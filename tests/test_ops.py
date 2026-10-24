@@ -11,7 +11,7 @@ import pytest
 
 np_ = pytest.importorskip("numpy")
 
-from civ6_ops import (
+from civ6_ops import (  # noqa: E402  （importorskip 之后，CI 无 numpy 时整模块跳过）
     _DEFAULT_BUTTONS,
     _VK_MAP,
     OpsError,
