@@ -209,12 +209,14 @@ async def list_cities(timeout: float = 8.0) -> dict:
 
 # 战争状态（v0.4.0）：Tuner 真实读取——比像素横幅检测可靠得多，
 # 用于"分清打仗和运营"：战争中 YUI 拒绝运营、立即交还控制权。
+# pcall 容错：不同版本 API 名可能有差异，失败返回明确 ERR 而非挂死/超时。
 LUA_AT_WAR = """
-local pPlayer = Players[Game.GetLocalPlayer() or 0]
-if pPlayer == nil then print("ERR:NO_PLAYER") return end
-local pDiplo = pPlayer:GetDiplomacy()
-if pDiplo == nil then print("ERR:NO_DIPLOMACY") return end
-local count = pDiplo:GetAtWarCount()
+local ok, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
+if not ok or pPlayer == nil then print("ERR:NO_PLAYER") return end
+local ok2, pDiplo = pcall(function() return pPlayer:GetDiplomacy() end)
+if not ok2 or pDiplo == nil then print("ERR:NO_DIPLOMACY") return end
+local ok3, count = pcall(function() return pDiplo:GetAtWarCount() end)
+if not ok3 then print("ERR:ATWAR_API") return end
 print("OK|at_war=" .. tostring(count or 0))
 """
 

@@ -104,3 +104,17 @@ def test_citizen_assignment_all_tiles():
     tiles = [{"food": 3, "prod": 1}, {"food": 5, "prod": 0}, {"food": 4, "prod": 1}]
     r = _citizen_best_assignment(tiles, 9, target="growth")
     assert set(r["assign"]) == {1, 2}  # 人口大于地块数，全分配
+
+
+def test_run_one_turn_ops_no_game_raises():
+    """无游戏窗口时必须抛 GAME_NOT_RUNNING（异常路径，不依赖 GUI）。"""
+    with pytest.raises(OpsError) as ei:
+        _civ6_ops_mod.run_one_turn_ops({}, war_state=None)
+    assert ei.value.code == "GAME_NOT_RUNNING"
+
+
+def test_run_one_turn_ops_accepts_war_state_kwarg():
+    """war_state 参数签名兼容（True 提前交还的路径在真实游戏下才可测）。"""
+    import inspect
+    sig = inspect.signature(_civ6_ops_mod.run_one_turn_ops)
+    assert "war_state" in sig.parameters

@@ -4,7 +4,7 @@ name = "文明6陪玩"
 description = "让 YUI 陪玩家打文明6：深度监控（解析 .Civ6Save 存档）获知当前局面——回合数/游戏速度/地图大小与类型/你的文明与领袖（含特性）/全部敌对文明与领袖/城邦列表/已装 MOD，据此给出陪玩建议（开局/科技/建城/战争/胜利路线/外交分主题规则化建议）。v0.2.0 新增进阶版：屏幕自动化运营托管（civ6_ops_takeover/civ6_ops_tick/civ6_ops_handoff）——YUI 按'推荐制'替玩家执行运营（处理弹窗、点下一回合），玩家只负责打仗。v0.3.0 打通 FireTuner 底层通道（civ6_tuner_status/civ6_city_details/civ6_ops_focus）——官方 API 直接读城市人口与产出、市民焦点分配，比像素点击可靠。v0.4.0 新增 civ6_ensure_sdk 自动装 Steam SDK（appid 597260）+ 自动启用 Tuner + 探测 4318；运营战争检测改 Tuner 官方 API（像素横幅兜底）；civ6_ops_citizens 精细运营真正落地（读真实城市数据→按目标执行官方焦点分配）。执行层复用 steam_manager 现成键鼠操控（缺失回退 pyautogui）；纯只读不改存档，每次操作截图验证、识别不了就停下如实汇报。存档解析使用插件内嵌 pydt/civ6-save-parser（MIT），调用本机 node（>=16）。存档目录默认 Documents\\My Games\\Sid Meier's Civilization VI\\Saves，可在 config 覆盖"
 short_description = "文明6陪玩：解析存档获知局面并给建议；运营托管替你处理弹窗/点下一回合；SDK/Tuner 底层通道自动装好，精细运营真实执行（读城市数据+官方焦点分配）；打仗归你"
 keywords = ["文明6", "Civilization VI", "Civ6", "陪玩", "存档", "Civ6Save", "局面", "攻略", "开局", "科技", "建城", "战争", "胜利", "城邦", "领袖", "文明特性", "situation", "advisor", "buddy", "coach", "运营托管", "键鼠接管", "屏幕自动化", "接管", "交还", "takeover", "FireTuner", "Tuner", "SDK", "4318", "底层通道", "市民分配", "焦点", "精细运营", "自动安装"]
-version = "0.4.0"
+version = "0.4.1"
 type = "plugin"
 entry = "plugin.plugins.civ6_buddy:Civ6BuddyPlugin"
 

@@ -134,12 +134,20 @@ def ensure_tuner_enabled(p: Path | None = None) -> dict:
     - 文件不存在 → 创建（备份不算，首次创建无旧值）。
     - 已有 EnableTuner 0 → 备份 .bak_<ts> 后改为 1。
     - 已有 1 → 不动。
+    - 已有文件但无 EnableTuner 行 → 备份后追加；已有 [Debug] 节则不再重复添加节头。
     返回 {"changed": bool, "backup": str|None, "path": str, "detail": str}。
     """
     ap = p or app_options_path()
     text = _read_app_options(ap)
-    changed = False
-    backup = None
+    backup: str | None = None
+
+    def _backup() -> None:
+        nonlocal backup
+        if backup is None:
+            ap.parent.mkdir(parents=True, exist_ok=True)
+            backup = str(ap) + f".bak_{time.strftime('%Y%m%d_%H%M%S')}"
+            Path(backup).write_text(text, encoding="utf-8")
+
     if text:
         lines = text.splitlines()
         for i, line in enumerate(lines):
@@ -150,35 +158,21 @@ def ensure_tuner_enabled(p: Path | None = None) -> dict:
                                 "path": str(ap), "detail": "EnableTuner 已为 1，无需修改"}
                 except ValueError:
                     pass
-                # 需修改：先备份
-                ap.parent.mkdir(parents=True, exist_ok=True)
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                backup = str(ap) + f".bak_{ts}"
-                try:
-                    ap.write_text(text, encoding="utf-8")
-                    _backup = Path(backup)
-                    _backup.write_text(text, encoding="utf-8")
-                except OSError:
-                    _logger.warning("AppOptions backup failed", exc_info=True)
+                _backup()
                 lines[i] = "EnableTuner 1"  # 保持原 [Debug] 节位置
-                changed = True
-                break
-        if changed:
-            ap.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                ap.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                return {"changed": True, "backup": backup, "path": str(ap),
+                        "detail": "EnableTuner 0 → 1（已备份原文件）"}
+        # 文件存在但没有 EnableTuner 行：备份后追加
+        _backup()
+        has_debug = any(l.strip().lower() == "[debug]" for l in lines)
+        if has_debug:
+            ap.write_text(text.rstrip("\n") + "\nEnableTuner 1\n", encoding="utf-8")
             return {"changed": True, "backup": backup, "path": str(ap),
-                    "detail": "EnableTuner 0 → 1（已备份原文件）"}
-        # 文件存在但没有 EnableTuner 行
-        ap.parent.mkdir(parents=True, exist_ok=True)
-        backup = str(ap) + f".bak_{time.strftime('%Y%m%d_%H%M%S')}"
-        try:
-            _backup = Path(backup)
-            _backup.write_text(text, encoding="utf-8")
-        except OSError:
-            _logger.warning("AppOptions backup failed", exc_info=True)
-        new = text.rstrip("\n") + "\n[Debug]\nEnableTuner 1\n"
-        ap.write_text(new, encoding="utf-8")
+                    "detail": "已追加 EnableTuner 1（复用已有 [Debug] 节）"}
+        ap.write_text(text.rstrip("\n") + "\n[Debug]\nEnableTuner 1\n", encoding="utf-8")
         return {"changed": True, "backup": backup, "path": str(ap),
-                "detail": "已追加 [Debug] EnableTuner 1"}
+                "detail": "已追加 [Debug] 节并启用 EnableTuner"}
     # 文件不存在：直接创建
     ap.parent.mkdir(parents=True, exist_ok=True)
     ap.write_text("[Debug]\nEnableTuner 1\n", encoding="utf-8")

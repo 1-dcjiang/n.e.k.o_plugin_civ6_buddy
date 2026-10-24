@@ -9,7 +9,7 @@
   城市"推荐生产"等），配合固定相对坐标 + 像素模板匹配，**不依赖 OCR**。
 - 城市生产走游戏自带"推荐建造"按钮；科技树无推荐按钮，自动部分只做
   "已就绪市政/政策"与"下一回合"，科技给建议留用户点（半自动）。
-- 战争检测到（横幅/用户打断）→ 立即停止运营、交还控制权。
+- 战争检测：Tuner 官方 API（GetAtWarCount）优先、像素横幅兜底——检测到即停止运营、交还控制权。
 - 每一次操作后截图验证；识别不了就停下如实汇报，绝不猜点。
 """
 
@@ -308,51 +308,32 @@ def _detect_popup_blocking(screen: np.ndarray) -> bool:
     return light_frac > 0.45
 
 
-def run_one_turn_ops(cfg: dict, war_check=None) -> dict:
+def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
     """执行一回合推荐制运营。返回结构化结果（供上层如实汇报）。
 
     cfg: {"saves_dir": str, "buttons": {...}} 按钮可用 config 覆盖。
-    war_check: 可选战争检测回调（async 可调用，返回 bool：处于战争则 True）。
-      提供时优先用它（Tuner 官方 API 最可靠）；像素横幅检测始终作为兜底。
-    流程：找窗口 → 前置 → 截图 → 战争检测 → ESC 清扫弹窗 → 点下一回合 → 验证结算。
+    war_state: 调用方（asyncio 上下文）先经 Tuner 官方 API 测得的战争状态：
+      True=战争中（立即交还，不点下一回合）；None=未测得（回退像素横幅检测）；
+      False=确认非战争。
+    流程：找窗口 → 前置 → 截图 → 战争判断 → ESC 清扫弹窗 → 点下一回合 → 验证结算。
     生产/市政推荐按钮通过模板资产尝试（assets/*.png），缺失则跳过并如实标注。
-    战争检测命中 → 停止并交还（不点下一回合）。
+    战争判断命中 → 停止并交还（不点下一回合）。结算后战争复检由调用方再做一次 Tuner 查询。
     """
     win = _find_window()
     win = _front_and_size(win)
     log: list[str] = [f"窗口已定位并前置（执行通道：{_EXEC.channel}）"]
 
-    async def _is_war_tuner() -> bool | None:
-        """Tuner 战争检测；不可用返回 None（调用方回退像素检测）。"""
-        if war_check is None:
-            return None
-        try:
-            r = await war_check()
-            if r.get("ok") and r.get("at_war", 0) > 0:
-                log.append(f"Tuner 战争检测：处于战争（{r['at_war']} 个敌对对象）")
-                return True
-            if r.get("ok"):
-                log.append("Tuner 战争检测：非战争状态")
-            return False if r.get("ok") else None
-        except Exception:
-            return None
-
     # 1) 初始截图
     screen = _shot(win)
 
-    # 2) 战争检测（Tuner 优先，像素横幅兜底）→ 交还
-    war = None
-    try:
-        import asyncio
-        war = asyncio.run(_is_war_tuner())
-    except Exception:
-        war = None
+    # 2) 战争判断（Tuner 结果优先；未测得时像素横幅兜底）→ 交还
+    war = war_state
     if war is None and _banner_war_present(screen):
         war = True
         log.append("像素横幅检测：疑似战争横幅")
     if war:
         return {
-            "ok": False, "handoff": True, "reason": "WAR_BANNER",
+            "ok": False, "handoff": True, "reason": "WAR_TUNER" if war_state is True else "WAR_BANNER",
             "output": "检测到战争状态：运营暂停，控制权交还给你。需要我继续运营时说'继续运营'。",
             "log": log, "channel": _EXEC.channel,
         }
@@ -380,23 +361,14 @@ def run_one_turn_ops(cfg: dict, war_check=None) -> dict:
     else:
         log.append("下一回合：模板匹配点击")
 
-    # 5) 等待 AI 结算 + 验证回合前进
+    # 5) 等待 AI 结算 + 像素战争复检（Tuner 复检由调用方在返回后执行）
     time.sleep(2.5)
     screen2 = _shot(win)
-    war_after = None
-    try:
-        import asyncio
-        war_after = asyncio.run(_is_war_tuner())
-    except Exception:
-        war_after = None
-    if war_after is None and _banner_war_present(screen2):
-        war_after = True
+    if _banner_war_present(screen2):
         log.append("结算后像素横幅检测：疑似战争横幅")
-    if war_after:
-        log.append("结算后检测到战争状态")
         return {"ok": True, "handoff": True, "reason": "WAR_AFTER_TURN", "log": log,
                 "channel": _EXEC.channel,
-                "output": "本回合运营已执行，结算后进入战争状态，控制权交还给你。"}
+                "output": "本回合运营已执行，结算后检测到战争状态，控制权交还给你。"}
     log.append("回合结算画面正常")
 
     return {

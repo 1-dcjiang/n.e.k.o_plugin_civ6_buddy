@@ -44,15 +44,6 @@ def _tool_params(_: dict) -> dict:
     return p if isinstance(p, dict) else {}
 
 
-async def _tuner_at_war() -> dict:
-    """Tuner 战争检测回调（供 civ6_ops.run_one_turn_ops 优先使用）。"""
-    try:
-        import civ6_tuner
-        return await civ6_tuner.at_war()
-    except Exception:
-        return {"ok": False, "error": "TUNER_IMPORT_FAILED"}
-
-
 @neko_plugin
 class Civ6BuddyPlugin(NekoPluginBase):
     """N.E.K.O. 插件：文明6陪玩（解析存档获知局面 + 陪玩建议）。"""
@@ -381,6 +372,15 @@ class Civ6BuddyPlugin(NekoPluginBase):
     )
     async def civ6_ops_tick(self, **_):
         self._load_config()
+        # 战争预检（Tuner 官方 API，asyncio 上下文内 await——不能在同步函数里 asyncio.run）
+        import civ6_tuner
+        war_pre = None
+        try:
+            wr = await civ6_tuner.at_war()
+            if wr.get("ok"):
+                war_pre = wr.get("at_war", 0) > 0
+        except Exception:
+            war_pre = None
         # 回合推进验证：执行前回合数
         try:
             t0 = int(civ6_parser.parse_save("", self._saves_dir).get("game_turn", 0))
@@ -389,7 +389,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
         try:
             result = civ6_ops.run_one_turn_ops(
                 {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
-                war_check=_tuner_at_war,
+                war_state=war_pre,
             )
         except civ6_ops.OpsError as exc:
             if self._ops_active:
@@ -400,7 +400,20 @@ class Civ6BuddyPlugin(NekoPluginBase):
         if result.get("handoff"):
             self._ops_active = False
             return {"output": result.get("output", "运营停止"), "is_error": not result.get("ok", False),
-                    "log": result.get("log", []), "handoff": True}
+                    "log": result.get("log", []), "handoff": True,
+                    "reason": result.get("reason", "")}
+        # 结算后战争复检（Tuner；战争即交还）
+        try:
+            wr2 = await civ6_tuner.at_war()
+            if wr2.get("ok") and wr2.get("at_war", 0) > 0:
+                self._ops_active = False
+                return {
+                    "output": "本回合运营已执行，但结算后 Tuner 检测到战争状态，控制权交还给你。",
+                    "is_error": False, "handoff": True,
+                    "log": result.get("log", []) + [f"结算后 Tuner 战争检测：{wr2.get('at_war')} 个敌对对象"],
+                }
+        except Exception:
+            pass
         # 验证回合推进：执行后回合数
         try:
             t1 = int(civ6_parser.parse_save("", self._saves_dir).get("game_turn", 0))
