@@ -258,6 +258,15 @@ _DEFAULT_BUTTONS = {
     "production_yes": (0.62, 0.78),
 }
 
+# 城市面板条按钮（真实截图标定，2558x1598 全屏/相对坐标，分辨率无关）：
+# 点击地图上的城市后底部出现的城市面板条。
+# citizen_button：面板条上的「市民管理」按钮 → 打开市民管理窗口（精细运营入口）
+# production_button：面板条上的「选择生产项目」按钮 → 打开生产面板
+_CITY_PANEL_BUTTONS = {
+    "citizen": (0.836, 0.871),      # 市民管理
+    "production": (0.929, 0.872),   # 选择生产项目
+}
+
 
 def _banner_war_present(screen) -> bool:
     """粗略战争横幅检测：顶部 10% 是否有红色横幅像素带（战争宣言横幅为红色系）。
@@ -299,26 +308,52 @@ def _detect_popup_blocking(screen: np.ndarray) -> bool:
     return light_frac > 0.45
 
 
-def run_one_turn_ops(cfg: dict) -> dict:
+def run_one_turn_ops(cfg: dict, war_check=None) -> dict:
     """执行一回合推荐制运营。返回结构化结果（供上层如实汇报）。
 
     cfg: {"saves_dir": str, "buttons": {...}} 按钮可用 config 覆盖。
-    流程：找窗口 → 前置 → 截图 → ESC 清扫弹窗 → 点下一回合 → 验证结算。
+    war_check: 可选战争检测回调（async 可调用，返回 bool：处于战争则 True）。
+      提供时优先用它（Tuner 官方 API 最可靠）；像素横幅检测始终作为兜底。
+    流程：找窗口 → 前置 → 截图 → 战争检测 → ESC 清扫弹窗 → 点下一回合 → 验证结算。
     生产/市政推荐按钮通过模板资产尝试（assets/*.png），缺失则跳过并如实标注。
-    战争横幅检测命中 → 停止并交还（不点下一回合）。
+    战争检测命中 → 停止并交还（不点下一回合）。
     """
     win = _find_window()
     win = _front_and_size(win)
     log: list[str] = [f"窗口已定位并前置（执行通道：{_EXEC.channel}）"]
 
+    async def _is_war_tuner() -> bool | None:
+        """Tuner 战争检测；不可用返回 None（调用方回退像素检测）。"""
+        if war_check is None:
+            return None
+        try:
+            r = await war_check()
+            if r.get("ok") and r.get("at_war", 0) > 0:
+                log.append(f"Tuner 战争检测：处于战争（{r['at_war']} 个敌对对象）")
+                return True
+            if r.get("ok"):
+                log.append("Tuner 战争检测：非战争状态")
+            return False if r.get("ok") else None
+        except Exception:
+            return None
+
     # 1) 初始截图
     screen = _shot(win)
 
-    # 2) 战争横幅检测 → 交还
-    if _banner_war_present(screen):
+    # 2) 战争检测（Tuner 优先，像素横幅兜底）→ 交还
+    war = None
+    try:
+        import asyncio
+        war = asyncio.run(_is_war_tuner())
+    except Exception:
+        war = None
+    if war is None and _banner_war_present(screen):
+        war = True
+        log.append("像素横幅检测：疑似战争横幅")
+    if war:
         return {
             "ok": False, "handoff": True, "reason": "WAR_BANNER",
-            "output": "检测到疑似战争横幅：运营暂停，控制权交还给你。需要我继续运营时说'继续运营'。",
+            "output": "检测到战争状态：运营暂停，控制权交还给你。需要我继续运营时说'继续运营'。",
             "log": log, "channel": _EXEC.channel,
         }
 
@@ -348,8 +383,17 @@ def run_one_turn_ops(cfg: dict) -> dict:
     # 5) 等待 AI 结算 + 验证回合前进
     time.sleep(2.5)
     screen2 = _shot(win)
-    if _banner_war_present(screen2):
-        log.append("结算后检测到战争横幅")
+    war_after = None
+    try:
+        import asyncio
+        war_after = asyncio.run(_is_war_tuner())
+    except Exception:
+        war_after = None
+    if war_after is None and _banner_war_present(screen2):
+        war_after = True
+        log.append("结算后像素横幅检测：疑似战争横幅")
+    if war_after:
+        log.append("结算后检测到战争状态")
         return {"ok": True, "handoff": True, "reason": "WAR_AFTER_TURN", "log": log,
                 "channel": _EXEC.channel,
                 "output": "本回合运营已执行，结算后进入战争状态，控制权交还给你。"}
@@ -361,3 +405,55 @@ def run_one_turn_ops(cfg: dict) -> dict:
                   "（生产/市政/政策建议请参考局面分析与建议；科技树请在游戏里点，或告诉我研发哪个。）",
         "log": log, "channel": _EXEC.channel,
     }
+
+
+# ── 精细运营：市民/地块分配（v0.3.0） ──
+
+# 城市面板市民管理 tab 的地块格布局：中心为城市，外圈为可工作地块。
+# 格子中心的窗口内相对坐标需按真实游戏截图标定（config [civ6_buddy.city_grid]），
+# 未标定前精细运营的"执行点击"不可用（只读建议可用）。
+_YIELD_KEYS = ("food", "prod", "gold", "culture", "science", "faith")
+
+
+def _citizen_best_assignment(tiles: list[dict], pop: int, target: str = "balanced") -> dict:
+    """最优市民分配（纯函数，不依赖 UI）。
+
+    tiles: 城市面板识别出的地块产出列表，[0] 为城市中心（始终锁定），其余为可工作地块，
+           每项含 food/prod/gold/culture/science/faith（可缺省=0）。
+    pop:   城市人口（=已工作地块数，含中心）。
+    target: balanced（综合）/ growth（食物优先）/ production（锤子优先）。
+
+    返回 {"assign": [地块下标...], "totals": {...}, "notes": str}。
+    只计算方案，不点任何东西；点击执行由上层（标定后）负责。
+    """
+    if not tiles:
+        return {"assign": [], "totals": {k: 0 for k in _YIELD_KEYS}, "notes": "无地块数据"}
+    keys = _YIELD_KEYS
+    def _sum(idx_list):
+        return {k: sum(float(tiles[i].get(k, 0) or 0) for i in idx_list) for k in keys}
+
+    def _rank(i: int) -> tuple:
+        """按目标给地块排序键（负值，越大越优先）。"""
+        t = tiles[i]
+        f = float(t.get("food", 0) or 0)
+        p = float(t.get("prod", 0) or 0)
+        if target == "growth":
+            return (-f, -p)
+        if target == "production":
+            return (-p, -f)
+        # balanced：食物×2 + 锤×3 + 金币×1 + 文化×1 + 科技×1.5（粗略综合分）
+        return (-(f * 2 + p * 3 + float(t.get("gold", 0) or 0)
+                  + float(t.get("culture", 0) or 0) + float(t.get("science", 0) or 0) * 1.5),)
+
+    assignable = list(range(1, len(tiles)))
+    n = max(0, int(pop) - 1)  # 中心锁定，可分配市民数 = 人口 - 1
+    if n == 0:
+        return {"assign": [], "totals": _sum([0]), "notes": f"人口 {pop}，仅城市中心被工作，无可分配市民"}
+    if n >= len(assignable):
+        chosen = assignable
+        notes = f"人口 {pop}，全部 {len(assignable)} 个可用地块都已分配（中心锁定）"
+    else:
+        chosen = sorted(assignable, key=_rank)[:n]
+        notes = (f"人口 {pop}，按「{target}」目标从 {len(assignable)} 个地块中选了 {n} 个"
+                 f"（中心锁定）")
+    return {"assign": chosen, "totals": _sum([0] + chosen), "notes": notes}

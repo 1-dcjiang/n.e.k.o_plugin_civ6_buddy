@@ -21,6 +21,7 @@ _VK_MAP = _civ6_ops_mod._VK_MAP
 OpsError = _civ6_ops_mod.OpsError
 _banner_war_present = _civ6_ops_mod._banner_war_present
 _match_template = _civ6_ops_mod._match_template
+_citizen_best_assignment = _civ6_ops_mod._citizen_best_assignment
 
 
 def test_vk_map_covers_common_keys():
@@ -68,3 +69,38 @@ def test_match_template_misses_absent_pattern():
 
 def test_bad_rel_coord_raises():
     assert issubclass(OpsError, Exception)
+
+
+def test_citizen_assignment_empty():
+    r = _citizen_best_assignment([], 3)
+    assert r["assign"] == []
+    assert r["totals"]["food"] == 0
+
+
+def test_citizen_assignment_pop1_center_only():
+    tiles = [{"food": 3, "prod": 1}, {"food": 5, "prod": 0}, {"food": 1, "prod": 4}]
+    r = _citizen_best_assignment(tiles, 1, target="balanced")
+    assert r["assign"] == []
+    assert r["totals"]["food"] == 3  # 仅中心
+
+
+def test_citizen_assignment_growth_picks_food():
+    tiles = [{"food": 3, "prod": 1},
+             {"food": 5, "prod": 0}, {"food": 4, "prod": 1}, {"food": 2, "prod": 4}]
+    r = _citizen_best_assignment(tiles, 3, target="growth")
+    assert set(r["assign"]) == {1, 2}  # 食物最高的两个
+    assert r["totals"]["food"] == 12  # 3 + 5 + 4
+
+
+def test_citizen_assignment_production_picks_prod():
+    tiles = [{"food": 3, "prod": 1},
+             {"food": 5, "prod": 0}, {"food": 2, "prod": 4}, {"food": 1, "prod": 6}]
+    r = _citizen_best_assignment(tiles, 3, target="production")
+    assert set(r["assign"]) == {2, 3}  # 锤子最高的两个
+    assert r["totals"]["prod"] == 11  # 1 + 4 + 6
+
+
+def test_citizen_assignment_all_tiles():
+    tiles = [{"food": 3, "prod": 1}, {"food": 5, "prod": 0}, {"food": 4, "prod": 1}]
+    r = _citizen_best_assignment(tiles, 9, target="growth")
+    assert set(r["assign"]) == {1, 2}  # 人口大于地块数，全分配

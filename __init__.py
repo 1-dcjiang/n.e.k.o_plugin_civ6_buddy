@@ -14,7 +14,7 @@ from pathlib import Path
 
 from plugin.sdk.plugin import NekoPluginBase, lifecycle, llm_tool, neko_plugin, plugin_entry
 
-from . import civ6_data, civ6_ops, civ6_parser
+from . import civ6_data, civ6_ops, civ6_parser, civ6_sdk
 
 _logger = logging.getLogger("N.E.K.O.Plugin_civ6_buddy.civ6_buddy")
 
@@ -42,6 +42,15 @@ def _tool_params(_: dict) -> dict:
     """宿主 llm_tool 传参防御：parameters 偶发被传成标量（int/str），非 dict 降级空字典。"""
     p = _.get("parameters")
     return p if isinstance(p, dict) else {}
+
+
+async def _tuner_at_war() -> dict:
+    """Tuner 战争检测回调（供 civ6_ops.run_one_turn_ops 优先使用）。"""
+    try:
+        import civ6_tuner
+        return await civ6_tuner.at_war()
+    except Exception:
+        return {"ok": False, "error": "TUNER_IMPORT_FAILED"}
 
 
 @neko_plugin
@@ -251,6 +260,83 @@ class Civ6BuddyPlugin(NekoPluginBase):
         """关闭钩子：无后台资源需释放。"""
         return {"status": "stopped", "plugin": "civ6_buddy"}
 
+    # ══════════ 前置链路：SDK 自动安装与 Tuner 配置（v0.4.0） ══════════
+
+    @llm_tool(
+        name="civ6_ensure_sdk",
+        description=(
+            "自动处理文明6底层通道前置：Steam SDK（FireTuner 服务端）检测/安装 + 游戏启用 Tuner + "
+            "探测 4318 端口。何时用：用户说'把底层通道装好/自动装 SDK/为什么读不到城市数据'，"
+            "或 civ6_tuner_status/civ6_city_details 报 GAME_TUNER_OFF 时。"
+            "参数 action：check（默认，汇总状态）/install（SDK 缺失时触发 Steam 自动安装，"
+            "appid 597260）/fix_tuner（自动写 AppOptions.txt 启用 Tuner，含备份）。"
+            "返回链路各环节状态与下一步动作。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string",
+                           "description": "check/install/fix_tuner，默认 check"},
+            },
+            "required": [],
+        },
+        timeout=30.0,
+    )
+    async def civ6_ensure_sdk(self, *, action: str = "check", **_):
+        params = _tool_params(_)
+        action = str(action or params.get("action") or "check").strip().lower()
+        if action not in ("check", "install", "fix_tuner"):
+            return {"output": "未知 action：可用 check / install / fix_tuner。", "is_error": True,
+                    "error": "BAD_ACTION"}
+        status = civ6_sdk.sdk_status()
+        sdk_ok = status["sdk_installed"]
+        tuner_ok = status["tuner_enabled"]
+        port_ok = status["port_4318_listening"]
+
+        if action == "fix_tuner":
+            r = civ6_sdk.ensure_tuner_enabled()
+            if not r["changed"]:
+                return {"output": f"Tuner 配置无需修改：{r['detail']}。", "is_error": False,
+                        "channel": "sdk", "tuner": r}
+            return {
+                "output": (f"已启用 Tuner：{r['detail']}。修改文件：{r['path']}。"
+                           "请重启游戏生效（同屏只能一个 Tuner 连接，先关掉 SDK 自带的 FireTuner.exe）。"),
+                "is_error": False, "channel": "sdk", "tuner": r,
+            }
+
+        if action == "install":
+            if sdk_ok:
+                return {"output": f"SDK 已安装（{status['sdk_dir']}），无需重复下载。"
+                                  f"Tuner 配置：{('已启用' if tuner_ok else '未启用')}；"
+                                  f"端口 4318：{('监听中' if port_ok else '未监听（需重启游戏）')}。",
+                        "is_error": False, "channel": "sdk", "status": status}
+            trig = civ6_sdk.trigger_steam_install()
+            if not trig["ok"]:
+                return {"output": trig["detail"], "is_error": True, "error": "STEAM_TRIGGER_FAILED",
+                        "channel": "sdk"}
+            return {"output": trig["detail"], "is_error": False,
+                    "channel": "sdk", "status": status, "action": "install"}
+
+        # check：汇总
+        lines = ["文明6 底层通道（FireTuner/SDK）状态："]
+        lines.append(f"- SDK 安装：{'✅ ' + status['sdk_dir'] if sdk_ok else '❌ 未安装（免费 Steam 工具，appid 597260）'}")
+        lines.append(f"- 游戏目录：{'✅ ' + status['game_dir'] if status['game_dir'] else '⚠ 未找到（检查 Steam 库路径）'}")
+        lines.append(f"- Tuner 配置（{status['app_options_path']}）：{'✅ 已启用' if tuner_ok else '❌ 未启用'}")
+        lines.append(f"- 端口 4318：{'✅ 监听中（游戏已开 Tuner）' if port_ok else '❌ 未监听（SDK 未装或游戏未重启）'}")
+        lines.append(f"- 游戏进程：{'✅ 运行中' if status['game_running'] else '未运行'}")
+        missing = []
+        if not sdk_ok:
+            missing.append("install（自动触发 Steam 下载 SDK）")
+        if not tuner_ok:
+            missing.append("fix_tuner（自动启用 Tuner 配置）")
+        if not port_ok and sdk_ok:
+            missing.append("重启游戏后再探测（SDK 装好、Tuner 开好后需重启游戏）")
+        if missing:
+            lines.append("下一步：请执行 " + "、".join(f"civ6_ensure_sdk(action='{m.split('（')[0]}')" for m in missing))
+        else:
+            lines.append("✅ 链路就绪：SDK 已装、Tuner 已开、端口在听，可读真实城市数据。")
+        return {"output": "\n".join(lines), "is_error": False, "channel": "sdk", "status": status}
+
     # ══════════ 进阶版：屏幕自动化运营（推荐制） ══════════
 
     @llm_tool(
@@ -284,9 +370,10 @@ class Civ6BuddyPlugin(NekoPluginBase):
     @llm_tool(
         name="civ6_ops_tick",
         description=(
-            "执行一回合推荐制运营：定位游戏窗口→处理弹窗→点下一回合→验证结算与回合推进。"
+            "执行一回合推荐制运营：定位游戏窗口→战争检测（Tuner 官方 API 优先、像素横幅兜底）→"
+            "处理弹窗→点下一回合→验证结算与回合推进。"
             "何时用：运营托管中，用户说'继续/执行本回合/点下一回合'。"
-            "参数无。检测到战争横幅立即停止并交还控制权；点完下一回合会解析存档验证回合数"
+            "检测到战争立即停止并交还控制权；点完下一回合会解析存档验证回合数"
             "确实 +1，未推进则如实报告并交还。不改存档、不点单位、不碰战斗。"
         ),
         parameters={"type": "object", "properties": {}, "required": []},
@@ -301,7 +388,9 @@ class Civ6BuddyPlugin(NekoPluginBase):
             return _wrap_err(exc)
         try:
             result = civ6_ops.run_one_turn_ops(
-                {"saves_dir": self._saves_dir, "buttons": self._ops_buttons})
+                {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
+                war_check=_tuner_at_war,
+            )
         except civ6_ops.OpsError as exc:
             if self._ops_active:
                 self._ops_active = False
@@ -331,6 +420,177 @@ class Civ6BuddyPlugin(NekoPluginBase):
         return {"output": f"本回合运营完成（回合 {t0} → {t1}）：{result.get('output', '')}",
                 "is_error": False, "log": result.get("log", []), "handoff": False,
                 "turn_before": t0, "turn_after": t1}
+
+    @llm_tool(
+        name="civ6_ops_citizens",
+        description=(
+            "精细运营：城市市民/地块分配。何时用：运营托管中，用户说'优化城市人口分配/"
+            "让市民去高锤地块/按增长分配'等。参数 target：balanced（综合）/growth（食物优先）/"
+            "production（锤子优先），默认 balanced。"
+            "执行方式（v0.4.0）：FireTuner 可用时直接读取全部城市真实人口与产出，"
+            "然后按目标执行游戏官方焦点分配（市民自动倾斜到目标产出地块，官方 API 级操作，"
+            "不点像素、不改存档），并报告执行结果。Tuner 不可用时如实说明并引导装 SDK/开 Tuner。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string",
+                           "description": "分配目标：balanced/growth/production，默认 balanced"},
+            },
+            "required": [],
+        },
+        timeout=60.0,
+    )
+    async def civ6_ops_citizens(self, *, target: str = "balanced", **_):
+        params = _tool_params(_)
+        target = str(target or params.get("target") or "balanced").strip().lower()
+        if target not in ("balanced", "growth", "production"):
+            target = "balanced"
+        import civ6_tuner
+        # 1) Tuner 是否可用
+        status = await civ6_tuner.tuner_status()
+        if not status["ok"]:
+            return {
+                "output": (
+                    f"精细运营（市民/地块分配）需要底层通道：当前 FireTuner 不可用"
+                    f"（{status.get('detail', '')}）。请先执行 civ6_ensure_sdk(action='check') 看缺口，"
+                    "再按提示 install（自动装 SDK）/ fix_tuner（自动开 Tuner），重启游戏后重试。"
+                ),
+                "is_error": True, "error": status.get("error", "GAME_TUNER_OFF"),
+                "channel": "firetuner", "requires_sdk": True,
+            }
+        # 2) 读真实城市数据
+        cities = await civ6_tuner.list_cities()
+        if not cities.get("ok"):
+            return {"output": f"读取城市数据失败：{cities.get('detail', '')}",
+                    "is_error": True, "error": cities.get("error", "GAME_TUNER_OFF"),
+                    "channel": "firetuner"}
+        if not cities["cities"]:
+            return {"output": "Tuner 已连接但未读到城市（可能还没进局/本地玩家不存在）。",
+                    "is_error": False, "channel": "firetuner"}
+        # 3) 映射 target → 官方焦点
+        focus_map = {"balanced": "DEFAULT", "growth": "FOOD", "production": "PRODUCTION"}
+        focus = focus_map[target]
+        before = {c["name"]: c["population"] for c in cities["cities"]}
+        r = await civ6_tuner.set_focus(focus)
+        if not r["ok"]:
+            return {"output": f"设置焦点失败：{r.get('detail', r.get('error', ''))}",
+                    "is_error": True, "error": r.get("error", "GAME_TUNER_OFF"),
+                    "channel": "firetuner"}
+        applied = {x["city"]: x["focus"] for x in r.get("results", [])}
+        lines = [f"精细运营执行完成（通道：FireTuner 官方焦点机制）："]
+        for c in cities["cities"]:
+            y = c["yields"]
+            eff = "已应用" if c["name"] in applied else "未收到回执"
+            lines.append(
+                f"- {c['name']}：人口 {c['population']}，食物 {y.get('food', '?')}，"
+                f"生产 {y.get('prod', '?')}，金币 {y.get('gold', '?')}，"
+                f"科技 {y.get('science', '?')}，文化 {y.get('culture', '?')}，"
+                f"信仰 {y.get('faith', '?')} —— 目标「{target}」（焦点 {focus}）{eff}"
+            )
+        if target == "production":
+            lines.append("市民已自动向高生产地块倾斜；如需恢复均衡执行 target=balanced。")
+        elif target == "growth":
+            lines.append("市民已自动向高食物地块倾斜（加速人口增长）；如需恢复均衡执行 target=balanced。")
+        else:
+            lines.append("焦点已清空，恢复系统默认均衡分配。")
+        return {"output": "\n".join(lines), "is_error": False,
+                "channel": "firetuner", "focus": focus, "applied": applied,
+                "cities": cities["cities"]}
+
+    @llm_tool(
+        name="civ6_tuner_status",
+        description=(
+            "检查文明6 FireTuner 底层通道是否可用。何时用：用户问'底层通道/能直接读游戏数据吗'"
+            "或精细运营/城市数据读取前先探测。参数无。"
+            "需要 Steam 已装 Civ6 SDK（appid 597260）且游戏内启用 Tuner（禁成就），"
+            "游戏重启后监听 4318 端口。返回游戏身份与 Lua states 列表或明确错误码。"
+        ),
+        parameters={"type": "object", "properties": {}, "required": []},
+        timeout=20.0,
+    )
+    async def civ6_tuner_status(self, **_):
+        import civ6_tuner
+        status = await civ6_tuner.tuner_status()
+        if not status["ok"]:
+            return {
+                "output": ("FireTuner 底层通道不可用：请确认 ① Steam 已装『Sid Meier's Civilization "
+                           "VI Development Assets』（Tools，appid 597260）；② 游戏内选项开启 "
+                           "『Tuner (disables achievements)』（会禁用成就）；③ 重启游戏后端口 4318 "
+                           "监听。当前详情：" + str(status.get("detail", ""))),
+                "is_error": True, "error": status.get("error", "GAME_TUNER_OFF"),
+                "channel": "firetuner",
+            }
+        return {"output": status["detail"], "is_error": False,
+                "app": status.get("app", ""), "states": status.get("states", []),
+                "channel": "firetuner"}
+
+    @llm_tool(
+        name="civ6_city_details",
+        description=(
+            "通过 FireTuner 底层通道读取本城全部城市的实时数据（人口 + 食物/生产/金币/科技/文化/信仰）。"
+            "何时用：用户问'我的城市现在什么产出/人口多少'，或精细运营前需要真实数据。参数无。"
+            "需要 Tuner 可用（见 civ6_tuner_status）；不可用时返回明确错误码。"
+        ),
+        parameters={"type": "object", "properties": {}, "required": []},
+        timeout=30.0,
+    )
+    async def civ6_city_details(self, **_):
+        import civ6_tuner
+        r = await civ6_tuner.list_cities()
+        if not r["ok"]:
+            return {"output": f"读取城市数据失败：{r.get('detail', r.get('error', ''))}",
+                    "is_error": True, "error": r.get("error", "GAME_TUNER_OFF"),
+                    "channel": "firetuner", "cities": []}
+        if not r["cities"]:
+            return {"output": "Tuner 已连接但未读到城市（可能还没进局/本地玩家不存在）。",
+                    "is_error": False, "channel": "firetuner", "cities": []}
+        lines = [f"共 {len(r['cities'])} 座城市："]
+        for c in r["cities"]:
+            y = c["yields"]
+            lines.append(
+                f"- {c['name']}：人口 {c['population']}，食物 {y.get('food', '?')}，"
+                f"生产 {y.get('prod', '?')}，金币 {y.get('gold', '?')}，"
+                f"科技 {y.get('science', '?')}，文化 {y.get('culture', '?')}，信仰 {y.get('faith', '?')}"
+            )
+        return {"output": "\n".join(lines), "is_error": False,
+                "channel": "firetuner", "cities": r["cities"]}
+
+    @llm_tool(
+        name="civ6_ops_focus",
+        description=(
+            "通过 FireTuner 为本城全部城市设置产出焦点（游戏官方市民分配机制：市民自动倾向焦点产出）。"
+            "何时用：精细运营中，用户说'城市优先生产/优先增长/把人口往高锤地块放'等。"
+            "参数 focus：FOOD（增长）/PRODUCTION（生产）/GOLD/SCIENCE/CULTURE/FAITH/DEFAULT（清空）。"
+            "需要 Tuner 可用；这是官方 API 级操作，不点像素、不碰战斗。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "focus": {"type": "string",
+                          "description": "FOOD/PRODUCTION/GOLD/SCIENCE/CULTURE/FAITH/DEFAULT，默认 FOOD"},
+            },
+            "required": [],
+        },
+        timeout=30.0,
+    )
+    async def civ6_ops_focus(self, *, focus: str = "FOOD", **_):
+        params = _tool_params(_)
+        focus = str(focus or params.get("focus") or "FOOD").strip()
+        import civ6_tuner
+        r = await civ6_tuner.set_focus(focus)
+        if not r["ok"]:
+            return {"output": f"设置焦点失败：{r.get('detail', r.get('error', ''))}",
+                    "is_error": True, "error": r.get("error", "GAME_TUNER_OFF"),
+                    "channel": "firetuner"}
+        if not r["results"]:
+            return {"output": "焦点已设置但未收到城市回执（可能无本地城市）。",
+                    "is_error": False, "channel": "firetuner", "focus": r.get("focus", "")}
+        names = "、".join(x["city"] for x in r["results"])
+        return {"output": f"已为 {len(r['results'])} 座城市（{names}）设置焦点：{r['focus']}。"
+                          "市民会自动向该产出倾斜分配（游戏官方机制）。",
+                "is_error": False, "channel": "firetuner",
+                "focus": r.get("focus", ""), "results": r["results"]}
 
     @llm_tool(
         name="civ6_ops_handoff",
