@@ -83,11 +83,24 @@ def candidate_steam_libs() -> list[str]:
 
 
 def sdk_dir(steam_libs: list[str] | None = None) -> str | None:
-    """定位已安装的 SDK 目录；未安装返回 None。"""
+    """定位已安装的 SDK 目录；未安装返回 None。
+
+    目录名实测有 "Sid Meier's Civilization VI SDK" 与
+    "Sid Meier's Civilization VI SDK Assets"（appid 597260 下载后即为 Assets 变体），
+    按 "civilization vi sdk" 子串宽松匹配，避免漏判。
+    """
     for lib in (steam_libs if steam_libs is not None else candidate_steam_libs()):
-        d = Path(lib) / "steamapps" / "common" / SDK_DIR_NAME
-        if d.is_dir() and any(d.iterdir()):
-            return str(d)
+        common = Path(lib) / "steamapps" / "common"
+        if not common.is_dir():
+            continue
+        for d in common.iterdir():
+            if not d.is_dir():
+                continue
+            name = d.name.lower()
+            if "civilization vi sdk" not in name:
+                continue
+            if any(d.iterdir()):
+                return str(d)
     return None
 
 
@@ -165,7 +178,7 @@ def ensure_tuner_enabled(p: Path | None = None) -> dict:
                         "detail": "EnableTuner 0 → 1（已备份原文件）"}
         # 文件存在但没有 EnableTuner 行：备份后追加
         _backup()
-        has_debug = any(l.strip().lower() == "[debug]" for l in lines)
+        has_debug = any(line.strip().lower() == "[debug]" for line in lines)
         if has_debug:
             ap.write_text(text.rstrip("\n") + "\nEnableTuner 1\n", encoding="utf-8")
             return {"changed": True, "backup": backup, "path": str(ap),

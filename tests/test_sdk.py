@@ -82,3 +82,28 @@ def test_sdk_status_shape():
 def test_sdk_constants():
     assert _sdk.SDK_APPID == 597260
     assert _sdk.TUNER_PORT == 4318
+
+
+def test_sdk_dir_matches_assets_variant(tmp_path):
+    """实际下载的目录名是 'Sid Meier's Civilization VI SDK Assets'（非精确名），必须能识别。"""
+    lib = tmp_path / "SteamLibrary"
+    common = lib / "steamapps" / "common"
+    sdk = common / "Sid Meier's Civilization VI SDK Assets"
+    sdk.mkdir(parents=True)
+    (sdk / "Civ6").mkdir()
+    (sdk / "civ6-asset-deps.json").write_text("{}", encoding="utf-8")
+    got = _sdk.sdk_dir(steam_libs=[str(lib)])
+    assert got is not None
+    assert "SDK Assets" in got
+
+
+def test_sdk_dir_none_when_absent(tmp_path):
+    assert _sdk.sdk_dir(steam_libs=[str(tmp_path)]) is None
+
+
+def test_sdk_dir_skips_empty_dir(tmp_path):
+    """目录存在但为空（下载未完成）不算已安装。"""
+    lib = tmp_path / "Lib"
+    sdk = lib / "steamapps" / "common" / "Sid Meier's Civilization VI SDK"
+    sdk.mkdir(parents=True)
+    assert _sdk.sdk_dir(steam_libs=[str(lib)]) is None
