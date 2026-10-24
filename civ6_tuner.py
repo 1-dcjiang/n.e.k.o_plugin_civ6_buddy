@@ -38,6 +38,14 @@ class TunerError(Exception):
     """FireTuner 连接/执行错误。"""
 
 
+def _to_int(raw) -> int:
+    """数值字段安全转 int（游戏返回可能带小数/空格/异常值，失败返回 0）。"""
+    try:
+        return int(float(str(raw or 0).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _pack(tag: int, payload: str) -> bytes:
     data = payload.encode("utf-8") + b"\x00"
     return struct.pack(HEADER_FMT, len(data), tag) + data
@@ -137,38 +145,43 @@ async def tuner_status() -> dict:
 
 
 # ── Lua 脚本（焦点式市民分配，游戏官方机制） ──
+# 主逻辑统一用 pcall 包裹：API 名在不同版本/资料片有差异，失败输出明确 ERR 而非挂死超时。
 
 LUA_SET_FOCUS = """
-local yields = {"YIELD_FOOD","YIELD_PRODUCTION","YIELD_GOLD","YIELD_SCIENCE","YIELD_CULTURE","YIELD_FAITH"}
-local pCity = nil
-local pPlayer = Players[Game.GetLocalPlayer() or 0]
-if pPlayer == nil then print("ERR:NO_PLAYER") return end
 local targetYield = "{yield_type}"
+local ok, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
+if not ok or pPlayer == nil then print("ERR:NO_PLAYER") return end
 local yRow = GameInfo.Yields[targetYield]
 if yRow == nil then print("ERR:YIELD_NOT_FOUND|" .. targetYield) return end
--- 遍历该玩家城市，设置焦点（DEFAULT 清空全部焦点）
-for i, pCity in ipairs(pPlayer:GetCities()) do
-  local citz = pCity:GetCitizens()
-  for yr in GameInfo.Yields() do
-    if citz:IsFavoredYield(yr.Index) then citz:SetYieldFocus(yr.Index, false) end
+local okApply = pcall(function()
+  -- 遍历该玩家城市，设置焦点（DEFAULT 清空全部焦点）
+  for i, pCity in ipairs(pPlayer:GetCities()) do
+    local citz = pCity:GetCitizens()
+    for yr in GameInfo.Yields() do
+      if citz:IsFavoredYield(yr.Index) then citz:SetYieldFocus(yr.Index, false) end
+    end
+    if targetYield ~= "YIELD_DEFAULT" then
+      citz:SetYieldFocus(yRow.Index, true)
+    end
+    print("OK|" .. pCity:GetName() .. "|focus=" .. targetYield)
   end
-  if targetYield ~= "YIELD_DEFAULT" then
-    citz:SetYieldFocus(yRow.Index, true)
-  end
-  print("OK|" .. pCity:GetName() .. "|focus=" .. targetYield)
-end
+end)
+if not okApply then print("ERR:SETFOCUS_FAILED") end
 """
 
 LUA_LIST_CITIES = """
-local pPlayer = Players[Game.GetLocalPlayer() or 0]
-if pPlayer == nil then print("ERR:NO_PLAYER") return end
-for i, c in ipairs(pPlayer:GetCities()) do
-  local g = c:GetGrowth()
-  print(string.format("%s|pop=%d|food=%s|prod=%s|gold=%s|sci=%s|cult=%s|faith=%s|growth=%s",
-    c:GetName(), c:GetPopulation(),
-    c:GetYield(0), c:GetYield(1), c:GetYield(2), c:GetYield(3), c:GetYield(4), c:GetYield(5),
-    tostring(g and g:GetTurnsUntilGrowth())))
-end
+local ok, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
+if not ok or pPlayer == nil then print("ERR:NO_PLAYER") return end
+local okList = pcall(function()
+  for i, c in ipairs(pPlayer:GetCities()) do
+    local g = c:GetGrowth()
+    print(string.format("%s|pop=%d|food=%s|prod=%s|gold=%s|sci=%s|cult=%s|faith=%s|growth=%s",
+      c:GetName(), c:GetPopulation(),
+      c:GetYield(0), c:GetYield(1), c:GetYield(2), c:GetYield(3), c:GetYield(4), c:GetYield(5),
+      tostring(g and g:GetTurnsUntilGrowth())))
+  end
+end)
+if not okList then print("ERR:LISTCITIES_FAILED") end
 """
 
 
@@ -199,8 +212,8 @@ async def list_cities(timeout: float = 8.0) -> dict:
             continue
         cities.append({
             "name": parts[0],
-            "population": parts[1].replace("pop=", ""),
-            "yields": {k: parts[2 + i] for i, k in
+            "population": _to_int(parts[1].replace("pop=", "")),
+            "yields": {k: _to_int(parts[2 + i]) for i, k in
                        enumerate(("food", "prod", "gold", "science", "culture", "faith"))
                        if 2 + i < len(parts)},
         })

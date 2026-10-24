@@ -56,3 +56,9 @@ FireTuner 是游戏调试端口（默认 4318），可读真实城市数据、�
 - v0.3.0：FireTuner 底层通道（读城市数据/官方焦点分配），AppOptions EnableTuner 自动配置。
 - v0.4.0：civ6_ensure_sdk 自动装 SDK + 自动修 Tuner 配置 + 4318 探测；战争检测改 Tuner 官方 API；
   精细运营真实执行（读数据→按目标设焦点）。
+- v0.4.1：复查修复——tick 内 await 替换 asyncio.run（修 N.E.K.O 事件循环崩溃）；SDK 配置写入去重、
+  [Debug] 节去重；战争 Lua 加 pcall 容错；测试补异常路径。
+- v0.4.2：SDK 目录名宽松匹配（实测下载为 "Sid Meier's Civilization VI SDK Assets" 变体）；
+  本机 Tuner 配置已实际写入（AppOptions EnableTuner 1）。
+- v0.4.3：建议逻辑重构为独立模块 civ6_advice（可测）；未知建议主题回退"综合"缺陷修复；
+  Tuner Lua 全部 pcall 加固（API 差异不挂死）；城市数据字段强类型化；新增真实存档集成测试（共 41 例）。
