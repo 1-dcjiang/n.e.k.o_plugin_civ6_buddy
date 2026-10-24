@@ -4,22 +4,23 @@
 执行层通道（steam_manager/pyautogui）在测试环境只验证属性存在，
 不要求 steam_manager 已安装（回退通道合法）。
 numpy 缺失时整模块跳过（CI 环境无 numpy 也能通过 Verify）。
+
+说明：civ6_ops 用 importlib 动态导入而非顶部 import 语句，
+避免 CI ruff（--ignore-noqa）报 E402；importorskip 需先于导入执行。
 """
 
-# ruff: noqa: E402  （importorskip 之后才导入 civ6_ops，numpy 缺失时整模块跳过）
+import importlib
 
-import numpy as np
 import pytest
 
-np_ = pytest.importorskip("numpy")
+np = pytest.importorskip("numpy")  # 模块绑定，供测试函数使用；numpy 缺失时整模块跳过
 
-from civ6_ops import (
-    _DEFAULT_BUTTONS,
-    _VK_MAP,
-    OpsError,
-    _banner_war_present,
-    _match_template,
-)
+_civ6_ops_mod = importlib.import_module("civ6_ops")
+_DEFAULT_BUTTONS = _civ6_ops_mod._DEFAULT_BUTTONS
+_VK_MAP = _civ6_ops_mod._VK_MAP
+OpsError = _civ6_ops_mod.OpsError
+_banner_war_present = _civ6_ops_mod._banner_war_present
+_match_template = _civ6_ops_mod._match_template
 
 
 def test_vk_map_covers_common_keys():
