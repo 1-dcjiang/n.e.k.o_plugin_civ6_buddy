@@ -100,6 +100,18 @@ def parse_save(target: str = "", saves_dir: str = "") -> dict:
     return _build_situation(raw, found)
 
 
+def self_check(saves_dir: str = "") -> dict:
+    """启动自检（只读）：解析器与 node 是否可用、存档目录是否可达。"""
+    if not _WRAPPER.is_file():
+        raise Civ6Error("PARSER_MISSING", f"插件内嵌解析器缺失：{_WRAPPER}")
+    try:
+        subprocess.run(["node", "-v"], capture_output=True, text=True, timeout=15,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        raise Civ6Error("NODE_MISSING", "未找到 node。请先安装 Node.js（>=16）后重启插件。")
+    return {"status": "ok", "saves_dir": _resolve_saves_dir(saves_dir)}
+
+
 def _run_parser(save_path: str) -> dict:
     """调用 node wrapper 解析存档 → 原始 JSON dict。"""
     if not _WRAPPER.is_file():

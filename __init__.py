@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from plugin.sdk.plugin import NekoPluginBase, llm_tool, neko_plugin, plugin_entry
+from plugin.sdk.plugin import NekoPluginBase, lifecycle, llm_tool, neko_plugin, plugin_entry
 
 from . import civ6_data, civ6_parser
 
@@ -224,6 +224,21 @@ class Civ6BuddyPlugin(NekoPluginBase):
         lines += _advice_lines(sit, topic)
         return {"output": "\n".join(lines), "is_error": False, "situation": sit, "advice": _advice_lines(sit, topic)}
 
+    @lifecycle(id="startup")
+    async def on_startup(self, **_):
+        """启动钩子：仅做配置预加载与自检，不启动任何后台任务（纯只读插件）。"""
+        try:
+            self._load_config()
+            civ6_parser.self_check(self._saves_dir)
+        except Exception as exc:  # 自检失败不影响宿主启动
+            _logger.warning("civ6_buddy startup self-check failed: %s", exc)
+        return {"status": "ready", "plugin": "civ6_buddy"}
+
+    @lifecycle(id="shutdown")
+    async def on_shutdown(self, **_):
+        """关闭钩子：无后台资源需释放。"""
+        return {"status": "stopped", "plugin": "civ6_buddy"}
+
 
 def _advice_lines(sit: dict, topic: str) -> list[str]:
     """局面 → 规则化建议。基于玩家文明特性/对手/城邦/回合阶段，模板式输出。"""
@@ -278,6 +293,6 @@ def _advice_lines(sit: dict, topic: str) -> list[str]:
     return out
 
 
-@plugin_entry
+@plugin_entry()
 def create_plugin(ctx):
     return Civ6BuddyPlugin(ctx)
