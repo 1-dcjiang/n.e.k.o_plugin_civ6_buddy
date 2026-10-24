@@ -6,8 +6,6 @@
 
 import importlib
 
-import pytest
-
 _sdk = importlib.import_module("civ6_sdk")
 
 

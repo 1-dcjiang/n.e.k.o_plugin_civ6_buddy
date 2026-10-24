@@ -471,14 +471,13 @@ class Civ6BuddyPlugin(NekoPluginBase):
         # 3) 映射 target → 官方焦点
         focus_map = {"balanced": "DEFAULT", "growth": "FOOD", "production": "PRODUCTION"}
         focus = focus_map[target]
-        before = {c["name"]: c["population"] for c in cities["cities"]}
         r = await civ6_tuner.set_focus(focus)
         if not r["ok"]:
             return {"output": f"设置焦点失败：{r.get('detail', r.get('error', ''))}",
                     "is_error": True, "error": r.get("error", "GAME_TUNER_OFF"),
                     "channel": "firetuner"}
         applied = {x["city"]: x["focus"] for x in r.get("results", [])}
-        lines = [f"精细运营执行完成（通道：FireTuner 官方焦点机制）："]
+        lines = ["精细运营执行完成（通道：FireTuner 官方焦点机制）："]
         for c in cities["cities"]:
             y = c["yields"]
             eff = "已应用" if c["name"] in applied else "未收到回执"

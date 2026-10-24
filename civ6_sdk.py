@@ -73,12 +73,12 @@ def candidate_steam_libs() -> list[str]:
             libs.append(str(p))
     seen: set[str] = set()
     out: list[str] = []
-    for l in libs:
-        key = l.rstrip("\\/").lower()
+    for lib in libs:
+        key = lib.rstrip("\\/").lower()
         if key in seen:
             continue
         seen.add(key)
-        out.append(l.rstrip("\\/"))
+        out.append(lib.rstrip("\\/"))
     return out
 
 

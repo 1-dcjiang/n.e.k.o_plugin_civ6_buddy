@@ -26,7 +26,6 @@ def test_unpack_rejects_short_frame():
 
 def test_unpack_rejects_bad_length():
     # 声称长度 9999999999（>1e7 上限）
-    raw = _tuner._pack(_tuner.TAG_COMMAND, "hi")
     # 手工构造超长长度帧
     import struct
     buf = struct.pack(_tuner.HEADER_FMT, 99_999_999, _tuner.TAG_COMMAND) + b"\x00"
