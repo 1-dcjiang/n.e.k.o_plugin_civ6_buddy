@@ -14,7 +14,7 @@ from pathlib import Path
 
 from plugin.sdk.plugin import NekoPluginBase, lifecycle, llm_tool, neko_plugin, plugin_entry
 
-from . import civ6_data, civ6_parser
+from . import civ6_data, civ6_ops, civ6_parser
 
 _logger = logging.getLogger("N.E.K.O.Plugin_civ6_buddy.civ6_buddy")
 
@@ -51,10 +51,12 @@ class Civ6BuddyPlugin(NekoPluginBase):
     def __init__(self, ctx):
         super().__init__(ctx)
         self._saves_dir = ""
+        self._ops_buttons: dict = {}
         self._cfg_loaded = False
+        self._ops_active = False
 
     def _load_config(self) -> None:
-        """读取运行配置 plugin.toml（civ6_buddy.saves_dir），失败静默用默认。"""
+        """读取运行配置 plugin.toml（civ6_buddy.saves_dir / ops_buttons），失败静默用默认。"""
         if self._cfg_loaded:
             return
         self._cfg_loaded = True
@@ -64,8 +66,18 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 import tomllib
                 data = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
                 sec = data.get("civ6_buddy", {})
-                if isinstance(sec, dict) and sec.get("saves_dir"):
-                    self._saves_dir = str(sec["saves_dir"])
+                if isinstance(sec, dict):
+                    if sec.get("saves_dir"):
+                        self._saves_dir = str(sec["saves_dir"])
+                    buttons = sec.get("ops_buttons")
+                    if isinstance(buttons, dict):
+                        cleaned = {}
+                        for k in ("next_turn", "policy_ok", "production_yes"):
+                            v = buttons.get(k)
+                            if (isinstance(v, (list, tuple)) and len(v) == 2
+                                    and all(isinstance(n, (int, float)) for n in v)):
+                                cleaned[k] = (float(v[0]), float(v[1]))
+                        self._ops_buttons = cleaned
         except Exception:  # 配置异常不影响插件工作
             _logger.warning("civ6_buddy config read failed, use defaults", exc_info=True)
 
@@ -238,6 +250,102 @@ class Civ6BuddyPlugin(NekoPluginBase):
     async def on_shutdown(self, **_):
         """关闭钩子：无后台资源需释放。"""
         return {"status": "stopped", "plugin": "civ6_buddy"}
+
+    # ══════════ 进阶版：屏幕自动化运营（推荐制） ══════════
+
+    @llm_tool(
+        name="civ6_ops_takeover",
+        description=(
+            "进入'运营托管'：玩家只负责打仗，YUI 接管本回合运营（推荐制：处理弹窗、点下一回合）。"
+            "何时用：用户说'接管运营/你替我点下一回合/运营交给你'。"
+            "参数无。只读+点击游戏内按钮，不改存档。之后每回合用 civ6_ops_tick 执行，"
+            "用户/战争打断用 civ6_ops_handoff 交还。"
+        ),
+        parameters={"type": "object", "properties": {}, "required": []},
+        timeout=30.0,
+    )
+    async def civ6_ops_takeover(self, **_):
+        self._load_config()
+        self._ops_active = True
+        try:
+            sit = civ6_parser.parse_save("", self._saves_dir)
+        except civ6_parser.Civ6Error as exc:
+            return _wrap_err(exc)
+        turn = sit.get("game_turn", 0)
+        return {
+            "output": (
+                f"已接管运营（第 {turn} 回合）。分工规则：运营归我（处理弹窗、点下一回合、"
+                "生产建议），打仗归你。每回合你说'继续'我就执行本回合；战争状态或你说"
+                "'我来打'就立即交还控制权。"
+            ),
+            "is_error": False, "active": True, "turn": turn,
+        }
+
+    @llm_tool(
+        name="civ6_ops_tick",
+        description=(
+            "执行一回合推荐制运营：定位游戏窗口→处理弹窗→点下一回合→验证结算与回合推进。"
+            "何时用：运营托管中，用户说'继续/执行本回合/点下一回合'。"
+            "参数无。检测到战争横幅立即停止并交还控制权；点完下一回合会解析存档验证回合数"
+            "确实 +1，未推进则如实报告并交还。不改存档、不点单位、不碰战斗。"
+        ),
+        parameters={"type": "object", "properties": {}, "required": []},
+        timeout=120.0,
+    )
+    async def civ6_ops_tick(self, **_):
+        self._load_config()
+        # 回合推进验证：执行前回合数
+        try:
+            t0 = int(civ6_parser.parse_save("", self._saves_dir).get("game_turn", 0))
+        except civ6_parser.Civ6Error as exc:
+            return _wrap_err(exc)
+        try:
+            result = civ6_ops.run_one_turn_ops(
+                {"saves_dir": self._saves_dir, "buttons": self._ops_buttons})
+        except civ6_ops.OpsError as exc:
+            if self._ops_active:
+                self._ops_active = False
+            out = _wrap_err(exc)
+            out["handoff"] = True
+            return out
+        if result.get("handoff"):
+            self._ops_active = False
+            return {"output": result.get("output", "运营停止"), "is_error": not result.get("ok", False),
+                    "log": result.get("log", []), "handoff": True}
+        # 验证回合推进：执行后回合数
+        try:
+            t1 = int(civ6_parser.parse_save("", self._saves_dir).get("game_turn", 0))
+        except civ6_parser.Civ6Error:
+            t1 = t0
+        if t1 <= t0:
+            self._ops_active = False
+            return {
+                "output": (
+                    f"已点击下一回合并等待结算，但存档回合数未推进（{t0} → {t1}）。"
+                    "可能游戏停在等待确认或结算未完成。请看一眼游戏窗口：若画面正常可再说'继续'重试；"
+                    "若有弹窗请手动处理。控制权暂交还给你。"
+                ),
+                "is_error": True, "error": "TURN_NOT_ADVANCED",
+                "log": result.get("log", []), "handoff": True, "turn_before": t0, "turn_after": t1,
+            }
+        return {"output": f"本回合运营完成（回合 {t0} → {t1}）：{result.get('output', '')}",
+                "is_error": False, "log": result.get("log", []), "handoff": False,
+                "turn_before": t0, "turn_after": t1}
+
+    @llm_tool(
+        name="civ6_ops_handoff",
+        description=(
+            "交还运营控制权：退出运营托管（战争开始/用户要自己操作时）。"
+            "何时用：用户说'我来打/我自己来/停止托管/交还控制'，或战争检测后。"
+            "参数无。只置状态，不操作游戏。"
+        ),
+        parameters={"type": "object", "properties": {}, "required": []},
+        timeout=15.0,
+    )
+    async def civ6_ops_handoff(self, **_):
+        self._ops_active = False
+        return {"output": "运营托管已结束，控制权交还给你。需要再托管时说'接管运营'。",
+                "is_error": False, "active": False}
 
 
 def _advice_lines(sit: dict, topic: str) -> list[str]:
