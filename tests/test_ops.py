@@ -6,12 +6,14 @@
 numpy 缺失时整模块跳过（CI 环境无 numpy 也能通过 Verify）。
 """
 
+# ruff: noqa: E402  （importorskip 之后才导入 civ6_ops，numpy 缺失时整模块跳过）
+
 import numpy as np
 import pytest
 
 np_ = pytest.importorskip("numpy")
 
-from civ6_ops import (  # noqa: E402  （importorskip 之后，CI 无 numpy 时整模块跳过）
+from civ6_ops import (
     _DEFAULT_BUTTONS,
     _VK_MAP,
     OpsError,
