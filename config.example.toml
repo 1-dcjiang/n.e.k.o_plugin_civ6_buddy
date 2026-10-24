@@ -1,0 +1,9 @@
+# 文明6陪玩插件运行配置（安装后写入 N.E.K.O/plugins/civ6_buddy/config/plugin.toml）
+
+[plugin_runtime]
+enabled = true
+auto_start = true
+
+[civ6_buddy]
+# 文明6存档目录（默认 Windows 位置；游戏改过存档路径时在此覆盖）
+saves_dir = "C:/Users/jh/Documents/My Games/Sid Meier's Civilization VI/Saves"
