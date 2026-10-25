@@ -452,17 +452,35 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 war_pre = wr.get("at_war", 0) > 0
         except Exception:
             war_pre = None
+        if war_pre is True:
+            # 战争中：玩家在打仗，运营不接管（避免抢玩家操作）
+            self._ops_active = False
+            _ops_lock_clear()
+            return {
+                "output": f"检测到战争状态（第 {turn} 回合）：运营不接管，控制权保持在你手上。"
+                          "打仗归你；战斗结束后说'继续运营'我再接管。",
+                "is_error": False, "active": False, "turn": turn, "handoff": True,
+                "reason": "WAR_TUNER",
+            }
         first = None
-        if war_pre is not True:
-            try:
-                first = await asyncio.to_thread(
-                    civ6_ops.run_one_turn_ops,
-                    {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
-                    war_state=war_pre if war_pre is not None else None,
-                )
-            except civ6_ops.OpsError as exc:
-                first = {"ok": False, "handoff": True,
-                         "output": f"接管后首回合运营出错：{exc}", "reason": "OPS_ERROR"}
+        try:
+            first = await asyncio.to_thread(
+                civ6_ops.run_one_turn_ops,
+                {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
+                war_state=None,
+            )
+        except civ6_ops.OpsError as exc:
+            first = {"ok": False, "handoff": True,
+                     "output": f"接管后首回合运营出错：{exc}", "reason": "OPS_ERROR"}
+        except Exception as exc:  # 非 OpsError（win32/线程异常）：清锁兜底，避免锁残留
+            self._ops_active = False
+            _ops_lock_clear()
+            return {
+                "output": f"已接管（第 {turn} 回合），但首回合运营出现异常：{exc}。"
+                          "请确认游戏窗口正常后再说'继续运营'重试。",
+                "is_error": True, "active": False, "turn": turn, "handoff": True,
+                "reason": "OPS_UNEXPECTED",
+            }
         if first is not None and first.get("handoff"):
             self._ops_active = False
             _ops_lock_clear()
@@ -519,13 +537,16 @@ class Civ6BuddyPlugin(NekoPluginBase):
             },
             "required": [],
         },
-        timeout=300.0,
+        timeout=900.0,
     )
     async def civ6_ops_tick(self, **kw):
         self._load_config()
         from . import civ6_tuner
 
-        loop_turns = int(kw.get("loop_turns", 1) or 1)
+        try:
+            loop_turns = int(kw.get("loop_turns", 1) or 1)
+        except (TypeError, ValueError):
+            loop_turns = 1
         if loop_turns < 1:
             loop_turns = 1
         if loop_turns > 50:

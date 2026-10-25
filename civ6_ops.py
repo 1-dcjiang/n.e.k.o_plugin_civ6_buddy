@@ -560,7 +560,8 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
     war_state: 调用方（asyncio 上下文）先经 Tuner 官方 API 测得的战争状态：
       True=战争中（立即交还，不点下一回合）；None=未测得（回退像素横幅检测）；
       False=确认非战争。
-    流程：找窗口 → 前置 → 截图 → 战争判断 → ESC 清扫弹窗 → 点下一回合 → 验证结算。
+    流程：找窗口 → 前置 → 截图 → 战争判断 → 先选科技（趁面板在，ESC 会吞掉它）
+    → ESC 清扫残留/弹窗 → 点下一回合 → 验证结算。
     生产/市政推荐按钮通过模板资产尝试（assets/*.png），缺失则跳过并如实标注。
     战争判断命中 → 停止并交还（不点下一回合）。结算后战争复检由调用方再做一次 Tuner 查询。
     """
@@ -569,10 +570,6 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
     log: list[str] = [f"窗口已定位并前置（执行通道：{_EXEC.channel}）"]
 
     # 1) 初始截图
-    screen = _shot(win)
-
-    # 1.5) ESC 预清扫：关掉任何残留面板（城市面板/科技树/外交/提示），文明6 ESC 无副作用
-    _press("esc", 0.35)
     screen = _shot(win)
 
     # 2) 战争判断（Tuner 结果优先；未测得时像素横幅兜底）→ 交还
@@ -592,6 +589,11 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
         _pick_first_research(win)
         log.append("检测到'选择研究'面板，已自动选择第一个科技（采矿业）")
         screen = _shot(win)
+
+    # 3.5) ESC 预清扫：选科技之后关掉任何残留面板（城市面板/科技树/外交/提示）。
+    # 注意顺序：ESC 会吞掉"选择研究"面板，必须先选科技再做预清扫，否则科技永远不选。
+    _press("esc", 0.35)
+    screen = _shot(win)
 
     # 4) 弹窗清扫（最多 3 次 ESC；仍挡→兜底点下一回合按钮→再验证）
     for i in range(3):
