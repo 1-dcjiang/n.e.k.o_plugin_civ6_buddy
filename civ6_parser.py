@@ -113,26 +113,57 @@ def self_check(saves_dir: str = "") -> dict:
 
 
 def _run_parser(save_path: str) -> dict:
-    """调用 node wrapper 解析存档 → 原始 JSON dict。"""
+    """调用 node wrapper 解析存档 → 原始 JSON dict。
+
+    实现说明（v0.4.8）：插件进程在打包环境（resources\\bin）下偶发 stdout=None，
+    故改用 Popen + stdout 写入临时文件，完全不依赖父进程的 stdout 管道；
+    失败时把 returncode / stderr 写入日志，便于定位。
+    """
     if not _WRAPPER.is_file():
         raise Civ6Error("PARSER_MISSING", f"插件内嵌解析器缺失：{_WRAPPER}")
+    import tempfile
+    tmp_path = None
     try:
-        proc = subprocess.run(
-            ["node", str(_WRAPPER), save_path, "--simple"],
-            capture_output=True, text=True, timeout=_PARSE_TIMEOUT,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        fd, tmp_path = tempfile.mkstemp(suffix=".civ6parse.json", prefix="civ6_")
+        out_fh = os.fdopen(fd, "w", encoding="utf-8", newline="")
+        try:
+            proc = subprocess.Popen(
+                ["node", str(_WRAPPER), save_path, "--simple"],
+                stdout=out_fh,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            _, err_text = proc.communicate(timeout=_PARSE_TIMEOUT)
+        finally:
+            out_fh.close()
     except FileNotFoundError:
         raise Civ6Error("NODE_MISSING", "未找到 node。请先安装 Node.js（>=16）后重启插件。")
     except subprocess.TimeoutExpired:
         raise Civ6Error("PARSE_TIMEOUT", f"解析存档超时（>{int(_PARSE_TIMEOUT)}s）：{save_path}")
     if proc.returncode != 0:
-        err = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+        err = (err_text or "").strip() or f"exit {proc.returncode}"
         raise Civ6Error("PARSE_FAILED", f"解析存档失败：{err[:400]}")
     try:
-        return json.loads(proc.stdout)
+        with open(tmp_path, encoding="utf-8") as fh:
+            raw_text = fh.read()
+    except OSError as exc:
+        raise Civ6Error("PARSE_OUTPUT_UNREADABLE", f"读取解析结果失败：{exc}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        raise Civ6Error(
+            "PARSE_EMPTY_OUTPUT",
+            f"解析器无输出（exit 0）：{(err_text or '')[:400]}",
+        )
+    try:
+        return json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        raise Civ6Error("PARSE_OUTPUT_INVALID", f"解析器输出非 JSON（{exc}），前 200 字符：{proc.stdout[:200]}")
+        raise Civ6Error("PARSE_OUTPUT_INVALID", f"解析器输出非 JSON（{exc}），前 200 字符：{raw_text[:200]}")
 
 
 def _build_situation(raw: dict, found: dict) -> dict:
