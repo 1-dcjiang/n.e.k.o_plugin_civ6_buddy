@@ -442,13 +442,47 @@ class Civ6BuddyPlugin(NekoPluginBase):
         except civ6_parser.Civ6Error as exc:
             return _wrap_err(exc)
         turn = sit.get("game_turn", 0)
+        # 接管即运营：内置推进第一回合（to_thread 防阻塞）。
+        # 历史教训：LLM 可能"先回复用户再调 tick"导致只接管不运营（13:13 复现），
+        # 这里接管时直接真实推进一回合，运营必然启动，不依赖 LLM 自觉。
+        war_pre = None
+        try:
+            wr = await civ6_tuner.at_war()
+            if wr.get("ok"):
+                war_pre = wr.get("at_war", 0) > 0
+        except Exception:
+            war_pre = None
+        first = None
+        if war_pre is not True:
+            try:
+                first = await asyncio.to_thread(
+                    civ6_ops.run_one_turn_ops,
+                    {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
+                    war_state=war_pre if war_pre is not None else None,
+                )
+            except civ6_ops.OpsError as exc:
+                first = {"ok": False, "handoff": True,
+                         "output": f"接管后首回合运营出错：{exc}", "reason": "OPS_ERROR"}
+        if first is not None and first.get("handoff"):
+            self._ops_active = False
+            _ops_lock_clear()
+            return {
+                "output": f"已接管运营（第 {turn} 回合），但首回合即交还：{first.get('output', '')}",
+                "is_error": not first.get("ok", False),
+                "active": False, "turn": turn, "handoff": True,
+                "reason": first.get("reason", ""),
+                "log": first.get("log", []),
+            }
+        first_line = ""
+        if first is not None and first.get("ok"):
+            first_line = f"\n接管即已推进第一回合：{first.get('output', '')}"
         return {
             "output": (
                 f"已接管运营（第 {turn} 回合）。分工规则：运营归我（处理弹窗、选科技、点下一回合），"
                 "打仗归你。立即开始连续运营：调用 civ6_ops_tick 带 loop_turns=20 自动推进，"
                 "每回合用真实状态汇报在干什么；战争状态或你说'我来打'就立即交还控制权。"
                 "严禁调用 steam_manager（运营期间它已让位，调用只会产生无意义回执打断运营）——"
-                "游戏局面由 civ6_buddy 的 situation/tuner/tick 提供。"
+                "游戏局面由 civ6_buddy 的 situation/tuner/tick 提供。" + first_line
             ),
             "is_error": False, "active": True, "turn": turn,
             "next_action": (
