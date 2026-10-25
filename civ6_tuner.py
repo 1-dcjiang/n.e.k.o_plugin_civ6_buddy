@@ -380,10 +380,14 @@ local techName = ""
 local okP, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
 if okP and pPlayer ~= nil then
   p = Game.GetLocalPlayer() or -1
-  turn = Game.GetGameTurn() or 0
+  pcall(function() turn = Game.GetGameTurn() or 0 end)
   local okCiv, civType = pcall(function() return pPlayer:GetCivilizationType() end)
-  if okCiv and civType ~= nil and GameInfo.Civilizations[civType] ~= nil then
-    civName = tostring(GameInfo.Civilizations[civType].Name or "")
+  if okCiv and civType ~= nil then
+    pcall(function()
+      if GameInfo and GameInfo.Civilizations and GameInfo.Civilizations[civType] ~= nil then
+        civName = tostring(GameInfo.Civilizations[civType].Name or "")
+      end
+    end)
   end
   local okCities, cList = pcall(function() return pPlayer:GetCities() end)
   if okCities and cList ~= nil then
@@ -393,8 +397,12 @@ if okP and pPlayer ~= nil then
   local okTechs, techs = pcall(function() return pPlayer:GetTechs() end)
   if okTechs and techs ~= nil then
     local okCur, cur = pcall(function() return techs:GetCurrentResearch() end)
-    if okCur and cur ~= nil and GameInfo.Technologies[cur] ~= nil then
-      techName = tostring(GameInfo.Technologies[cur].Name or "")
+    if okCur and cur ~= nil then
+      pcall(function()
+        if GameInfo and GameInfo.Technologies and GameInfo.Technologies[cur] ~= nil then
+          techName = tostring(GameInfo.Technologies[cur].Name or "")
+        end
+      end)
     end
   end
 end
