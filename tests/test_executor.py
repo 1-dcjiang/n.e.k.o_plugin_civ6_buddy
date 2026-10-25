@@ -5,9 +5,19 @@
 2. ctypes 兜底函数可用（v0.4.12 起插件进程无 pyautogui，键鼠/截图全走 ctypes）
 3. PrintWindow 对无效窗口给出稳定错误码（不崩溃）
 """
+import platform
+
 import pytest
-from _win32 import BITMAPINFOHEADER, mouse_click_abs, press_key, screen_region_rgb
 from civ6_ops import OpsError, _Executor
+
+# CI（GitHub Actions）跑在 Ubuntu/Linux：ctypes.WinDLL 仅 Windows 存在，
+# _win32 顶层导入在 Linux 会抛 AttributeError 导致测试收集失败（v0.6.3 教训）。
+# Windows 专属符号延迟到平台守卫内导入，Windows 专属测试在 Linux 上跳过。
+_WINDOWS = platform.system() == "Windows"
+if _WINDOWS:
+    from _win32 import BITMAPINFOHEADER, mouse_click_abs, press_key, screen_region_rgb
+else:
+    BITMAPINFOHEADER = mouse_click_abs = press_key = screen_region_rgb = None
 
 
 def test_executor_lazy_load_returns_modules():
@@ -18,6 +28,7 @@ def test_executor_lazy_load_returns_modules():
     assert hasattr(pil, "open")
 
 
+@pytest.mark.skipif(not _WINDOWS, reason="Windows-only ctypes fallback")
 def test_executor_ctypes_fallback_available():
     # 插件进程无 pyautogui → 键鼠/截图兜底必须来自 ctypes 兼容层
     assert BITMAPINFOHEADER is not None
@@ -35,6 +46,7 @@ def test_executor_methods_do_not_shadow_attributes():
     assert hasattr(ex, "_pil_mod")
 
 
+@pytest.mark.skipif(not _WINDOWS, reason="PrintWindow is Windows-only")
 def test_capture_printwindow_invalid_hwnd_raises_stable_code():
     ex = _Executor()
     # 无效窗口句柄 → PrintWindow 通道必须给出稳定错误码（而不是裸崩溃）
