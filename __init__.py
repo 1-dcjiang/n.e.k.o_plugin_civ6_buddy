@@ -400,19 +400,50 @@ class Civ6BuddyPlugin(NekoPluginBase):
     @llm_tool(
         name="civ6_ops_tick",
         description=(
-            "执行一回合推荐制运营：定位游戏窗口→战争检测（Tuner 官方 API 优先、像素横幅兜底）→"
-            "处理弹窗→点下一回合→验证结算与回合推进。"
-            "何时用：运营托管中，用户说'继续/执行本回合/点下一回合'。"
-            "检测到战争立即停止并交还控制权；点完下一回合会解析存档验证回合数"
-            "确实 +1，未推进则如实报告并交还。不改存档、不点单位、不碰战斗。"
+            "运营托管中执行本回合（或连续多回合）运营操作：定位游戏窗口→战争检测"
+            "（Tuner 官方 API 优先、像素横幅兜底）→处理弹窗→点下一回合→Tuner 实时验证回合推进。"
+            "何时用：运营托管中，用户说'继续/执行本回合/点下一回合/你一直玩别停/我吃饭你玩'。"
+            "参数 loop_turns：连续运营回合数，默认 1；loop_turns>1 时自动循环执行 N 回合，"
+            "战争/弹窗无法清除/连续 2 次回合未推进时立即停止并交还控制权。"
+            "检测到战争立即停止并交还；每回合用 FireTuner 实时回合数验证确实 +1，"
+            "未推进则如实报告并交还。不改存档、不点单位、不碰战斗。"
         ),
-        parameters={"type": "object", "properties": {}, "required": []},
-        timeout=120.0,
+        parameters={
+            "type": "object",
+            "properties": {
+                "loop_turns": {
+                    "type": "integer",
+                    "description": "连续运营回合数（1-50，默认 1；>1 时自动循环，遇战争/弹窗/未推进提前停止）",
+                },
+            },
+            "required": [],
+        },
+        timeout=300.0,
     )
-    async def civ6_ops_tick(self, **_):
+    async def civ6_ops_tick(self, **kw):
         self._load_config()
-        # 战争预检（Tuner 官方 API，asyncio 上下文内 await——不能在同步函数里 asyncio.run）
         from . import civ6_tuner
+
+        loop_turns = int(kw.get("loop_turns", 1) or 1)
+        if loop_turns < 1:
+            loop_turns = 1
+        if loop_turns > 50:
+            loop_turns = 50
+
+        async def _turn_async() -> int | None:
+            """实时回合数：Tuner 优先（游戏运行时准确），失败回退存档（可能滞后）。"""
+            try:
+                r = await civ6_tuner.read_situation(timeout=8.0)
+                if r.get("ok"):
+                    return int(r.get("turn", 0) or 0)
+            except Exception:
+                pass
+            try:
+                return int(civ6_parser.parse_save("", self._saves_dir).get("game_turn", 0))
+            except Exception:
+                return None
+
+        # 战争预检（Tuner 官方 API）
         war_pre = None
         try:
             wr = await civ6_tuner.at_war()
@@ -420,58 +451,80 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 war_pre = wr.get("at_war", 0) > 0
         except Exception:
             war_pre = None
-        # 回合推进验证：执行前回合数
-        try:
-            t0 = int(civ6_parser.parse_save("", self._saves_dir).get("game_turn", 0))
-        except civ6_parser.Civ6Error as exc:
-            return _wrap_err(exc)
-        try:
-            result = civ6_ops.run_one_turn_ops(
-                {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
-                war_state=war_pre,
-            )
-        except civ6_ops.OpsError as exc:
-            if self._ops_active:
+
+        t0 = await _turn_async()
+        if t0 is None:
+            t0 = 0
+        logs: list = []
+        turns_done = 0
+        no_advance = 0
+        for i in range(loop_turns):
+            try:
+                result = civ6_ops.run_one_turn_ops(
+                    {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
+                    war_state=war_pre if i == 0 else None,
+                )
+            except civ6_ops.OpsError as exc:
                 self._ops_active = False
-            out = _wrap_err(exc)
-            out["handoff"] = True
-            return out
-        if result.get("handoff"):
-            self._ops_active = False
-            return {"output": result.get("output", "运营停止"), "is_error": not result.get("ok", False),
-                    "log": result.get("log", []), "handoff": True,
-                    "reason": result.get("reason", "")}
-        # 结算后战争复检（Tuner；战争即交还）
-        try:
-            wr2 = await civ6_tuner.at_war()
-            if wr2.get("ok") and wr2.get("at_war", 0) > 0:
+                out = _wrap_err(exc)
+                out["handoff"] = True
+                out["turns_done"] = turns_done
+                return out
+            logs += result.get("log", [])
+            if result.get("handoff"):
                 self._ops_active = False
                 return {
-                    "output": "本回合运营已执行，但结算后 Tuner 检测到战争状态，控制权交还给你。",
-                    "is_error": False, "handoff": True,
-                    "log": result.get("log", []) + [f"结算后 Tuner 战争检测：{wr2.get('at_war')} 个敌对对象"],
+                    "output": f"已执行 {turns_done} 回合后停止：{result.get('output', '运营停止')}",
+                    "is_error": not result.get("ok", False),
+                    "log": logs, "handoff": True,
+                    "reason": result.get("reason", ""), "turns_done": turns_done,
                 }
-        except Exception:
-            pass
-        # 验证回合推进：执行后回合数
-        try:
-            t1 = int(civ6_parser.parse_save("", self._saves_dir).get("game_turn", 0))
-        except civ6_parser.Civ6Error:
-            t1 = t0
-        if t1 <= t0:
-            self._ops_active = False
-            return {
-                "output": (
-                    f"已点击下一回合并等待结算，但存档回合数未推进（{t0} → {t1}）。"
-                    "可能游戏停在等待确认或结算未完成。请看一眼游戏窗口：若画面正常可再说'继续'重试；"
-                    "若有弹窗请手动处理。控制权暂交还给你。"
-                ),
-                "is_error": True, "error": "TURN_NOT_ADVANCED",
-                "log": result.get("log", []), "handoff": True, "turn_before": t0, "turn_after": t1,
-            }
-        return {"output": f"本回合运营完成（回合 {t0} → {t1}）：{result.get('output', '')}",
-                "is_error": False, "log": result.get("log", []), "handoff": False,
-                "turn_before": t0, "turn_after": t1}
+            # 回合推进验证：Tuner 实时回合数
+            t1 = await _turn_async()
+            if t1 is None:
+                t1 = t0
+            if t1 <= t0:
+                no_advance += 1
+                if no_advance >= 2:
+                    self._ops_active = False
+                    return {
+                        "output": (
+                            f"已执行 {turns_done} 回合后停止：连续 2 次点击后回合数未推进"
+                            f"（{t0} → {t1}）。可能游戏停在等待确认/结算，或按钮坐标失效。"
+                            "请看一眼游戏窗口：若画面正常可再说'继续'重试；有弹窗请手动处理。控制权暂交还。"
+                        ),
+                        "is_error": True, "error": "TURN_NOT_ADVANCED",
+                        "log": logs, "handoff": True, "turn_before": t0, "turn_after": t1,
+                        "turns_done": turns_done,
+                    }
+            else:
+                no_advance = 0
+                turns_done += 1
+                t0 = t1
+            # 每回合结算后战争复检（Tuner；战争即交还）
+            try:
+                wr2 = await civ6_tuner.at_war()
+                if wr2.get("ok") and wr2.get("at_war", 0) > 0:
+                    self._ops_active = False
+                    return {
+                        "output": f"已执行 {turns_done} 回合，Tuner 检测到战争状态，控制权交还给你。",
+                        "is_error": False, "handoff": True,
+                        "log": logs + [f"结算后 Tuner 战争检测：{wr2.get('at_war')} 个敌对对象"],
+                        "turns_done": turns_done,
+                    }
+            except Exception:
+                pass
+            if i < loop_turns - 1:
+                import asyncio as _asyncio
+
+                await _asyncio.sleep(0.5)
+        self._ops_active = False
+        return {
+            "output": f"连续运营完成：共执行 {turns_done}/{loop_turns} 回合（回合推进至 {t0}）。"
+                      + ("" if turns_done == loop_turns else "部分回合未推进已提前停止。"),
+            "is_error": False, "log": logs, "handoff": False,
+            "turn_after": t0, "turns_done": turns_done, "turns_target": loop_turns,
+        }
 
     @llm_tool(
         name="civ6_ops_citizens",
