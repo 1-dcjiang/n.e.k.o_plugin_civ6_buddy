@@ -259,7 +259,11 @@ _WIN_TITLES = ("Civilization VI", "Sid Meier's Civilization VI", "CivilizationVI
 def _find_window_probe() -> bool:
     """只读探测：文明6 窗口当前是否存在（测试/状态检查用，不抛错、不操作）。"""
     try:
-        import win32gui
+        from ._win32 import win32gui
+    except ImportError:  # 包外直接加载（测试/独立脚本）
+        import _win32 as _win32_mod  # type: ignore
+
+        win32gui = _win32_mod.win32gui
     except Exception:
         return False
     found = []
@@ -279,7 +283,12 @@ def _find_window_probe() -> bool:
 
 def _find_window():
     """查找文明6 主窗口，返回 (hwnd, left, top, right, bottom)。未运行则抛 OpsError。"""
-    import win32gui
+    try:
+        from ._win32 import win32gui
+    except ImportError:  # 包外直接加载（测试/独立脚本）
+        import _win32 as _win32_mod  # type: ignore
+
+        win32gui = _win32_mod.win32gui
     matches = []
 
     def _enum(hwnd, _):
@@ -308,10 +317,15 @@ def _front_and_size(win: dict) -> dict:
     先 AttachThreadInput 挂到前台线程再 SetForegroundWindow + BringWindowToTop，
     成功率大幅提高。最终用 GetForegroundWindow 校验。
     """
-    import win32api
-    import win32con
-    import win32gui
-    import win32process
+    try:
+        from ._win32 import win32api, win32con, win32gui, win32process
+    except ImportError:  # 包外直接加载（测试/独立脚本）
+        import _win32 as _win32_mod  # type: ignore
+
+        win32gui = _win32_mod.win32gui
+        win32api = _win32_mod.win32api
+        win32con = _win32_mod.win32con
+        win32process = _win32_mod.win32process
     hwnd = win["hwnd"]
     try:
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
