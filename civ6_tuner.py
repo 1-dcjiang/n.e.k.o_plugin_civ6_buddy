@@ -198,18 +198,31 @@ async def execute_lua(
     await _drain(reader, timeout=0.1)
     await _send(writer, TAG_COMMAND, f"CMD:{state_index}:{code}")
     lines: list[str] = []
-    deadline = asyncio.get_running_loop().time() + timeout
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    got_any = False
+    last_data = loop.time()
     while True:
-        remaining = deadline - asyncio.get_running_loop().time()
+        now = loop.time()
+        remaining = deadline - now
         if remaining <= 0:
             break
+        # 性能优化：脚本输出完成后 FireTuner 不再发帧，继续等待只会白耗 2 秒/步。
+        # 收到首个输出行后改用短等待片（0.2s），连续 0.6s 无新帧判定流结束提前返回。
+        wait = min(remaining, 2.0)
+        if got_any:
+            wait = min(wait, 0.2)
         try:
-            _, payload = await _recv(reader, min(remaining, 2.0))
+            _, payload = await _recv(reader, wait)
         except TunerError:
             break  # 读取超时/帧损坏 → 停止收集
         text = _parse_output_payload(payload)
         if text is not None and text.strip():
             lines.append(text.strip())
+            got_any = True
+            last_data = loop.time()
+        elif got_any and (loop.time() - last_data) >= 0.6:
+            break  # 输出后 0.6s 无新帧 → 脚本已执行完
     await _drain(reader, timeout=0.2)
     return lines
 
@@ -2047,52 +2060,60 @@ if c then print("NW2=" .. tostring(not c:IsHidden())) else print("NW2=false") en
 
 
 def _right_click_game_window() -> str:
-    """在游戏窗口中央右键（关闭自然奇观等 blocking popup 的原生路径）。返回结果描述。"""
+    """在游戏窗口中央右键（关闭自然奇观等 blocking popup 的原生路径）。返回结果描述。
+
+    安全铁律：必须先激活游戏窗口再点击——游戏在后台时直接 pyautogui 点击
+    会落到前台窗口（实测会点到 QQ 等无关窗口，可能造成误操作）。"""
     import time as _time
 
+    hwnd_rect = None
+    hwnd = None
     try:
-        import pyautogui as _pg
+        import win32gui as _wg
+
+        def _cb(h, _):
+            nonlocal hwnd, hwnd_rect
+            if hwnd is None and _wg.IsWindowVisible(h) and _wg.GetWindowText(h):
+                tl = _wg.GetWindowText(h).lower()
+                if "civilization" in tl or "sid meier" in tl or "文明" in tl:
+                    hwnd = h
+                    hwnd_rect = _wg.GetWindowRect(h)
+        _wg.EnumWindows(_cb, None)
+    except Exception:
+        pass
+    if hwnd_rect is None:
+        # 兜底：pyautogui 找窗口（标题匹配）
         try:
+            import pyautogui as _pg
             wins = _pg.getWindowsWithTitle("Civilization")
             if not wins:
                 wins = _pg.getWindowsWithTitle("Sid Meier")
             if not wins:
                 wins = _pg.getWindowsWithTitle("文明")
-        except Exception:
-            wins = []
-        hwnd_rect = None
-        if wins:
-            w = wins[0]
-            try:
+            if wins:
+                w = wins[0]
                 hwnd_rect = (w.left, w.top, w.right, w.bottom)
-            except Exception:
-                hwnd_rect = None
-        if hwnd_rect is None:
-            # 兜底：win32 枚举
+        except Exception:
+            pass
+    if hwnd_rect is None:
+        return "（未找到游戏窗口，无法右键）"
+    try:
+        # 激活游戏窗口（前台锁定/最小化时尽力恢复）
+        if hwnd is not None:
             try:
-                import win32con as _wc
-                import win32gui as _wg
-
-                def _cb(h, _):
-                    nonlocal hwnd_rect
-                    if hwnd_rect is None and _wg.IsWindowVisible(h) and _wg.GetWindowText(h):
-                        tl = _wg.GetWindowText(h).lower()
-                        if "civilization" in tl or "sid meier" in tl or "文明" in tl:
-                            hwnd_rect = _wg.GetWindowRect(h)
-                            try:
-                                _wg.ShowWindow(h, _wc.SW_RESTORE)
-                            except Exception:
-                                pass
-                _wg.EnumWindows(_cb, None)
+                import win32con as _wc2
+                import win32gui as _wg2
+                _wg2.ShowWindow(hwnd, _wc2.SW_RESTORE)
+                _wg2.SetForegroundWindow(hwnd)
+                _time.sleep(0.6)
             except Exception:
                 pass
-        if hwnd_rect is None:
-            return "（未找到游戏窗口，无法右键）"
         x1, y1, x2, y2 = hwnd_rect
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-        _pg.click(cx, cy, button="right")
+        import pyautogui as _pg2
+        _pg2.click(cx, cy, button="right")
         _time.sleep(1.5)
-        return "（已右键游戏窗口中央）"
+        return "（已激活游戏窗口并右键中央）"
     except Exception as e:
         return f"（右键失败：{e}）"
 
@@ -2102,7 +2123,7 @@ async def auto_resolve_soft_blockers(timeout: float = 10.0) -> dict:
 
     处理：GOVERNOR_IDLE（总督空闲：SendActivated+Dismiss）、
     CONSIDER_GOVERNMENT_CHANGE（考虑更换政体：置 considered=true）、
-    WORLD_CONGRESS_LOOK（世界议会查看：RequestPlayerOperation + dismiss）、
+    WORLD_CONGRESS_LOOK / WORLD_CONGRESS_SPECIAL_SESSION（世界议会查看/特别会议：dismiss）、
     SPY_CHOOSE_ESCAPE_ROUTE（间谍选最快撤退路线）。
     返回 {"ok", "resolved": [类型列表]}。
     生产/科技/市政/单位/议会投票等策略性 blocker 不在本函数内处理（由调用方决策）。
@@ -2131,6 +2152,9 @@ pcall(function()
           elseif bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK then
             pcall(function() NotificationManager.Dismiss(me, nid) end)
             mark("WORLD_CONGRESS_LOOK")
+          elseif bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_WORLD_CONGRESS_SPECIAL_SESSION then
+            pcall(function() NotificationManager.Dismiss(me, nid) end)
+            mark("WORLD_CONGRESS_SPECIAL_SESSION")
           elseif bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_SPY_CHOOSE_ESCAPE_ROUTE then
             pcall(function() NotificationManager.Dismiss(me, nid) end)
             mark("SPY_ESCAPE_ROUTE")

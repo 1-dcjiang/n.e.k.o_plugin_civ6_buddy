@@ -4,7 +4,7 @@ name = "文明6陪玩"
 description = "让 YUI 陪玩家打文明6：深度监控（解析 .Civ6Save 存档）获知当前局面——回合数/游戏速度/地图大小与类型/你的文明与领袖（含特性）/全部敌对文明与领袖/城邦列表/已装 MOD，据此给出陪玩建议（开局/科技/建城/战争/胜利路线/外交分主题规则化建议）。v0.2.0 新增进阶版：屏幕自动化运营托管（civ6_ops_takeover/civ6_ops_tick/civ6_ops_handoff）——YUI 按'推荐制'替玩家执行运营（处理弹窗、点下一回合），玩家只负责打仗。v0.3.0 打通 FireTuner 底层通道（civ6_tuner_status/civ6_city_details/civ6_ops_focus）——官方 API 直接读城市人口与产出、市民焦点分配，比像素点击可靠。v0.4.0 新增 civ6_ensure_sdk 自动装 Steam SDK（appid 597260）+ 自动启用 Tuner + 探测 4318；运营战争检测改 Tuner 官方 API（像素横幅兜底）；civ6_ops_citizens 精细运营真正落地（读真实城市数据→按目标执行官方焦点分配）。v0.5.0 运营彻底打通官方写链路：回合读取修正（GetCurrentGameTurn）；每回合读 blockers（未选生产/科技/市政/单位待指挥/软 blocker）→ 官方 API 设置生产（RequestOperation）与科研（PlayerOperations.RESEARCH）→ GameCore 跳过单位剩余移动 → 自动关闭挡路的顾问/科技完成弹窗 → ACTION_ENDTURN 结束回合 → 真实回合数验证推进；civ6_ops_tick 改 Tuner 写优先（屏幕点击兜底），新增 civ6_ops_status（真实局面）/civ6_ops_set_production/civ6_ops_set_research（策略工具）；托管期间 steam_manager 让位锁保持至交还。v0.5.1 实机验收补丁：新增自动填补政策槽（ENDTURN_BLOCKING_FILL_CIVIC_SLOT——市政完成出现空槽挡回合），官方 UNLOCK_POLICIES + RequestPolicyChanges 三步填满；实机 15→16→17→18 连续推进验证通过（填槽/设建造者生产/选陶器/跳单位/关弹窗全链路）。v0.5.2 侦察兵真探路：新增 civ6_tuner.move_explorers（每回合向远离首都方向移动一格，避开水域/山脉/己方单位），回合管理 UNITS 分支先探路再结束剩余移动力；实机 18→19 推进，侦察兵 10,13→11,12、9,13→8,12 位置真实变化；勇士/建造者不主动移动（战斗单位不引战——打仗归玩家，建造者等策略工具指挥）。v0.5.3 局面感知决策：政策填槽升级按局面评分（读人口/金币/侦察勇士数→城市规划/神王/勘察/纪律/农业按权重取最优，不再机械填第一张）；万神殿自动选择（ENDTURN_BLOCKING_PANTHEON——扫描首都3圈地形匹配：沙漠/雨林/冻土/临河/沿海→对应万神殿，默认神启）；新增 civ6_tuner.read_economy 经济读数（金币/信仰/人口/单位构成/首都），civ6_ops_status 输出带经济面板，信仰≥25 提示万神殿可自动选。v0.5.4 外交+文化+卡死弹窗修复：新增 read_diplomacy（对每个文明读关系状态 DIPLO_STATE_*、城邦列表/距离/使节数/能否派使节）、read_culture（文化产出/旅游业绩/巨作数/当前市政）、auto_send_envoy（ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN 自动派给离首都最近的城邦——官方 GIVE_INFLUENCE_TOKEN）；civ6_ops_status 新增外交面板与文化面板；政策评分表补外交卡（特许状 CHARTERS/外交联盟 DIPLOMATIC_LEAGUE）；close_ui_popups 实测修复两类卡死弹窗——自然奇观发现（NaturalWonderPopup blocking popup，Lua 关不掉、仅游戏原生右键解锁，Python 侧 pyautogui 右键兜底）与尤里卡提示（BoostUnlockedPopup SetHide）；实机 21→22 连续推进，卡死解除。v0.5.5 全系统运营补全：单位自动升级（ENDTURN_BLOCKING_UNIT_PROMOTION——GameCore SetPromotion 自动选第一个可用升级+清零 stored，纯强化不引战）、总督自动任命（GOVERNOR_APPOINTMENT——选第一个未任命总督分配首都）、时代纪念自动选择（COMMEMORATION_AVAILABLE——COMMEMORATE 选第一个可用纪念）；堆叠单位 blocker 尝试跳过解除、失败交还；结束回合自愈兜底（endturn 后回合未推进→自动重关弹窗再结束，最多 3 轮，防新弹窗连环卡死）；全部新 Lua 全程 pcall 防 API 缺失挂死（无总督/无纪念时明确返回 NO_POINT/NONE 而非无回执）。实机 22→23 推进。执行层复用 steam_manager 现成键鼠操控（缺失回退 pyautogui）；纯只读不改存档，每次操作截图验证、识别不了就停下如实汇报。存档解析使用插件内嵌 pydt/civ6-save-parser（MIT），调用本机 node（>=16）。存档目录默认 Documents\\My Games\\Sid Meier's Civilization VI\\Saves，可在 config 覆盖"
 short_description = "文明6陪玩：解析存档获知局面并给建议；运营托管打通 FireTuner 官方写链路（生产/科研/单位/弹窗→真实推进回合，不瞎点不挂机不编状态）；打仗归你"
 keywords = ["文明6", "Civilization VI", "Civ6", "陪玩", "存档", "Civ6Save", "局面", "攻略", "开局", "科技", "建城", "战争", "胜利", "城邦", "领袖", "文明特性", "situation", "advisor", "buddy", "coach", "运营托管", "键鼠接管", "屏幕自动化", "接管", "交还", "takeover", "FireTuner", "Tuner", "SDK", "4318", "底层通道", "市民分配", "焦点", "精细运营", "自动安装", "blocker", "生产", "科研", "结束回合", "官方API"]
-version = "0.5.5"
+version = "0.5.6"
 type = "plugin"
 entry = "plugin.plugins.civ6_buddy:Civ6BuddyPlugin"
 
@@ -29,6 +29,7 @@ enabled = true
 id = "quickstart"
 title = "使用说明"
 entry = "docs/guide.md"
+
 
 
 

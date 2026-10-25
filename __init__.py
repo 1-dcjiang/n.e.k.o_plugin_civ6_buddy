@@ -752,6 +752,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
             elif bt in ("ENDTURN_BLOCKING_GOVERNOR_IDLE",
                         "ENDTURN_BLOCKING_CONSIDER_GOVERNMENT_CHANGE",
                         "ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK",
+                        "ENDTURN_BLOCKING_WORLD_CONGRESS_SPECIAL_SESSION",
                         "ENDTURN_BLOCKING_SPY_CHOOSE_ESCAPE_ROUTE"):
                 r = await civ6_tuner.auto_resolve_soft_blockers(timeout=10.0)
                 logs.append(f"自动软 blocker：{r.get('detail', r.get('error', ''))}")
@@ -831,8 +832,17 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 if s.get("ok") and int(s.get("turn", 0) or 0) > turn_before:
                     return {"ok": True, "handoff": False,
                             "turn_after": int(s.get("turn", 0) or 0), "log": logs}
-            # 未推进：可能冒出新的拦截弹窗（如奇观/尤里卡）——再关一次再试
+            # 未推进：可能冒出新的拦截弹窗（奇观/尤里卡/城邦请求等无固定 Lua 路径的 modal）——
+            # 第 2 轮起先做屏幕级右键解除（游戏原生关闭 modal 弹窗路径，实测对奇观弹窗有效；
+            # 城邦请求弹窗=取消请求，符合"托管不主动派兵参战"纪律），再关弹窗再结束。
             if attempt < 2:
+                if attempt == 1:
+                    try:
+                        rc = civ6_tuner._right_click_game_window()
+                        logs.append(f"自愈右键解除 modal：{rc}")
+                    except Exception as exc:
+                        logs.append(f"自愈右键失败：{exc}")
+                    await asyncio.sleep(1.0)
                 cp2 = await civ6_tuner.close_ui_popups(timeout=10.0)
                 logs.append(f"自愈重试{attempt + 1}：{cp2.get('detail', cp2.get('error', ''))}")
         return {"handoff": True, "ok": False, "reason": "TURN_NOT_ADVANCED",
