@@ -1198,6 +1198,232 @@ print("MOVED=" .. table.concat(targets, "|"))
     return {"ok": False, "error": "NO_RESPONSE", "detail": "侦察兵移动无回执（Tuner 输出丢失），请重试"}
 
 
+async def read_threats(timeout: float = 10.0) -> dict:
+    """扫描本地玩家单位的威胁态势（InGame）。
+
+    对每个己方单位读：位置/类型/战力/剩余移动力，并扫描周围 5 格内的敌方单位
+    （可见范围内），输出敌方最强战力与数量。供避险决策使用——回答"碰到比自己
+    强大的敌人怎么办"：先看清敌我力量对比，再决定撤/守。
+    返回 {"ok", "units": [{id, type, x, y, str, moves, threat_str, threat_count, threat_dist}]}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local capX, capY = -1, -1
+pcall(function()
+  local cap = Players[me]:GetCities():GetCapitalCity()
+  if cap then capX, capY = cap:GetX(), cap:GetY() end
+end)
+local rows = {}
+for _, u in Players[me]:GetUnits():Members() do
+  local x, y = u:GetX(), u:GetY()
+  if x ~= -9999 then
+    local info = GameInfo.Units[u:GetType()]
+    local ut = info and info.UnitType or "?"
+    local str = 0
+    if info and info.Combat then str = info.Combat end
+    local moves = 0
+    pcall(function() moves = u:GetMovesRemaining() or 0 end)
+    local tStr, tCount, tDist = -1, 0, 99
+    -- 扫描周围 5 格（曼哈顿/切比雪夫混合：|dx|<=2, |dy|<=2）
+    for dx = -2, 2 do for dy = -2, 2 do
+      if dx ~= 0 or dy ~= 0 then
+        local nx, ny = x + dx, y + dy
+        local p = Map.GetPlot(nx, ny)
+        if p then
+          local owner = -1
+          pcall(function() owner = p:GetOwner() end)
+          if owner >= 0 and owner ~= me then
+            local eStr = -1
+            local eCount = 0
+            pcall(function()
+              local us = Map.GetUnitsAt(nx, ny)
+              if us then
+                for o in us:Units() do
+                  if o:GetOwner() == owner and o:GetX() == nx then
+                    eCount = eCount + 1
+                    local ei = GameInfo.Units[o:GetType()]
+                    local cs = 0
+                    if ei and ei.Combat then cs = ei.Combat end
+                    if cs > eStr then eStr = cs end
+                  end
+                end
+              end
+            end)
+            if eCount > 0 and eStr > tStr then
+              tStr = eStr
+              tCount = eCount
+              tDist = math.max(math.abs(dx), math.abs(dy))
+            end
+          end
+        end
+      end
+    end end
+    rows[#rows+1] = string.format("%d|%s|%d,%d|%d|%d|%d|%d|%d",
+        u:GetID(), ut, x, y, str, moves, tStr, tCount, tDist)
+  end
+end
+print("THREATS|" .. table.concat(rows, ";;"))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("THREATS|"):
+            continue
+        payload = line[len("THREATS|"):]
+        units = []
+        for part in payload.split(";;"):
+            f = part.split("|")
+            if len(f) == 8:
+                xy = f[2].split(",")
+                units.append({
+                    "id": int(f[0]), "type": f[1], "x": int(xy[0]), "y": int(xy[1]),
+                    "str": int(f[3]), "moves": int(f[4]),
+                    "threat_str": int(f[5]), "threat_count": int(f[6]), "threat_dist": int(f[7]),
+                })
+        return {"ok": True, "app": app_id, "units": units,
+                "detail": f"威胁扫描完成（{len(units)} 个单位，含 {sum(1 for u in units if u['threat_count'] > 0)} 个受威胁单位）",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "威胁扫描无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_evade_threats(timeout: float = 15.0) -> dict:
+    """避险移动：对受威胁单位（附近敌方战力 ≥ 我方 1.2 倍）向远离威胁方向撤退一格。
+
+    回答"碰到比自己强大的敌人怎么办"——托管纪律明确：
+    1. 敌强我弱（敌方战力 ≥ 我方 1.2 倍）→ 自动向远离威胁方向撤退（自保，不送死）；
+    2. 敌弱我强或势均力敌 → 原地警戒（不主动攻击——战争归玩家，YUI 不引战）；
+    3. 城市被威胁 → 在回合摘要里明确报告，建议玩家决策。
+    侦察兵/勇士/建造者都适用（建造者遇到蛮族也会撤）。移动用 InGame MOVE_TO（异步生效），
+    调用方短等待后再 skip。返回 {"ok", "evaded": ["WARRIOR:9,13->8,14 敌强撤"]}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local capX, capY = -1, -1
+pcall(function()
+  local cap = Players[me]:GetCities():GetCapitalCity()
+  if cap then capX, capY = cap:GetX(), cap:GetY() end
+end)
+local evaded = {}
+-- 先收集威胁信息（同 read_threats），对受威胁且有移动力的单位找远离方向
+local danger = {}
+for _, u in Players[me]:GetUnits():Members() do
+  local x, y = u:GetX(), u:GetY()
+  if x ~= -9999 then
+    local uinfo = GameInfo.Units[u:GetType()]
+    local str = 0
+    if uinfo and uinfo.Combat then str = uinfo.Combat end
+    local tStr, tCount, tDX, tDY = -1, 0, 0, 0
+    for dx = -2, 2 do for dy = -2, 2 do
+      if dx ~= 0 or dy ~= 0 then
+        local p = Map.GetPlot(x + dx, y + dy)
+        if p then
+          local owner = -1
+          pcall(function() owner = p:GetOwner() end)
+          if owner >= 0 and owner ~= me then
+            local eStr, eCount = -1, 0
+            pcall(function()
+              local us = Map.GetUnitsAt(x + dx, y + dy)
+              if us then
+                for o in us:Units() do
+                  if o:GetOwner() == owner then
+                    eCount = eCount + 1
+                    local ei = GameInfo.Units[o:GetType()]
+                    local cs = 0
+                    if ei and ei.Combat then cs = ei.Combat end
+                    if cs > eStr then eStr = cs end
+                  end
+                end
+              end
+            end)
+            if eCount > 0 and eStr > tStr then
+              tStr = eStr; tCount = eCount; tDX = dx; tDY = dy
+            end
+          end
+        end
+      end
+    end end
+    if tCount > 0 and tStr >= str * 1.2 then
+      danger[u:GetID()] = {x=x, y=y, str=str, tStr=tStr, tDX=tDX, tDY=tDY}
+    end
+  end
+end
+-- 对受威胁单位：向远离威胁方向找相邻可行格移动
+for _, u in Players[me]:GetUnits():Members() do
+  local d = danger[u:GetID()]
+  if d and (u:GetMovesRemaining() or 0) > 0 then
+    local best, bestScore = nil, -999999
+    for dx = -1, 1 do for dy = -1, 1 do
+      if dx ~= 0 or dy ~= 0 then
+        local nx, ny = d.x + dx, d.y + dy
+        local p = Map.GetPlot(nx, ny)
+        if p and not p:IsWater() and not p:IsMountain() then
+          local occ = false
+          local us = Map.GetUnitsAt(nx, ny)
+          if us then
+            for o in us:Units() do if o:GetOwner() == me then occ = true break end end
+          end
+          if not occ then
+            -- 远离威胁方向分（沿威胁反向）+ 靠近首都分
+            local score = -((nx - d.x) * d.tDX + (ny - d.y) * d.tDY)
+            if capX >= 0 then
+              local towardCap = (d.x - capX) * (d.x - nx) + (d.y - capY) * (d.y - ny)
+              score = score + towardCap * 0.5
+            end
+            if score > bestScore then bestScore = score; best = {nx, ny} end
+          end
+        end
+      end
+    end end
+    if best then
+      local params = {}
+      params[UnitOperationTypes.PARAM_X] = best[1]
+      params[UnitOperationTypes.PARAM_Y] = best[2]
+      pcall(function() UnitManager.RequestOperation(u, UnitOperationTypes.MOVE_TO, params) end)
+      local info = GameInfo.Units[u:GetType()]
+      local ut = info and info.UnitType or "?"
+      evaded[#evaded+1] = string.format("%s:%d,%d->%d,%d 敌强(%d)撤",
+          ut, d.x, d.y, best[1], best[2], d.tStr)
+    end
+  end
+end
+print("EVADED=" .. table.concat(evaded, "|"))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("EVADED="):
+            continue
+        evaded = [t for t in line[len("EVADED="):].split("|") if t]
+        return {"ok": True, "app": app_id, "evaded": evaded,
+                "detail": f"避险移动：{len(evaded)} 个单位撤退（{'；'.join(evaded) or '无受威胁单位，无需撤退'}）",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "避险移动无回执（Tuner 输出丢失），请重试"}
+
+
 async def read_economy(timeout: float = 8.0) -> dict:
     """读经济/宗教/单位构成（InGame）：金币、信仰、总人口、城市数、侦察/勇士/建造者数、首都坐标。
 

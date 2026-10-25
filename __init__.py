@@ -797,7 +797,10 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 if not u.get("ok"):
                     hard.append((bt, u.get("detail", "")))
                 elif u.get("skip_idle_ok"):
-                    # 先让侦察兵真正探路（远离首都方向），再结束剩余移动力
+                    # 先避险（敌强撤退，自保不引战）→ 再让侦察兵真正探路（远离首都方向）→ 结束剩余移动力
+                    ev = await civ6_tuner.auto_evade_threats(timeout=15.0)
+                    logs.append(f"避险：{ev.get('detail', ev.get('error', '无威胁'))}")
+                    await asyncio.sleep(1.0)
                     me = await civ6_tuner.move_explorers(timeout=15.0)
                     logs.append(f"侦察探路：{me.get('detail', me.get('error', '跳过'))}")
                     await asyncio.sleep(2.0)
