@@ -394,7 +394,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
     async def civ6_ops_tick(self, **_):
         self._load_config()
         # 战争预检（Tuner 官方 API，asyncio 上下文内 await——不能在同步函数里 asyncio.run）
-        import civ6_tuner
+        from . import civ6_tuner
         war_pre = None
         try:
             wr = await civ6_tuner.at_war()
@@ -480,7 +480,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
         target = str(target or params.get("target") or "balanced").strip().lower()
         if target not in ("balanced", "growth", "production"):
             target = "balanced"
-        import civ6_tuner
+        from . import civ6_tuner
         # 1) Tuner 是否可用
         status = await civ6_tuner.tuner_status()
         if not status["ok"]:
@@ -543,7 +543,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
         timeout=20.0,
     )
     async def civ6_tuner_status(self, **_):
-        import civ6_tuner
+        from . import civ6_tuner
         status = await civ6_tuner.tuner_status()
         if not status["ok"]:
             return {
@@ -569,7 +569,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def civ6_city_details(self, **_):
-        import civ6_tuner
+        from . import civ6_tuner
         r = await civ6_tuner.list_cities()
         if not r["ok"]:
             return {"output": f"读取城市数据失败：{r.get('detail', r.get('error', ''))}",
@@ -610,7 +610,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
     async def civ6_ops_focus(self, *, focus: str = "FOOD", **_):
         params = _tool_params(_)
         focus = str(focus or params.get("focus") or "FOOD").strip()
-        import civ6_tuner
+        from . import civ6_tuner
         r = await civ6_tuner.set_focus(focus)
         if not r["ok"]:
             return {"output": f"设置焦点失败：{r.get('detail', r.get('error', ''))}",
