@@ -401,7 +401,10 @@ class Civ6BuddyPlugin(NekoPluginBase):
         name="civ6_ops_tick",
         description=(
             "运营托管中执行本回合（或连续多回合）运营操作：定位游戏窗口→战争检测"
-            "（Tuner 官方 API 优先、像素横幅兜底）→处理弹窗→点下一回合→Tuner 实时验证回合推进。"
+            "（Tuner 官方 API 优先、像素横幅兜底）→处理弹窗/开局选科技→点下一回合→"
+            "Tuner 实时验证回合推进。返回 turn_summaries（每回合真实状态：当前研究科技、"
+            "城市人口），汇报时必须引用这些真实状态说明自己在干什么、为什么，"
+            "不得只说'点了下一回合'。"
             "何时用：运营托管中，用户说'继续/执行本回合/点下一回合/你一直玩别停/我吃饭你玩'。"
             "参数 loop_turns：连续运营回合数，默认 1；loop_turns>1 时自动循环执行 N 回合，"
             "战争/弹窗无法清除/连续 2 次回合未推进时立即停止并交还控制权。"
@@ -443,6 +446,36 @@ class Civ6BuddyPlugin(NekoPluginBase):
             except Exception:
                 return None
 
+        async def _semantic_line(turn: int) -> str:
+            """从 Tuner 读真实游戏状态，拼一句'我现在在干什么'的语义摘要，
+            让托管方（Neko）能读懂并汇报，而不是只知道坐标/日志。"""
+            bits = [f"回合{turn}"]
+            try:
+                r = await civ6_tuner.read_situation(timeout=6.0)
+                if r.get("ok"):
+                    civ = str(r.get("civ") or "")
+                    tech = str(r.get("tech") or "")
+                    cities = int(r.get("cities", 0) or 0)
+                    if civ:
+                        bits.append(f"文明{civ}")
+                    if tech:
+                        bits.append(f"研究《{tech}》")
+                    bits.append(f"城市{cities}座")
+            except Exception:
+                pass
+            try:
+                c = await civ6_tuner.list_cities(timeout=6.0)
+                if c.get("ok"):
+                    pops = [
+                        f"{x.get('name', '?')}人口{x.get('population', '?')}"
+                        for x in c.get("cities", [])[:3]
+                    ]
+                    if pops:
+                        bits.append("，".join(pops))
+            except Exception:
+                pass
+            return "；".join(bits)
+
         # 战争预检（Tuner 官方 API）
         war_pre = None
         try:
@@ -458,6 +491,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
         logs: list = []
         turns_done = 0
         no_advance = 0
+        turn_summaries: list = []
         for i in range(loop_turns):
             try:
                 result = civ6_ops.run_one_turn_ops(
@@ -478,6 +512,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                     "is_error": not result.get("ok", False),
                     "log": logs, "handoff": True,
                     "reason": result.get("reason", ""), "turns_done": turns_done,
+                    "turn_summaries": turn_summaries,
                 }
             # 回合推进验证：Tuner 实时回合数
             t1 = await _turn_async()
@@ -496,11 +531,20 @@ class Civ6BuddyPlugin(NekoPluginBase):
                         "is_error": True, "error": "TURN_NOT_ADVANCED",
                         "log": logs, "handoff": True, "turn_before": t0, "turn_after": t1,
                         "turns_done": turns_done,
+                        "turn_summaries": turn_summaries,
                     }
             else:
                 no_advance = 0
                 turns_done += 1
                 t0 = t1
+                # 语义摘要：让托管方知道每个回合'在干什么'（研究/城市/人口真实状态）
+                try:
+                    sem = await _semantic_line(t0)
+                    if sem:
+                        turn_summaries.append(sem)
+                        logs.append(f"运营摘要：{sem}")
+                except Exception:
+                    pass
             # 每回合结算后战争复检（Tuner；战争即交还）
             try:
                 wr2 = await civ6_tuner.at_war()
@@ -511,6 +555,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                         "is_error": False, "handoff": True,
                         "log": logs + [f"结算后 Tuner 战争检测：{wr2.get('at_war')} 个敌对对象"],
                         "turns_done": turns_done,
+                        "turn_summaries": turn_summaries,
                     }
             except Exception:
                 pass
@@ -524,6 +569,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                       + ("" if turns_done == loop_turns else "部分回合未推进已提前停止。"),
             "is_error": False, "log": logs, "handoff": False,
             "turn_after": t0, "turns_done": turns_done, "turns_target": loop_turns,
+            "turn_summaries": turn_summaries,
         }
 
     @llm_tool(
