@@ -1424,6 +1424,179 @@ print("EVADED=" .. table.concat(evaded, "|"))
     return {"ok": False, "error": "NO_RESPONSE", "detail": "避险移动无回执（Tuner 输出丢失），请重试"}
 
 
+async def auto_use_builder(timeout: float = 20.0) -> dict:
+    """让建造者自动改良地块（InGame BUILD_IMPROVEMENT）——回答"工人会建建筑吗"。
+
+    对每个有移动力的建造者：找其相邻格中"我方领土 + 无已有改良 + 无己方单位 +
+    可建改良"的最优格（改良白名单 FARM/MINE/PASTURE/QUARRY/PLANTATION/CAMP/
+    LUMBER_MILL，资源格优先 + 食物/生产力按格型加分 + 靠近首都加分），
+    RequestOperation BUILD_IMPROVEMENT 原地建造（官方写法：PARAM_X/Y 为所在格，
+    与 CanStartOperation 校验一致）。无可用相邻格则不动（不瞎跑）。
+    返回 {"ok", "built": ["FARM@10,14"], "detail"}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local capX, capY = -1, -1
+pcall(function()
+  local cap = Players[me]:GetCities():GetCapitalCity()
+  if cap then capX, capY = cap:GetX(), cap:GetY() end
+end)
+local whitelist = {"IMPROVEMENT_FARM", "IMPROVEMENT_MINE", "IMPROVEMENT_PASTURE",
+                   "IMPROVEMENT_QUARRY", "IMPROVEMENT_PLANTATION", "IMPROVEMENT_CAMP",
+                   "IMPROVEMENT_LUMBER_MILL"}
+local built = {}
+local moved = {}
+local done = {}
+local function pick_improvement(u, nx, ny)
+  local p = Map.GetPlot(nx, ny)
+  if p == nil then return nil end
+  local owner = -1
+  pcall(function() owner = p:GetOwner() end)
+  if owner ~= me then return nil end
+  local hasImp = -1
+  pcall(function() hasImp = p:GetImprovementType() end)
+  if hasImp >= 0 then return nil end
+  local occ = false
+  local us = Map.GetUnitsAt(nx, ny)
+  if us then
+    for o in us:Units() do if o:GetOwner() == me then occ = true break end end
+  end
+  if occ then return nil end
+  local bestImp, impScore = nil, -999999
+  for _, impName in ipairs(whitelist) do
+    local imp = GameInfo.Improvements[impName]
+    if imp then
+      local params = {}
+      params[UnitOperationTypes.PARAM_X] = nx
+      params[UnitOperationTypes.PARAM_Y] = ny
+      params[UnitOperationTypes.PARAM_IMPROVEMENT_TYPE] = imp.Hash
+      local ok, can = pcall(function()
+        return UnitManager.CanStartOperation(u, UnitOperationTypes.BUILD_IMPROVEMENT, nil, params)
+      end)
+      if ok and can then
+        local sc = 0
+        local res = -1
+        pcall(function() res = p:GetResourceType() end)
+        if res >= 0 then sc = 100 end
+        if impName == "IMPROVEMENT_FARM" then sc = sc + 50 end
+        if impName == "IMPROVEMENT_MINE" then sc = sc + 40 end
+        if sc > impScore then impScore = sc; bestImp = impName end
+      end
+    end
+  end
+  if bestImp then
+    local sc = impScore
+    if capX >= 0 then
+      sc = sc - (math.abs(nx - capX) + math.abs(ny - capY))
+    end
+    return {nx, ny, bestImp, sc}
+  end
+  return nil
+end
+for _, u in Players[me]:GetUnits():Members() do
+  if not done[u:GetID()] then
+    done[u:GetID()] = true
+    local info = GameInfo.Units[u:GetType()]
+    if info and info.UnitType == "UNIT_BUILDER" and (u:GetMovesRemaining() or 0) > 0 then
+      local x, y = u:GetX(), u:GetY()
+      if x ~= -9999 then
+        -- 情况1：当前格可建 → 原地直接建（BUILD 要求单位在目标格）
+        local cur = pick_improvement(u, x, y)
+        if cur then
+          local params = {}
+          params[UnitOperationTypes.PARAM_X] = cur[1]
+          params[UnitOperationTypes.PARAM_Y] = cur[2]
+          params[UnitOperationTypes.PARAM_IMPROVEMENT_TYPE] = GameInfo.Improvements[cur[3]].Hash
+          pcall(function() UnitManager.RequestOperation(u, UnitOperationTypes.BUILD_IMPROVEMENT, params) end)
+          built[#built+1] = cur[3] .. "@" .. cur[1] .. "," .. cur[2]
+        else
+          -- 情况2：相邻最优可建格 → 先移动过去（下回合建）
+          local best, bestScore = nil, -999999
+          for dx = -1, 1 do for dy = -1, 1 do
+            if dx ~= 0 or dy ~= 0 then
+              local cand = pick_improvement(u, x + dx, y + dy)
+              if cand and cand[4] > bestScore then bestScore = cand[4]; best = cand end
+            end
+          end end
+          if best then
+            local params = {}
+            params[UnitOperationTypes.PARAM_X] = best[1]
+            params[UnitOperationTypes.PARAM_Y] = best[2]
+            pcall(function() UnitManager.RequestOperation(u, UnitOperationTypes.MOVE_TO, params) end)
+            moved[#moved+1] = x .. "," .. y .. "->" .. best[1] .. "," .. best[2] .. "(待建" .. best[3] .. ")"
+          end
+        end
+      end
+    end
+  end
+end
+print("BUILT=" .. table.concat(built, "|") .. "|MOVED=" .. table.concat(moved, "|"))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("BUILT="):
+            continue
+        payload = line[len("BUILT="):]
+        built_part, _, moved_part = payload.partition("|MOVED=")
+        built = [t for t in built_part.split("|") if t]
+        moved = [t for t in moved_part.split("|") if t]
+        return {"ok": True, "app": app_id, "built": built, "moved": moved,
+                "detail": f"建造者工作：建成 {len(built)} 处（{'、'.join(built) or '无'}），"
+                          f"移动待建 {len(moved)} 处（{'、'.join(moved) or '无'}）",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "建造者工作无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_decide_production(timeout: float = 10.0) -> dict:
+    """生产智能决策：按真实局面选城市该造什么（回答"很多没想起来的事也要做"）。
+
+    读经济/区域数据后按优先级决策（全部来自真实读数，不编造）：
+    1. 城市无区域 且 人口≥3 → district/DISTRICT_CAMPUS（学院，科技运营基础）；
+    2. 侦察兵 < 2 → unit/UNIT_SCOUT（探路开图）；
+    3. 建造者 < 2 → unit/UNIT_BUILDER（改良地块涨产能）；
+    4. 人口≥2 且勇士 < 1 → unit/UNIT_WARRIOR（保底防御）；
+    5. 兜底 → unit/UNIT_SCOUT。
+    返回 {"ok", "kind", "item", "reason", "eco": {...}}。
+    """
+    eco = await read_economy(timeout=timeout)
+    if not eco.get("ok"):
+        return {"ok": False, "error": eco.get("error", "ECO_FAIL"),
+                "detail": eco.get("detail", "读经济失败")}
+    pop = int(eco.get("population") or 0)
+    cities = int(eco.get("cities") or 0)
+    scouts = int(eco.get("scouts") or 0)
+    builders = int(eco.get("builders") or 0)
+    warriors = int(eco.get("warriors") or 0)
+    districts = int(eco.get("districts") or 0)
+    if cities > 0 and districts == 0 and pop >= 3:
+        return {"ok": True, "kind": "district", "item": "DISTRICT_CAMPUS",
+                "reason": f"人口{pop} 无区域 → 建学院", "eco": eco}
+    if scouts < 2:
+        return {"ok": True, "kind": "unit", "item": "UNIT_SCOUT",
+                "reason": f"侦察兵{scouts} < 2 → 补侦察探路", "eco": eco}
+    if builders < 2:
+        return {"ok": True, "kind": "unit", "item": "UNIT_BUILDER",
+                "reason": f"建造者{builders} < 2 → 补工人改良地块", "eco": eco}
+    if pop >= 2 and warriors < 1:
+        return {"ok": True, "kind": "unit", "item": "UNIT_WARRIOR",
+                "reason": f"人口{pop} 无勇士 → 补防御", "eco": eco}
+    return {"ok": True, "kind": "unit", "item": "UNIT_SCOUT",
+            "reason": "局面平衡 → 继续补侦察", "eco": eco}
+
+
 async def read_economy(timeout: float = 8.0) -> dict:
     """读经济/宗教/单位构成（InGame）：金币、信仰、总人口、城市数、侦察/勇士/建造者数、首都坐标。
 
@@ -1440,6 +1613,7 @@ pcall(function()
   for _, c in Players[me]:GetCities():Members() do cities = cities + 1; pop = pop + c:GetPopulation() end
 end)
 local scouts, warriors, builders = 0, 0, 0
+local districts = 0
 pcall(function()
   for _, u in Players[me]:GetUnits():Members() do
     local info = GameInfo.Units[u:GetType()]
@@ -1448,6 +1622,13 @@ pcall(function()
       if ut == "UNIT_SCOUT" then scouts = scouts + 1
       elseif ut == "UNIT_WARRIOR" then warriors = warriors + 1
       elseif ut == "UNIT_BUILDER" then builders = builders + 1 end
+    end
+  end
+end)
+pcall(function()
+  for _, c in Players[me]:GetCities():Members() do
+    for _, d in c:GetDistricts():Members() do
+      if not d:IsPillaged() then districts = districts + 1 end
     end
   end
 end)
@@ -1461,6 +1642,7 @@ pcall(function() pan = Players[me]:GetReligion():GetPantheon() end)
 print("ECO|gold=" .. tostring(gold) .. "|faith=" .. tostring(faith) .. "|pop=" .. tostring(pop) ..
       "|cities=" .. tostring(cities) .. "|scouts=" .. tostring(scouts) ..
       "|warriors=" .. tostring(warriors) .. "|builders=" .. tostring(builders) ..
+      "|districts=" .. tostring(districts) ..
       "|cap=" .. tostring(capX) .. "," .. tostring(capY) .. "|pantheon=" .. tostring(pan))
 """
     try:
@@ -1490,6 +1672,7 @@ print("ECO|gold=" .. tostring(gold) .. "|faith=" .. tostring(faith) .. "|pop=" .
                 "scouts": _to_int(parts.get("scouts", "0")),
                 "warriors": _to_int(parts.get("warriors", "0")),
                 "builders": _to_int(parts.get("builders", "0")),
+                "districts": _to_int(parts.get("districts", "0")),
                 "capital": (int(cap[0]) if cap[0].lstrip("-").isdigit() else -1,
                             int(cap[1]) if len(cap) > 1 and cap[1].lstrip("-").isdigit() else -1),
                 "pantheon": _to_int(parts.get("pantheon", "-1"))}

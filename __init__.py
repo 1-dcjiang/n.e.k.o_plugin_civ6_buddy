@@ -716,8 +716,18 @@ class Civ6BuddyPlugin(NekoPluginBase):
         for blk in b.get("blockers", []):
             bt = blk.get("type", "")
             if bt == "ENDTURN_BLOCKING_PRODUCTION":
-                r = await civ6_tuner.set_city_production(auto_prod_kind, auto_prod_item, timeout=12.0)
-                logs.append(f"设置生产：{auto_prod_item} → {r.get('detail', r.get('error', ''))}")
+                # 生产智能决策：用户显式给了参数则尊重，否则按真实局面自动选
+                if (auto_prod_item or "").strip().upper() != "UNIT_SCOUT":
+                    r = await civ6_tuner.set_city_production(auto_prod_kind, auto_prod_item, timeout=12.0)
+                    logs.append(f"设置生产：{auto_prod_item} → {r.get('detail', r.get('error', ''))}")
+                else:
+                    ad = await civ6_tuner.auto_decide_production(timeout=10.0)
+                    if ad.get("ok"):
+                        r = await civ6_tuner.set_city_production(ad["kind"], ad["item"], timeout=12.0)
+                        logs.append(f"生产决策：{ad.get('reason')} → {r.get('detail', r.get('error', ''))}")
+                    else:
+                        r = {"ok": False, "detail": ad.get("detail", "")}
+                        logs.append(f"生产决策失败：{ad.get('detail', '')}")
                 if not r.get("ok"):
                     hard.append((bt, r.get("detail", "")))
             elif bt == "ENDTURN_BLOCKING_RESEARCH":
@@ -797,9 +807,12 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 if not u.get("ok"):
                     hard.append((bt, u.get("detail", "")))
                 elif u.get("skip_idle_ok"):
-                    # 先避险（敌强撤退，自保不引战）→ 再让侦察兵真正探路（远离首都方向）→ 结束剩余移动力
+                    # 先避险（敌强撤退，自保不引战）→ 建造者自动改良地块 → 再让侦察兵真正探路 → 结束剩余移动力
                     ev = await civ6_tuner.auto_evade_threats(timeout=15.0)
                     logs.append(f"避险：{ev.get('detail', ev.get('error', '无威胁'))}")
+                    await asyncio.sleep(1.0)
+                    bd = await civ6_tuner.auto_use_builder(timeout=20.0)
+                    logs.append(f"建造者：{bd.get('detail', bd.get('error', '待命'))}")
                     await asyncio.sleep(1.0)
                     me = await civ6_tuner.move_explorers(timeout=15.0)
                     logs.append(f"侦察探路：{me.get('detail', me.get('error', '跳过'))}")
