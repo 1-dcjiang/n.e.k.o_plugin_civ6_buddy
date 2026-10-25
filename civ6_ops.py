@@ -462,15 +462,22 @@ def _template_path(name: str) -> Path:
 
 # ── 运营执行（推荐制） ──
 
-# 主界面相对按钮（默认值，可在 config 覆盖）：
-# "下一回合"按钮位于文明6 右下角操作栏；默认 (0.960, 0.918) 为 1920x1080 布局的
-# 估算值，未实测校准——分辨率/窗口缩放不同时请在运行配置 [civ6_buddy.ops_buttons]
-# 中校准（按钮中心相对坐标 = 按钮中心像素 ÷ 窗口宽高）。
+# 主界面相对按钮（v0.4.14 起为真实 1707x1067 全屏截图标定，分辨率无关）：
+# "下一回合"按钮位于文明6 右下角操作栏——实测右下角按钮中心 ≈ (0.94, 0.81)。
+# 注意：开局/需要选科技时，右下角按钮是"选择研究"，必须先选科技再点下一回合
+# （run_one_turn_ops 会先检测左侧科技面板并自动选择第一个科技）。
 _DEFAULT_BUTTONS = {
-    "next_turn": (0.960, 0.918),
+    "next_turn": (0.938, 0.806),     # 实测标定：右下角主按钮（下一回合/选择研究共用位置）
     "policy_ok": (0.50, 0.55),
     "production_yes": (0.62, 0.78),
 }
+
+# 左侧"选择研究"科技面板：科技列表第一项（采矿业）标签中心 ≈ (0.035, 0.19)
+# 面板判定：屏幕左侧 x<12% 且 y 15%-60% 区域浅色占比 >0.4 → 需要选科技。
+_RESEARCH_PANEL_X = 0.12
+_RESEARCH_PANEL_Y0 = 0.15
+_RESEARCH_PANEL_Y1 = 0.60
+_RESEARCH_FIRST_ITEM = (0.035, 0.19)
 
 # 城市面板条按钮（真实截图标定，2558x1598 全屏/相对坐标，分辨率无关）：
 # 点击地图上的城市后底部出现的城市面板条。
@@ -522,6 +529,31 @@ def _detect_popup_blocking(screen: np.ndarray) -> bool:
     return light_frac > 0.45
 
 
+def _research_panel_open(screen: np.ndarray) -> bool:
+    """左侧'选择研究'科技面板检测：文明6 科技侧栏是暗色面板，
+    屏幕左侧 x<12%、y 15%-60% 区域暗色（灰度<100）占比 >0.6 → 需要选科技。"""
+    if np is None or screen.size == 0:
+        return False
+    h, w = screen.shape[:2]
+    x0 = 0
+    x1 = int(w * _RESEARCH_PANEL_X)
+    y0 = int(h * _RESEARCH_PANEL_Y0)
+    y1 = int(h * _RESEARCH_PANEL_Y1)
+    if x1 - x0 < 20 or y1 - y0 < 20:
+        return False
+    zone = screen[y0:y1, x0:x1]
+    gray = zone.mean(axis=2)
+    return float((gray < 100).mean()) > 0.60
+
+
+def _pick_first_research(win: dict) -> None:
+    """选择左侧科技面板第一个科技（采矿业位置）并点右下按钮开始研究。"""
+    _click_rel(win, _RESEARCH_FIRST_ITEM[0], _RESEARCH_FIRST_ITEM[1], delay=0.5)
+    time.sleep(0.6)
+    btn = _DEFAULT_BUTTONS["next_turn"]
+    _click_rel(win, float(btn[0]), float(btn[1]), delay=0.5)
+
+
 def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
     """执行一回合推荐制运营。返回结构化结果（供上层如实汇报）。
 
@@ -552,7 +584,13 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
             "log": log, "channel": _EXEC.channel,
         }
 
-    # 3) 弹窗清扫（最多 3 次 ESC）
+    # 3) 开局/研究完成需选科技：左侧"选择研究"面板 → 自动选第一个科技
+    if _research_panel_open(screen):
+        _pick_first_research(win)
+        log.append("检测到'选择研究'面板，已自动选择第一个科技（采矿业）")
+        screen = _shot(win)
+
+    # 4) 弹窗清扫（最多 3 次 ESC）
     for i in range(3):
         if not _detect_popup_blocking(screen):
             break
