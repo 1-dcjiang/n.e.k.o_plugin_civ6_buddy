@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import os as _os
 import time
 from pathlib import Path
 
@@ -185,8 +186,40 @@ _VK_MAP = {
 
 _EXEC = _Executor()
 
-import os as _os
 _FRAME_DIR = str(Path(_os.environ.get("TEMP", ".")) / "civ6_buddy" / "frames")
+
+
+def _image_entry(image_path: str) -> list | None:
+    """把截图文件读成 N.E.K.O ``images`` 通道条目 [{data_b64, mime}]。
+
+    关键：N.E.K.O 只把工具返回 dict 的 ``images`` 数组喂给模型视觉——
+    ``screenshot`` 字段只是文本路径（此前 YUI '看不到画面'的真正根因）。
+    超 2MB base64 上限时用 PIL 缩图存 JPEG（N.E.K.O 交付侧还会压缩到 ≤500KB）。
+    """
+    if not image_path:
+        return None
+    try:
+        import base64
+
+        with open(image_path, "rb") as fh:
+            raw = fh.read()
+        b64 = base64.b64encode(raw).decode("ascii")
+        if len(b64) <= 2 * 1024 * 1024:
+            return [{"data_b64": b64, "mime": "image/png"}]
+        from io import BytesIO
+
+        from PIL import Image
+
+        im = Image.open(image_path).convert("RGB")
+        w, h = im.size
+        scale = min(1.0, 1200.0 / max(w, h))
+        if scale < 1.0:
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        buf = BytesIO()
+        im.save(buf, "JPEG", quality=82)
+        return [{"data_b64": base64.b64encode(buf.getvalue()).decode("ascii"), "mime": "image/jpeg"}]
+    except Exception:
+        return None
 
 
 def peek_window() -> dict:
@@ -210,10 +243,10 @@ def peek_window() -> dict:
     from PIL import Image
     Image.fromarray(arr).save(path)
     if std < 6:
-        return {"ok": True, "screenshot": path, "size": f"{w}x{h}", "suspicious": True,
+        return {"ok": True, "screenshot": path, "images": _image_entry(path) or [], "size": f"{w}x{h}", "suspicious": True,
                 "detail": "截图内容接近纯色：游戏窗口可能被最小化。运营执行（civ6_ops_takeover/civ6_ops_tick）"
                           "会自动恢复窗口并前置，不需要你手动操作；确认窗口请以这张图为准。"}
-    return {"ok": True, "screenshot": path, "size": f"{w}x{h}",
+    return {"ok": True, "screenshot": path, "images": _image_entry(path) or [], "size": f"{w}x{h}",
             "detail": "已用 PrintWindow 直接抓取游戏画面（即使被其他窗口遮挡也能拿到游戏本体）。"
                       "后续运营执行会自动定位并前置游戏窗口，无需手动切换。"}
 
