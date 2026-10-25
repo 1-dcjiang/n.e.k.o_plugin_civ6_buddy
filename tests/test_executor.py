@@ -6,7 +6,6 @@
 3. PrintWindow 对无效窗口给出稳定错误码（不崩溃）
 """
 import pytest
-
 from _win32 import BITMAPINFOHEADER, mouse_click_abs, press_key, screen_region_rgb
 from civ6_ops import OpsError, _Executor
 
