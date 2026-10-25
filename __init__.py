@@ -397,6 +397,140 @@ class Civ6BuddyPlugin(NekoPluginBase):
     # ══════════ 进阶版：屏幕自动化运营（推荐制） ══════════
 
     @llm_tool(
+        name="civ6_ops_status",
+        description=(
+            "读取文明6当前真实局面（FireTuner 官方 API）：回合/研究科技/城市生产队列/"
+            "阻挡结束回合的通知（blockers）/单位待指挥状态。何时用：运营托管中，"
+            "决定'这一回合该干什么'之前先读真实状态，或用户问'现在什么局面/卡在哪'。"
+            "参数无。返回当前回合、城市生产（队列大小/在造什么/剩余回合）、"
+            "需要处理的 blocker 清单（未选生产/未选科技/单位待指挥/世界议会等）与单位状态。"
+            "纪律：汇报必须引用本工具返回的真实数据，禁止编造科技、生产或回合数。"
+        ),
+        parameters={"type": "object", "properties": {}, "required": []},
+        timeout=30.0,
+    )
+    async def civ6_ops_status(self, **_):
+        from . import civ6_tuner
+        sit = await civ6_tuner.read_situation(timeout=8.0)
+        if not sit.get("ok"):
+            return {"output": f"FireTuner 读取失败：{sit.get('detail', sit.get('error', ''))}。"
+                              "请先执行 civ6_ensure_sdk(action='check') 检查底层通道。",
+                    "is_error": True, "error": sit.get("error", "GAME_TUNER_OFF"), "channel": "firetuner"}
+        prod = await civ6_tuner.read_production(timeout=8.0)
+        blockers = await civ6_tuner.read_blockers(timeout=8.0)
+        units = await civ6_tuner.units_blocker_status(timeout=8.0)
+        lines = [f"回合 {sit.get('turn', '?')}（FireTuner 实时）"]
+        civ = str(sit.get("civ") or "")
+        tech = str(sit.get("tech") or "")
+        if civ:
+            lines.append(f"文明：{civ}")
+        if tech:
+            lines.append(f"当前研究：{tech}")
+        if prod.get("ok") and prod.get("cities"):
+            for c in prod["cities"]:
+                sz = c.get("size", 0)
+                if sz > 0:
+                    lines.append(f"🏙️ 城市生产：{c.get('current_type') or '#' + str(c.get('hash'))} "
+                                 f"（队列 {sz} 项，剩 {c.get('turns_left')} 回合）")
+                else:
+                    lines.append("🏙️ 城市生产：未选择（需要设置生产才能结束回合）")
+        if blockers.get("ok") and blockers.get("blockers"):
+            lines.append("需要处理：")
+            for blk in blockers["blockers"]:
+                lines.append(f"- {blk['type']}（{blk.get('message', '')}）")
+        else:
+            lines.append("无结束回合 blocker（可以直接结束回合）")
+        if units.get("ok"):
+            if units.get("blocked"):
+                lines.append(f"⚠️ 单位待指挥：{len(units.get('units_with_moves', []))} 个有剩余移动力"
+                             f"（{'、'.join(units['units_with_moves'][:5])}）")
+            else:
+                lines.append(f"单位状态：{units.get('total_units', 0)} 个，无待指挥单位")
+        return {
+            "output": "\n".join(lines),
+            "is_error": False,
+            "channel": "firetuner",
+            "situation": sit,
+            "production": prod,
+            "blockers": blockers.get("blockers", []),
+            "units": units,
+        }
+
+    @llm_tool(
+        name="civ6_ops_set_production",
+        description=(
+            "为城市设置生产项目（FireTuner 官方 API：CityManager.RequestOperation，"
+            "设置后同连接验证队列并消除'未选生产'blocker）。何时用：运营托管中，"
+            "读到 blockers 含 ENDTURN_BLOCKING_PRODUCTION，或要规划城市造什么。"
+            "参数 kind：unit/building/district/project；item：GameInfo Type，如 "
+            "UNIT_SCOUT（侦察兵）/BUILDING_MONUMENT（纪念碑）/DISTRICT_CAMPUS（学院）/"
+            "BUILDING_GRANARY（粮仓）。"
+            "纪律：生产决策要结合真实局面（城市产出/当前回合），说明'为什么造这个'，"
+            "禁止编造'已设置生产'——本工具返回 ok=false 时必须如实报告。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "description": "unit/building/district/project，默认 unit"},
+                "item": {"type": "string", "description": "GameInfo Type，如 UNIT_SCOUT / BUILDING_MONUMENT"},
+            },
+            "required": ["item"],
+        },
+        timeout=30.0,
+    )
+    async def civ6_ops_set_production(self, *, item: str = "", kind: str = "unit", **_):
+        params = _tool_params(_)
+        item = str(item or params.get("item") or "").strip()
+        kind = str(kind or params.get("kind") or "unit").strip().lower()
+        if not item:
+            return {"output": "请提供生产项目 Type，例如：UNIT_SCOUT / BUILDING_MONUMENT / DISTRICT_CAMPUS。",
+                    "is_error": True, "error": "NO_ITEM"}
+        from . import civ6_tuner
+        r = await civ6_tuner.set_city_production(kind, item, timeout=12.0)
+        if not r.get("ok"):
+            return {"output": f"设置生产失败：{r.get('detail', r.get('error', ''))}",
+                    "is_error": True, "error": r.get("error", "SET_FAILED"), "channel": "firetuner"}
+        return {"output": r["detail"], "is_error": False, "channel": "firetuner",
+                "item": item, "kind": kind, "queue_size": r.get("queue_size")}
+
+    @llm_tool(
+        name="civ6_ops_set_research",
+        description=(
+            "设置当前研究（科技或市政，FireTuner 官方 API：PlayerOperations.RESEARCH/"
+            "PROGRESS_CIVIC，并消除对应 blocker）。何时用：运营托管中读到 blockers 含 "
+            "ENDTURN_BLOCKING_RESEARCH（未选科技）或 ENDTURN_BLOCKING_CIVIC（未选市政），"
+            "或要规划科研方向。"
+            "参数 category：tech（科技）/civic（市政）；item：GameInfo Type，如 "
+            "TECH_BRONZE_WORKING（青铜工作）/TECH_CURRENCY（货币）/CIVIC_CODE_OF_LAWS（法典）。"
+            "纪律：科研决策要结合当前局面说明理由（如'马上要开战所以研究青铜工作'），"
+            "禁止编造'已选择科技'——ok=false 必须如实报告。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "tech/civic，默认 tech"},
+                "item": {"type": "string", "description": "GameInfo Type，如 TECH_BRONZE_WORKING"},
+            },
+            "required": ["item"],
+        },
+        timeout=30.0,
+    )
+    async def civ6_ops_set_research(self, *, item: str = "", category: str = "tech", **_):
+        params = _tool_params(_)
+        item = str(item or params.get("item") or "").strip()
+        category = str(category or params.get("category") or "tech").strip().lower()
+        if not item:
+            return {"output": "请提供研究项 Type，例如：TECH_BRONZE_WORKING / TECH_CURRENCY / CIVIC_CODE_OF_LAWS。",
+                    "is_error": True, "error": "NO_ITEM"}
+        from . import civ6_tuner
+        r = await civ6_tuner.set_research(category, item, timeout=12.0)
+        if not r.get("ok"):
+            return {"output": f"设置研究失败：{r.get('detail', r.get('error', ''))}",
+                    "is_error": True, "error": r.get("error", "SET_FAILED"), "channel": "firetuner"}
+        return {"output": r["detail"], "is_error": False, "channel": "firetuner",
+                "category": category, "item": item}
+
+    @llm_tool(
         name="civ6_ops_peek",
         description=(
             "确认文明6 游戏窗口与画面（只读：不点击、不切窗口、不抢焦点）。"
@@ -418,8 +552,9 @@ class Civ6BuddyPlugin(NekoPluginBase):
     @llm_tool(
         name="civ6_ops_takeover",
         description=(
-            "进入'运营托管'：玩家只负责打仗，YUI 接管本回合运营（推荐制：处理弹窗、选科技、"
-            "点下一回合）。何时用：用户说'接管运营/你替我玩/你来全盘操作/运营交给你'。"
+            "进入'运营托管'：玩家只负责打仗，YUI 接管本回合运营（推荐制：处理生产/科技/弹窗、"
+            "推进回合，优先 FireTuner 官方 API，不可用时屏幕点击兜底）。何时用：用户说"
+            "'接管运营/你替我玩/你来全盘操作/运营交给你'。"
             "【硬流程·必须执行】接管成功后，立即（同一次任务内）调用 civ6_ops_tick 且 "
             "loop_turns=20~50 自动连续运营，直到交还/战争/卡住为止；"
             "【严禁调用 steam_manager】运营托管期间禁止调用 steam_manager 任何工具"
@@ -427,8 +562,12 @@ class Civ6BuddyPlugin(NekoPluginBase):
             "Steam 管理器无需介入；确需 Steam 操作必须先 civ6_ops_handoff 交还。"
             "严禁只接管不运营，严禁回复'你说继续我就点下一回合'后停手等待——用户说'全盘操作'"
             "就是授权你连续运营，不需要每回合都等'继续'。"
-            "运营执行会自动定位并前置游戏窗口（PrintWindow 拿游戏画面），不需要玩家手动切到游戏窗口。"
-            "参数无。只读+点击游戏内按钮，不改存档。用户/战争打断用 civ6_ops_handoff 交还。"
+            "【行为纪律】接管即开始真实运营；每个回合必须先读真实局面（civ6_ops_status/tick 的"
+            "turn_summaries）再行动；禁止编造科技/生产/回合数；禁止'只会点下一回合'——"
+            "未选生产就设生产、未选科技就选科技（用 civ6_ops_set_production / "
+            "civ6_ops_set_research 或 tick 参数），有 blocker 就处理，处理不了如实交还。"
+            "运营执行会自动定位游戏窗口（PrintWindow 拿游戏画面），不需要玩家手动切窗口。"
+            "参数无。不改存档、不替玩家移动战争单位。用户/战争打断用 civ6_ops_handoff 交还。"
         ),
         parameters={"type": "object", "properties": {}, "required": []},
         timeout=30.0,
@@ -442,7 +581,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
         except civ6_parser.Civ6Error as exc:
             return _wrap_err(exc)
         turn = sit.get("game_turn", 0)
-        # 接管即运营：内置推进第一回合（to_thread 防阻塞）。
+        # 接管即运营：内置推进第一回合（Tuner 官方链路优先，屏幕点击兜底）。
         # 历史教训：LLM 可能"先回复用户再调 tick"导致只接管不运营（13:13 复现），
         # 这里接管时直接真实推进一回合，运营必然启动，不依赖 LLM 自觉。
         war_pre = None
@@ -463,24 +602,48 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 "reason": "WAR_TUNER",
             }
         first = None
+        tuner_ok = False
         try:
-            first = await asyncio.to_thread(
-                civ6_ops.run_one_turn_ops,
-                {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
-                war_state=None,
-            )
-        except civ6_ops.OpsError as exc:
-            first = {"ok": False, "handoff": True,
-                     "output": f"接管后首回合运营出错：{exc}", "reason": "OPS_ERROR"}
-        except Exception as exc:  # 非 OpsError（win32/线程异常）：清锁兜底，避免锁残留
-            self._ops_active = False
-            _ops_lock_clear()
-            return {
-                "output": f"已接管（第 {turn} 回合），但首回合运营出现异常：{exc}。"
-                          "请确认游戏窗口正常后再说'继续运营'重试。",
-                "is_error": True, "active": False, "turn": turn, "handoff": True,
-                "reason": "OPS_UNEXPECTED",
-            }
+            ts = await civ6_tuner.tuner_status()
+            tuner_ok = bool(ts.get("ok"))
+        except Exception:
+            tuner_ok = False
+        if tuner_ok:
+            try:
+                t0r = await civ6_tuner.read_situation(timeout=8.0)
+                tb = int(t0r.get("turn", 0) or 0) if t0r.get("ok") else turn
+                first = await self._tuner_manage_turn(
+                    tb, war_pre is True, "unit", "UNIT_SCOUT",
+                    "TECH_BRONZE_WORKING", "CIVIC_CODE_OF_LAWS",
+                )
+            except Exception as exc:
+                self._ops_active = False
+                _ops_lock_clear()
+                return {
+                    "output": f"已接管（第 {turn} 回合），但首回合 Tuner 运营出现异常：{exc}。"
+                              "请确认游戏窗口/FireTuner 正常后再说'继续运营'重试。",
+                    "is_error": True, "active": False, "turn": turn, "handoff": True,
+                    "reason": "OPS_UNEXPECTED",
+                }
+        else:
+            try:
+                first = await asyncio.to_thread(
+                    civ6_ops.run_one_turn_ops,
+                    {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
+                    war_state=None,
+                )
+            except civ6_ops.OpsError as exc:
+                first = {"ok": False, "handoff": True,
+                         "output": f"接管后首回合运营出错：{exc}", "reason": "OPS_ERROR"}
+            except Exception as exc:  # 非 OpsError（win32/线程异常）：清锁兜底，避免锁残留
+                self._ops_active = False
+                _ops_lock_clear()
+                return {
+                    "output": f"已接管（第 {turn} 回合），但首回合运营出现异常：{exc}。"
+                              "请确认游戏窗口正常后再说'继续运营'重试。",
+                    "is_error": True, "active": False, "turn": turn, "handoff": True,
+                    "reason": "OPS_UNEXPECTED",
+                }
         if first is not None and first.get("handoff"):
             self._ops_active = False
             _ops_lock_clear()
@@ -496,44 +659,145 @@ class Civ6BuddyPlugin(NekoPluginBase):
             first_line = f"\n接管即已推进第一回合：{first.get('output', '')}"
         return {
             "output": (
-                f"已接管运营（第 {turn} 回合）。分工规则：运营归我（处理弹窗、选科技、点下一回合），"
+                f"已接管运营（第 {turn} 回合）。分工规则：运营归我（处理生产/科技/弹窗、推进回合），"
                 "打仗归你。立即开始连续运营：调用 civ6_ops_tick 带 loop_turns=20 自动推进，"
-                "每回合用真实状态汇报在干什么；战争状态或你说'我来打'就立即交还控制权。"
+                "每回合用真实状态（turn_summaries）汇报在干什么；战争状态或你说'我来打'就立即交还控制权。"
                 "严禁调用 steam_manager（运营期间它已让位，调用只会产生无意义回执打断运营）——"
-                "游戏局面由 civ6_buddy 的 situation/tuner/tick 提供。" + first_line
+                "游戏局面由 civ6_buddy 的 status/tuner/tick 提供。" + first_line
             ),
             "is_error": False, "active": True, "turn": turn,
             "next_action": (
                 "civ6_ops_tick(loop_turns=20)：立即自动连续运营 20 回合，不要等待用户再次喊'继续'；"
-                "每回合用 turn_summaries 汇报当前研究/城市/人口状态。"
+                "每回合用 turn_summaries 汇报当前研究/生产/城市状态。"
                 "严禁调用 steam_manager 任何工具（其回执会打断运营节奏）；"
                 "如确需 Steam 操作，先 civ6_ops_handoff 交还后再调用。"
             ),
         }
 
+    async def _tuner_manage_turn(
+        self, turn_before: int, war_flag: bool,
+        auto_prod_kind: str, auto_prod_item: str, auto_tech: str, auto_civic: str,
+    ) -> dict:
+        """Tuner 完整一回合：读 blockers → 处理（生产/科研/市政/单位/软 blocker）→
+        结束回合 → 轮询真实回合数验证推进。返回交还/成功。"""
+        from . import civ6_tuner
+        logs: list = []
+        b = await civ6_tuner.read_blockers(timeout=8.0)
+        if not b.get("ok"):
+            return {"handoff": True, "ok": False, "reason": "TUNER_OFF",
+                    "output": f"读取 blocker 失败：{b.get('detail', b.get('error', ''))}",
+                    "log": logs}
+        hard: list = []
+        for blk in b.get("blockers", []):
+            bt = blk.get("type", "")
+            if bt == "ENDTURN_BLOCKING_PRODUCTION":
+                r = await civ6_tuner.set_city_production(auto_prod_kind, auto_prod_item, timeout=12.0)
+                logs.append(f"设置生产：{auto_prod_item} → {r.get('detail', r.get('error', ''))}")
+                if not r.get("ok"):
+                    hard.append((bt, r.get("detail", "")))
+            elif bt == "ENDTURN_BLOCKING_RESEARCH":
+                r = await civ6_tuner.set_research("tech", auto_tech, timeout=12.0)
+                if not r.get("ok"):
+                    # 默认科技已完成/不可用 → 自动改选第一个可用科技
+                    ap = await civ6_tuner.auto_pick_research("tech", timeout=8.0)
+                    if ap.get("ok"):
+                        r = await civ6_tuner.set_research("tech", ap["item"], timeout=12.0)
+                        logs.append(f"设置科研：{auto_tech} 不可用，自动改选 {ap['item']} → "
+                                    f"{r.get('detail', r.get('error', ''))}")
+                    else:
+                        logs.append(f"设置科研：{auto_tech} → {r.get('detail', r.get('error', ''))}")
+                else:
+                    logs.append(f"设置科研：{auto_tech} → {r.get('detail')}")
+                if not r.get("ok"):
+                    hard.append((bt, r.get("detail", "")))
+            elif bt == "ENDTURN_BLOCKING_CIVIC":
+                r = await civ6_tuner.set_research("civic", auto_civic, timeout=12.0)
+                if not r.get("ok"):
+                    ap = await civ6_tuner.auto_pick_research("civic", timeout=8.0)
+                    if ap.get("ok"):
+                        r = await civ6_tuner.set_research("civic", ap["item"], timeout=12.0)
+                        logs.append(f"设置市政：{auto_civic} 不可用，自动改选 {ap['item']} → "
+                                    f"{r.get('detail', r.get('error', ''))}")
+                    else:
+                        logs.append(f"设置市政：{auto_civic} → {r.get('detail', r.get('error', ''))}")
+                else:
+                    logs.append(f"设置市政：{auto_civic} → {r.get('detail')}")
+                if not r.get("ok"):
+                    hard.append((bt, r.get("detail", "")))
+            elif bt in ("ENDTURN_BLOCKING_GOVERNOR_IDLE",
+                        "ENDTURN_BLOCKING_CONSIDER_GOVERNMENT_CHANGE",
+                        "ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK",
+                        "ENDTURN_BLOCKING_SPY_CHOOSE_ESCAPE_ROUTE"):
+                r = await civ6_tuner.auto_resolve_soft_blockers(timeout=10.0)
+                logs.append(f"自动软 blocker：{r.get('detail', r.get('error', ''))}")
+            elif bt == "ENDTURN_BLOCKING_UNITS":
+                u = await civ6_tuner.units_blocker_status(timeout=8.0)
+                if not u.get("ok"):
+                    hard.append((bt, u.get("detail", "")))
+                elif u.get("skip_idle_ok"):
+                    r = await civ6_tuner.skip_idle_units(force=False, timeout=8.0)
+                    logs.append(f"单位跳过：{r.get('detail', '跳过完成')}")
+                else:
+                    if war_flag:
+                        hard.append((bt, "战争单位待指挥——打仗归玩家，已交还"))
+                    else:
+                        r = await civ6_tuner.skip_idle_units(force=True, timeout=8.0)
+                        logs.append(f"单位自动跳过（非战争）：{r.get('detail', '完成')}")
+            else:
+                hard.append((bt, blk.get("message", "")))
+        if hard:
+            names = "、".join(f"{h}（{m[:36]}）" for h, m in hard)
+            return {"handoff": True, "ok": False, "reason": "HARD_BLOCKER",
+                    "output": f"存在需要决策/无法自动处理的 blocker：{names}。控制权交还，请处理或调整策略后继续。",
+                    "log": logs}
+        # 关弹窗（顾问提示/科技完成等会挡住结束回合——实测不关弹窗 ACTION_ENDTURN 被拦截、回合不推进）
+        cp = await civ6_tuner.close_ui_popups(timeout=10.0)
+        logs.append(f"弹窗清理：{cp.get('detail', cp.get('error', ''))}")
+        e = await civ6_tuner.end_turn(timeout=8.0)
+        logs.append(e.get("detail", "结束回合"))
+        if not e.get("ok"):
+            return {"handoff": True, "ok": False, "reason": "ENDTURN_ERR",
+                    "output": f"结束回合失败：{e.get('detail')}", "log": logs}
+        for _ in range(3):
+            await asyncio.sleep(3.0)
+            s = await civ6_tuner.read_situation(timeout=6.0)
+            if s.get("ok") and int(s.get("turn", 0) or 0) > turn_before:
+                return {"ok": True, "handoff": False,
+                        "turn_after": int(s.get("turn", 0) or 0), "log": logs}
+        return {"handoff": True, "ok": False, "reason": "TURN_NOT_ADVANCED",
+                "output": "结束回合后回合数未推进（可能卡在结算/弹窗）。控制权交还，请看一眼游戏。",
+                "log": logs}
+
     @llm_tool(
         name="civ6_ops_tick",
         description=(
-            "运营托管中执行本回合（或连续多回合）运营操作：定位游戏窗口→战争检测"
-            "（Tuner 官方 API 优先、像素横幅兜底）→处理弹窗/开局选科技→点下一回合→"
-            "Tuner 实时验证回合推进。返回 turn_summaries（每回合真实状态：当前研究科技、"
-            "城市人口），汇报时必须引用这些真实状态说明自己在干什么、为什么，"
-            "不得只说'点了下一回合'。"
+            "运营托管中执行本回合（或连续多回合）运营操作。**优先 FireTuner 官方 API 链路**："
+            "读阻挡结束回合的通知（blockers：未选生产/未选科技/市政/单位待指挥/世界议会等）→"
+            "设置生产（prod_item）/设置科技（tech）/市政（civic）→自动解决软 blocker →"
+            "结束回合（ACTION_ENDTURN）→真实回合数验证推进；FireTuner 不可用时才回退屏幕点击。"
+            "返回 turn_summaries（每回合真实状态：回合/研究/生产/城市），"
+            "汇报必须引用这些真实状态说明自己在干什么、为什么，不得只说'点了下一回合'。"
             "何时用：运营托管中，用户说'继续/执行本回合/点下一回合/你一直玩别停/我吃饭你玩/"
             "你全盘操作'。用户明确'全盘操作/一直玩/托管'时必须 loop_turns=20~50 连续运营，"
-            "不得只执行 1 回合就停。"
-            "参数 loop_turns：连续运营回合数，默认 1；loop_turns>1 时自动循环执行 N 回合，"
-            "战争/弹窗无法清除/连续 2 次回合未推进时立即停止并交还控制权。"
-            "检测到战争立即停止并交还；每回合用 FireTuner 实时回合数验证确实 +1，"
-            "未推进则如实报告并交还。不改存档、不点单位、不碰战斗。"
+            "不得只执行 1 回合就停，也不得只点'下一回合'就汇报（每回合必须实际处理生产/科技等）。"
+            "参数 loop_turns：连续运营回合数（默认 1，1-50）；prod_kind/prod_item：城市生产"
+            "（默认 unit/UNIT_SCOUT 侦察兵）；tech：科技（默认 TECH_BRONZE_WORKING）；"
+            "civic：市政（默认 CIVIC_CODE_OF_LAWS）。决策参数建议先按真实局面由你选定，"
+            "默认值仅是兜底。战争/无法自动处理的 blocker/连续 2 次未推进时立即交还控制权。"
+            "纪律：禁止编造科技/生产/回合数——一切汇报来自本工具返回的真实状态；"
+            "运营期间严禁调用 steam_manager 任何工具。不改存档、不替玩家移动战争单位、不碰战斗。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "loop_turns": {
                     "type": "integer",
-                    "description": "连续运营回合数（1-50，默认 1；>1 时自动循环，遇战争/弹窗/未推进提前停止）",
+                    "description": "连续运营回合数（1-50，默认 1；>1 时自动循环，遇战争/硬 blocker/未推进提前停止）",
                 },
+                "prod_kind": {"type": "string", "description": "城市生产类别：unit/building/district/project，默认 unit"},
+                "prod_item": {"type": "string", "description": "城市生产项目 GameInfo Type，默认 UNIT_SCOUT（侦察兵）"},
+                "tech": {"type": "string", "description": "科技 GameInfo Type，默认 TECH_BRONZE_WORKING（青铜工作）"},
+                "civic": {"type": "string", "description": "市政 GameInfo Type，默认 CIVIC_CODE_OF_LAWS（法典）"},
             },
             "required": [],
         },
@@ -551,6 +815,19 @@ class Civ6BuddyPlugin(NekoPluginBase):
             loop_turns = 1
         if loop_turns > 50:
             loop_turns = 50
+        # 运营决策参数（Neko 按真实局面指定；默认值仅兜底）
+        auto_prod_kind = str(kw.get("prod_kind") or "unit").strip().lower()
+        auto_prod_item = str(kw.get("prod_item") or "UNIT_SCOUT").strip()
+        auto_tech = str(kw.get("tech") or "TECH_BRONZE_WORKING").strip()
+        auto_civic = str(kw.get("civic") or "CIVIC_CODE_OF_LAWS").strip()
+
+        # Tuner 可用性（决定主链路：Tuner 官方 API 优先，屏幕点击兜底）
+        tuner_ok = False
+        try:
+            ts = await civ6_tuner.tuner_status()
+            tuner_ok = bool(ts.get("ok"))
+        except Exception:
+            tuner_ok = False
 
         async def _turn_async() -> int | None:
             """实时回合数：Tuner 优先（游戏运行时准确），失败回退存档（可能滞后）。"""
@@ -583,6 +860,17 @@ class Civ6BuddyPlugin(NekoPluginBase):
             except Exception:
                 pass
             try:
+                p = await civ6_tuner.read_production(timeout=6.0)
+                if p.get("ok") and p.get("cities"):
+                    for c in p["cities"][:3]:
+                        sz = c.get("size", 0)
+                        if sz > 0:
+                            bits.append(f"{c.get('current_type') or '#' + str(c.get('hash'))}生产剩{c.get('turns_left')}回")
+                        else:
+                            bits.append("城市未选生产")
+            except Exception:
+                pass
+            try:
                 c = await civ6_tuner.list_cities(timeout=6.0)
                 if c.get("ok"):
                     pops = [
@@ -595,14 +883,24 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 pass
             return "；".join(bits)
 
-        # 战争预检（Tuner 官方 API）
-        war_pre = None
+        async def _tuner_turn(turn_before: int) -> dict:
+            """Tuner 完整一回合（复用共享回合管理器）。"""
+            return await self._tuner_manage_turn(
+                turn_before, war_flag,
+                auto_prod_kind, auto_prod_item, auto_tech, auto_civic,
+            )
+
+        # 战争预检（Tuner 官方 API；战争即交还——打仗归玩家）
+        war_flag = False
         try:
             wr = await civ6_tuner.at_war()
             if wr.get("ok"):
-                war_pre = wr.get("at_war", 0) > 0
+                war_flag = wr.get("at_war", 0) > 0
         except Exception:
-            war_pre = None
+            pass
+        if war_flag:
+            return {"output": "检测到战争状态：运营不接管，打仗归你。战斗结束后说'继续运营'我再接管。",
+                    "is_error": False, "handoff": True, "reason": "WAR_TUNER", "active": False}
 
         t0 = await _turn_async()
         if t0 is None:
@@ -612,90 +910,109 @@ class Civ6BuddyPlugin(NekoPluginBase):
         no_advance = 0
         turn_summaries: list = []
         for i in range(loop_turns):
-            try:
-                # 同步点击段丢到线程执行：内部含阻塞 sleep/截图/点击，
-                # 直接 await 会卡死事件循环（实测 sleep(1s) 被拖到 5.7s）→ 运营"半天不动"。
-                result = await asyncio.to_thread(
-                    civ6_ops.run_one_turn_ops,
-                    {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
-                    war_state=war_pre if i == 0 else None,
-                )
-            except civ6_ops.OpsError as exc:
-                self._ops_active = False
-                _ops_lock_clear()
-                out = _wrap_err(exc)
-                out["handoff"] = True
-                out["turns_done"] = turns_done
-                return out
-            logs += result.get("log", [])
-            if result.get("handoff"):
-                self._ops_active = False
-                _ops_lock_clear()
-                return {
-                    "output": f"已执行 {turns_done} 回合后停止：{result.get('output', '运营停止')}",
-                    "is_error": not result.get("ok", False),
-                    "log": logs, "handoff": True,
-                    "reason": result.get("reason", ""), "turns_done": turns_done,
-                    "turn_summaries": turn_summaries,
-                }
-            # 回合推进验证：Tuner 实时回合数
-            t1 = await _turn_async()
-            if t1 is None:
-                t1 = t0
-            if t1 <= t0:
-                no_advance += 1
-                if no_advance >= 2:
+            if tuner_ok:
+                # Tuner 主链路：真实处理生产/科研/blocker，不再只点下一回合
+                result = await _tuner_turn(t0)
+                logs += result.get("log", [])
+                if result.get("handoff"):
                     self._ops_active = False
                     _ops_lock_clear()
                     return {
-                        "output": (
-                            f"已执行 {turns_done} 回合后停止：连续 2 次点击后回合数未推进"
-                            f"（{t0} → {t1}）。可能游戏停在等待确认/结算，或按钮坐标失效。"
-                            "请看一眼游戏窗口：若画面正常可再说'继续'重试；有弹窗请手动处理。控制权暂交还。"
-                        ),
-                        "is_error": True, "error": "TURN_NOT_ADVANCED",
-                        "log": logs, "handoff": True, "turn_before": t0, "turn_after": t1,
-                        "turns_done": turns_done,
-                        "turn_summaries": turn_summaries,
+                        "output": f"已执行 {turns_done} 回合后停止：{result.get('output', '运营停止')}",
+                        "is_error": not result.get("ok", False),
+                        "log": logs, "handoff": True,
+                        "reason": result.get("reason", ""), "turns_done": turns_done,
+                        "turn_summaries": turn_summaries, "tuner_mode": True,
                     }
-            else:
+                t1 = result.get("turn_after", t0)
                 no_advance = 0
-                turns_done += 1
-                t0 = t1
-                _ops_lock_set()  # 刷新运营锁保鲜（防 5 分钟 TTL 失效）
-                # 语义摘要：让托管方知道每个回合'在干什么'（研究/城市/人口真实状态）
+            else:
+                # Tuner 不可用：屏幕点击兜底（原逻辑）
                 try:
-                    sem = await _semantic_line(t0)
-                    if sem:
-                        turn_summaries.append(sem)
-                        logs.append(f"运营摘要：{sem}")
-                except Exception:
-                    pass
-            # 每回合结算后战争复检（Tuner；战争即交还）
+                    # 同步点击段丢到线程执行：内部含阻塞 sleep/截图/点击，
+                    # 直接 await 会卡死事件循环（实测 sleep(1s) 被拖到 5.7s）→ 运营"半天不动"。
+                    result = await asyncio.to_thread(
+                        civ6_ops.run_one_turn_ops,
+                        {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
+                        war_state=war_flag if i == 0 else None,
+                    )
+                except civ6_ops.OpsError as exc:
+                    self._ops_active = False
+                    _ops_lock_clear()
+                    out = _wrap_err(exc)
+                    out["handoff"] = True
+                    out["turns_done"] = turns_done
+                    return out
+                logs += result.get("log", [])
+                if result.get("handoff"):
+                    self._ops_active = False
+                    _ops_lock_clear()
+                    return {
+                        "output": f"已执行 {turns_done} 回合后停止：{result.get('output', '运营停止')}",
+                        "is_error": not result.get("ok", False),
+                        "log": logs, "handoff": True,
+                        "reason": result.get("reason", ""), "turns_done": turns_done,
+                        "turn_summaries": turn_summaries, "tuner_mode": False,
+                    }
+                # 回合推进验证：Tuner 实时回合数
+                t1 = await _turn_async()
+                if t1 is None:
+                    t1 = t0
+                if t1 <= t0:
+                    no_advance += 1
+                    if no_advance >= 2:
+                        self._ops_active = False
+                        _ops_lock_clear()
+                        return {
+                            "output": (
+                                f"已执行 {turns_done} 回合后停止：连续 2 次点击后回合数未推进"
+                                f"（{t0} → {t1}）。可能游戏停在等待确认/结算，或按钮坐标失效。"
+                                "请看一眼游戏窗口：若画面正常可再说'继续'重试；有弹窗请手动处理。控制权暂交还。"
+                            ),
+                            "is_error": True, "error": "TURN_NOT_ADVANCED",
+                            "log": logs, "handoff": True, "turn_before": t0, "turn_after": t1,
+                            "turns_done": turns_done,
+                            "turn_summaries": turn_summaries, "tuner_mode": False,
+                        }
+                else:
+                    no_advance = 0
+            # 推进成功：结算
+            turns_done += 1
+            t0 = t1
+            _ops_lock_set()  # 刷新运营锁保鲜——托管持续中不清锁（handoff/战争/错误才清）
+            # 语义摘要：让托管方知道每个回合'在干什么'（研究/生产/城市真实状态）
+            try:
+                sem = await _semantic_line(t0)
+                if sem:
+                    turn_summaries.append(sem)
+                    logs.append(f"运营摘要：{sem}")
+            except Exception:
+                pass
+            # 每回合结算后战争复检（Tuner；战争即交还——打仗归玩家）
             try:
                 wr2 = await civ6_tuner.at_war()
                 if wr2.get("ok") and wr2.get("at_war", 0) > 0:
                     self._ops_active = False
                     _ops_lock_clear()
                     return {
-                        "output": f"已执行 {turns_done} 回合，Tuner 检测到战争状态，控制权交还给你。",
+                        "output": f"已执行 {turns_done} 回合，Tuner 检测到战争状态，控制权交还给你（打仗归你）。",
                         "is_error": False, "handoff": True,
                         "log": logs + [f"结算后 Tuner 战争检测：{wr2.get('at_war')} 个敌对对象"],
                         "turns_done": turns_done,
-                        "turn_summaries": turn_summaries,
+                        "turn_summaries": turn_summaries, "tuner_mode": tuner_ok,
                     }
             except Exception:
                 pass
             if i < loop_turns - 1:
                 await asyncio.sleep(0.5)
-        self._ops_active = False
-        _ops_lock_clear()
+        # 正常完成：托管保持（锁不清，steam_manager 继续让位）；交还由 handoff 负责
         return {
             "output": f"连续运营完成：共执行 {turns_done}/{loop_turns} 回合（回合推进至 {t0}）。"
-                      + ("" if turns_done == loop_turns else "部分回合未推进已提前停止。"),
+                      + ("" if turns_done == loop_turns else "部分回合未推进已提前停止。")
+                      + "运营托管保持中；需要继续可再调用 tick，要结束请 civ6_ops_handoff。",
             "is_error": False, "log": logs, "handoff": False,
             "turn_after": t0, "turns_done": turns_done, "turns_target": loop_turns,
-            "turn_summaries": turn_summaries,
+            "turn_summaries": turn_summaries, "tuner_mode": tuner_ok,
         }
 
     @llm_tool(

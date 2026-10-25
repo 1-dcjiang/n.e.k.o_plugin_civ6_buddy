@@ -1,7 +1,17 @@
-"""civ6_tuner.py — 文明6 FireTuner 底层通道（v0.3.0）。
+"""civ6_tuner.py — 文明6 FireTuner 底层通道（v0.5.0）。
 
 通过游戏内 FireTuner 调试端口（默认 TCP 4318）直连游戏 Lua 仿真层：
-读城市/人口/产出/焦点，用官方焦点 API 执行市民分配（比屏幕像素点击可靠）。
+读城市/人口/产出/焦点/生产队列/回合，用官方 API 执行市民分配、
+生产设置（CityManager.RequestOperation）与结束回合（ACTION_ENDTURN）。
+
+【Lua state 分工（实测铁律）】
+- GameCore（gamecore_index）：读局面常量（回合=Game.GetCurrentGameTurn、文明、科技名等）。
+- InGame（state 96）：UI 仿真层。写操作必须在此（RequestOperation / ACTION_ENDTURN
+  在此才生效）；生产队列的当前状态也必须在 InGame 读（GameCore 读到的是旧/空状态，
+  会误判"设置生产失败"）。
+
+【回合读取】正确 API 是 Game.GetCurrentGameTurn()（不是 GetGameTurn——后者在本
+游戏版本为 nil，会导致回合数恒为 0 的假 bug）。
 
 前置条件（Windows）：
 1. Steam 安装 "Sid Meier's Civilization VI Development Assets"（appid 597260）
@@ -380,7 +390,7 @@ local techName = ""
 local okP, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
 if okP and pPlayer ~= nil then
   p = Game.GetLocalPlayer() or -1
-  pcall(function() turn = Game.GetGameTurn() or 0 end)
+  pcall(function() turn = Game.GetCurrentGameTurn() or 0 end)
   local okCiv, civType = pcall(function() return pPlayer:GetCivilizationType() end)
   if okCiv and civType ~= nil then
     pcall(function()
@@ -503,3 +513,727 @@ async def set_focus(yield_name: str, timeout: float = 8.0) -> dict:
         if parts[0] == "OK":
             results.append({"city": parts[1], "focus": parts[2]})
     return {"ok": True, "app": app_id, "focus": yield_name, "results": results}
+
+
+# ══════════ v0.5.0：Tuner 写链路（生产设置 / 结束回合 / 生产队列读取） ══════════
+
+# InGame（UI 仿真层）state 索引。实测：写操作（RequestOperation/ACTION_ENDTURN）与
+# 生产队列读取必须在 InGame 执行；GameCore 读队列会拿到旧/空状态。
+INGAME_STATE = 96
+
+# 物品类型 → GameInfo 表名
+_ITEM_KIND_TO_TABLE = {
+    "unit": "Units",
+    "building": "Buildings",
+    "district": "Districts",
+    "project": "Projects",
+}
+
+
+def _ingame_state_index(states: list[str] | None, fallback: int = INGAME_STATE) -> int:
+    """从 Lua states 中找 InGame 索引；找不到回退 96（文明6 固定 UI 层索引）。"""
+    if states:
+        for s in states:
+            if "InGame" in s:
+                # states 元素形如 "96 InGame" 或 "InGame"
+                for token in s.replace(",", " ").split():
+                    if token.isdigit():
+                        return int(token)
+    return fallback
+
+
+async def read_production(timeout: float = 8.0) -> dict:
+    """读取本地玩家全部城市的生产队列（InGame 层，与写操作同 context）。
+
+    返回 {"ok": True, "turn", "cities":[{name, size, current_type, current_hash,
+    turns_left}], "via": "tuner"}。生产队列为空（size=0）说明城市没选生产，
+    文明6 会拒绝结束回合——这是"挂机不动"的根因，调用方需先 set_city_production。
+    """
+    lua = """
+local s = {}
+local okT, t = pcall(function() return Game.GetCurrentGameTurn() end)
+s[#s+1] = "TURN=" .. tostring(t or -1)
+local okP, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
+if not okP or pPlayer == nil then
+  s[#s+1] = "ERR=NO_PLAYER"
+  print(table.concat(s, "&"))
+  return
+end
+pcall(function()
+  local idx = 0
+  for i, c in pPlayer:GetCities():Members() do
+    idx = idx + 1
+    local q = c:GetBuildQueue()
+    local sz = 0
+    pcall(function() sz = q:GetSize() or 0 end)
+    local curH = 0
+    pcall(function() curH = q:GetCurrentProductionTypeHash() or 0 end)
+    local tl = -1
+    pcall(function() tl = q:GetTurnsLeft() or -1 end)
+    s[#s+1] = string.format("C%d|sz=%d|h=%d|tl=%d", idx, sz, curH, tl)
+  end
+end)
+print(table.concat(s, "&"))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc), "cities": []}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc), "cities": []}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    turn: int | None = None
+    cities: list[dict] = []
+    for line in out:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("ERR="):
+            return {"ok": False, "error": "NO_PLAYER", "detail": line, "cities": cities}
+        # 单帧汇总格式：TURN=9&C1|sz=1|h=1872107673|tl=1&C2|sz=0|h=0|tl=-1
+        for chunk in line.split("&"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if chunk.startswith("TURN="):
+                turn = _to_int(chunk[len("TURN="):])
+            elif chunk.startswith("C") and "|" in chunk:
+                parts = chunk.split("|")
+                kv = {p.split("=")[0]: p.split("=", 1)[1] for p in parts[1:] if "=" in p}
+                cities.append({
+                    "name": parts[0],
+                    "size": _to_int(kv.get("sz", "0")),
+                    "hash": _to_int(kv.get("h", "0")),
+                    "current_type": "",
+                    "turns_left": _to_int(kv.get("tl", "-1")),
+                })
+    # 城市名/当前生产类型：交给调用方用 list_cities 或 ItemHash 映射补全
+    return {"ok": True, "app": app_id, "turn": turn, "cities": cities, "via": "tuner"}
+
+
+async def set_city_production(
+    item_kind: str = "unit",
+    item_name: str = "UNIT_SCOUT",
+    timeout: float = 10.0,
+) -> dict:
+    """为本地玩家的第一座城市设置生产项目（InGame 层 RequestOperation）。
+
+    实测铁律：RequestOperation 是 fire-and-forget，即使 CanStartOperation=true 也可能
+    静默 no-op；必须在**同一段 Lua 内**等待后读取队列验证 size>=1，失败重试。
+    用 GameCore 跨 context 读队列会误判失败——本函数全部在 InGame 内完成。
+
+    参数 item_kind：unit/building/district/project；item_name：GameInfo 的 Type
+    （如 UNIT_SCOUT / BUILDING_MONUMENT / DISTRICT_CAMPUS / PROJECT_ENCAMPMENT_ARMORY）。
+    返回 {"ok", "city", "item", "kind", "queue_size", "detail"}；失败含 error。
+    """
+    kind = (item_kind or "unit").strip().lower()
+    if kind not in _ITEM_KIND_TO_TABLE:
+        return {"ok": False, "error": "BAD_KIND", "detail": f"item_kind 需为 {list(_ITEM_KIND_TO_TABLE)}"}
+    item_name = (item_name or "").strip()
+    if not item_name:
+        return {"ok": False, "error": "NO_ITEM", "detail": "缺少 item_name（如 UNIT_SCOUT）"}
+
+    lua = f"""
+local me = Game.GetLocalPlayer()
+local pCity = CityManager.GetCity(me, 0)
+if pCity == nil then print("ERR:CITY_NOT_FOUND") return end
+local item = GameInfo.{_ITEM_KIND_TO_TABLE[kind]}["{item_name}"]
+if item == nil then print("ERR:ITEM_NOT_FOUND|{item_name}") return end
+local bq = pCity:GetBuildQueue()
+local canProduce = false
+pcall(function() canProduce = bq:CanProduce(item.Hash, true) end)
+if not canProduce then print("ERR:CANNOT_PRODUCE|{item_name}") return end
+local tCheck = {{}}
+tCheck[CityOperationTypes.PARAM_UNIT_TYPE] = item.Hash
+local canStart = CityManager.CanStartOperation(pCity, CityOperationTypes.BUILD, tCheck, true)
+local done = false
+local lastSize = 0
+for i = 1, 3 do
+  local tParams = {{}}
+  tParams[CityOperationTypes.PARAM_UNIT_TYPE] = item.Hash
+  tParams[CityOperationTypes.PARAM_INSERT_MODE] = CityOperationTypes.VALUE_EXCLUSIVE
+  CityManager.RequestOperation(pCity, CityOperationTypes.BUILD, tParams)
+  local t0 = os.clock()
+  while os.clock() - t0 < 0.8 do end
+  local sz = 0
+  pcall(function() sz = bq:GetSize() or 0 end)
+  lastSize = sz
+  if sz >= 1 then
+    done = true
+    break
+  end
+end
+-- 消除"未选择生产"的结束回合 blocker 通知（官方 UI 同款操作）
+local cleared = 0
+pcall(function()
+  local list = NotificationManager.GetList(me)
+  if list then
+    for _, nid in ipairs(list) do
+      local e = NotificationManager.Find(me, nid)
+      if e and not e:IsDismissed() then
+        local bt = e:GetEndTurnBlocking()
+        if bt and bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_PRODUCTION then
+          pcall(function() NotificationManager.SendActivated(me, nid) end)
+          pcall(function() NotificationManager.Dismiss(me, nid) end)
+          cleared = cleared + 1
+        end
+      end
+    end
+  end
+end)
+print("SET|canStart=" .. tostring(canStart) .. "|size=" .. tostring(lastSize)
+      .. "|done=" .. tostring(done) .. "|cleared=" .. tostring(cleared))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("ERR"):
+            return {"ok": False, "error": line.split("|")[0], "detail": line}
+        if line.startswith("SET|"):
+            parts = {p.split("=")[0]: p.split("=", 1)[1] for p in line[4:].split("|") if "=" in p}
+            size = _to_int(parts.get("size", "0"))
+            done = parts.get("done", "false") == "true"
+            if done and size >= 1:
+                return {
+                    "ok": True, "app": app_id, "city": "第一城",
+                    "item": item_name, "kind": kind, "queue_size": size,
+                    "detail": f"生产队列已设置（{item_name}，队列 {size} 项）",
+                }
+            return {
+                "ok": False, "error": "SILENT_FAILURE",
+                "detail": f"{item_name} canStart={parts.get('canStart')} 但队列仍空（size={size}）；"
+                          "游戏可能在等待其他确认，可换生产项重试",
+            }
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "设置生产无回执（Tuner 输出丢失），请重试"}
+
+
+async def end_turn(timeout: float = 8.0) -> dict:
+    """结束当前回合（InGame 层 ACTION_ENDTURN）。玩家回合时有效。
+
+    返回 {"ok": True, "detail": "回合结束指令已发出"}；Tuner 不可用返回明确错误码。
+    调用方应在发出后轮询 read_production/read_situation 的回合号确认推进。
+    """
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(
+            reader, writer,
+            "UI.RequestAction(ActionTypes.ACTION_ENDTURN); print('ENDT_OK')",
+            state_index=INGAME_STATE, timeout=timeout,
+        )
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        if line.strip().startswith("ENDT_OK"):
+            return {"ok": True, "app": app_id, "detail": "回合结束指令已发出（ACTION_ENDTURN）"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "结束回合无回执（Tuner 输出丢失），请重试"}
+
+
+async def read_blockers(timeout: float = 8.0) -> dict:
+    """读取当前阻挡结束回合的通知（InGame NotificationManager，官方 API）。
+
+    返回 {"ok", "blockers": [{"type": "ENDTURN_BLOCKING_PRODUCTION", "message": ...}]}。
+    blockers 为空 = 游戏允许结束回合。常见类型：
+    PRODUCTION（未选生产）/RESEARCH（未选科技）/CIVIC（未选市政）/
+    UNIT_PROMOTION（单位可升级）/GOVERNOR_IDLE（总督空闲）/WORLD_CONGRESS_*（世界议会）。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local list = NotificationManager.GetList(me)
+local seen = {}
+local found = 0
+if list then
+    for _, nid in ipairs(list) do
+        local entry = NotificationManager.Find(me, nid)
+        if entry and not entry:IsDismissed() then
+            local bt = entry:GetEndTurnBlocking()
+            if bt and bt ~= 0 then
+                local typeName = "UNKNOWN"
+                for k, v in pairs(EndTurnBlockingTypes) do
+                    if v == bt then typeName = k; break end
+                end
+                if not seen[typeName] then
+                    seen[typeName] = true
+                    local msg = (entry:GetMessage() or ""):gsub("|", "/")
+                    print("BLOCKING|" .. typeName .. "|" .. msg)
+                    found = found + 1
+                end
+            end
+        end
+    end
+end
+if found == 0 then print("NONE") end
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc), "blockers": []}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc), "blockers": []}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    blockers: list[dict] = []
+    for line in out:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("BLOCKING|"):
+            parts = line.split("|", 2)
+            blockers.append({"type": parts[1], "message": parts[2] if len(parts) > 2 else ""})
+    return {"ok": True, "app": app_id, "blockers": blockers, "via": "tuner"}
+
+
+async def set_research(
+    category: str = "tech",
+    item_name: str = "TECH_BRONZE_WORKING",
+    timeout: float = 10.0,
+) -> dict:
+    """设置当前研究（科技/市政，InGame RequestPlayerOperation 官方 API）。
+
+    文明6 未选科技/市政会产生 ENDTURN_BLOCKING_RESEARCH / _CIVIC blocker，
+    游戏拒绝结束回合——开局"挂机不动"的常见原因。本函数设置研究项并消除 blocker。
+
+    参数 category：tech（科技，默认）/civic（市政）；
+    item_name：GameInfo 的 Type（如 TECH_BRONZE_WORKING / CIVIC_CODE_OF_LAWS）。
+    返回 {"ok", "category", "item", "detail"}；失败含 error（NOT_FOUND/ALREADY_COMPLETED 等）。
+    """
+    cat = (category or "tech").strip().lower()
+    if cat not in ("tech", "civic"):
+        return {"ok": False, "error": "BAD_CATEGORY", "detail": "category 需为 tech/civic"}
+    item_name = (item_name or "").strip()
+    if not item_name:
+        return {"ok": False, "error": "NO_ITEM", "detail": "缺少 item_name（如 TECH_BRONZE_WORKING）"}
+
+    if cat == "tech":
+        gi_table, type_field, param, operation, blocking, ok_prefix, has_m, player_m = (
+            "Technologies", "TechnologyType", "PARAM_TECH_TYPE", "RESEARCH",
+            "ENDTURN_BLOCKING_RESEARCH", "OK:RESEARCHING", "HasTech", "GetTechs",
+        )
+    else:
+        gi_table, type_field, param, operation, blocking, ok_prefix, has_m, player_m = (
+            "Civics", "CivicType", "PARAM_CIVIC_TYPE", "PROGRESS_CIVIC",
+            "ENDTURN_BLOCKING_CIVIC", "OK:PROGRESSING", "HasCivic", "GetCulture",
+        )
+
+    lua = f"""
+local id = Game.GetLocalPlayer()
+local idx = nil
+for row in GameInfo.{gi_table}() do
+    if row.{type_field} == "{item_name}" then idx = row.Index; break end
+end
+if idx == nil then print("ERR:NOT_FOUND|{item_name}") return end
+if Players[id]:{player_m}():{has_m}(idx) then
+    print("ERR:ALREADY_COMPLETED|{item_name}") return
+end
+local params = {{}}
+params[PlayerOperations.{param}] = idx
+UI.RequestPlayerOperation(id, PlayerOperations.{operation}, params)
+local cleared = 0
+pcall(function()
+  local list = NotificationManager.GetList(id)
+  if list then
+    for _, nid in ipairs(list) do
+      local e = NotificationManager.Find(id, nid)
+      if e and not e:IsDismissed() then
+        local bt = e:GetEndTurnBlocking()
+        if bt and bt == EndTurnBlockingTypes.{blocking} then
+          pcall(function() NotificationManager.SendActivated(id, nid) end)
+          pcall(function() NotificationManager.Dismiss(id, nid) end)
+          cleared = cleared + 1
+        end
+      end
+    end
+  end
+end)
+print("{ok_prefix}|{item_name}|cleared=" .. tostring(cleared))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("ERR"):
+            return {"ok": False, "error": line.split("|")[0], "detail": line}
+        if line.startswith(ok_prefix):
+            return {"ok": True, "app": app_id, "category": cat, "item": item_name,
+                    "detail": f"已设置研究：{item_name}（{cat}）"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "设置研究无回执（Tuner 输出丢失），请重试"}
+
+
+async def units_blocker_status(timeout: float = 8.0) -> dict:
+    """检查"单位需要命令" blocker（ENDTURN_BLOCKING_UNITS）。
+
+    文明6 单位有剩余移动力时会阻挡结束回合。本函数返回：
+    {"ok", "blocked": bool, "units_with_moves": [名称列表], "skip_idle_ok": bool}
+    - units_with_moves：有剩余移动力的单位（需要指挥）。
+    - skip_idle_ok：是否全部单位剩余移动力 <= 0（此时可安全 FinishMoves 跳过）。
+    注意：有移动力的单位属于"打仗/探索归玩家"的范围，运营方不应擅自动作；
+    若运营托管且用户授权自动跳过（侦察兵探路类），可调 skip_idle_units(force=True)。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local busy = {}
+local idle = 0
+local total = 0
+pcall(function()
+  for _, u in Players[me]:GetUnits():Members() do
+    if u:GetX() ~= -9999 then
+      total = total + 1
+      local m = u:GetMovesRemaining() or 0
+      if m > 0 then
+        local nm = ""
+        pcall(function() nm = u:GetName() end)
+        busy[#busy+1] = tostring(nm) .. ":" .. tostring(m)
+      else
+        idle = idle + 1
+      end
+    end
+  end
+end)
+local parts = {}
+parts[#parts+1] = "TOTAL=" .. tostring(total)
+parts[#parts+1] = "IDLE=" .. tostring(idle)
+parts[#parts+1] = "BUSY=" .. tostring(#busy)
+parts[#parts+1] = "LIST=" .. table.concat(busy, ",")
+print(table.concat(parts, "&"))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or "&" not in line:
+            continue
+        kv = {p.split("=")[0]: p.split("=", 1)[1] for p in line.split("&") if "=" in p}
+        total = _to_int(kv.get("TOTAL", "0"))
+        idle = _to_int(kv.get("IDLE", "0"))
+        busy = [u for u in kv.get("LIST", "").split(",") if u]
+        blocked = len(busy) > 0
+        return {
+            "ok": True, "app": app_id,
+            "blocked": blocked,
+            "units_with_moves": busy,
+            "total_units": total,
+            "idle_units": idle,
+            "skip_idle_ok": total > 0 and not blocked,
+            "via": "tuner",
+        }
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "单位状态无回执（Tuner 输出丢失），请重试"}
+
+
+async def skip_idle_units(force: bool = False, timeout: float = 8.0) -> dict:
+    """跳过单位剩余移动（GameCore_Tuner 的 UnitManager.FinishMoves），解除 UNITS blocker。
+
+    **必须用 GameCore_Tuner(3) context**——实测 InGame(96) 的 FinishMoves/FORTIFY/WAIT_FOR/
+    SetActivityType(SLEEP) 全部无效（单位移动力不变、blocker 不消），GameCore 一次生效。
+
+    force=False（默认）：仅跳过剩余移动力 <= 0 的单位（安全，不碰有移动力的单位）。
+    force=True：跳过全部单位（包括有移动力的侦察兵/非战斗单位——运营托管自动探路场景）。
+    注意：不要对战争单位使用 force=True（打仗归玩家，不能替玩家动兵）。
+    返回 {"ok", "skipped", "left_with_moves"}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local skipped = 0
+local left = 0
+local forced = %s
+pcall(function()
+  for _, u in Players[me]:GetUnits():Members() do
+    if u:GetX() ~= -9999 then
+      local m = u:GetMovesRemaining() or 0
+      if forced or m <= 0 then
+        pcall(function() UnitManager.FinishMoves(u) end)
+        skipped = skipped + 1
+      else
+        left = left + 1
+      end
+    end
+  end
+end)
+print("SKIPPED=" .. tostring(skipped) .. "&LEFT=" .. tostring(left))
+""" % ("true" if force else "false")
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        gc = _gamecore_state_index(states)
+        out = await execute_lua(reader, writer, lua, state_index=gc, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or "&" not in line:
+            continue
+        kv = {p.split("=")[0]: p.split("=", 1)[1] for p in line.split("&") if "=" in p}
+        return {
+            "ok": True, "app": app_id,
+            "skipped": _to_int(kv.get("SKIPPED", "0")),
+            "left_with_moves": _to_int(kv.get("LEFT", "0")),
+            "detail": f"跳过 {kv.get('SKIPPED', '0')} 个单位剩余移动，"
+                      f"仍有 {kv.get('LEFT', '0')} 个单位有移动力待指挥",
+            "via": "tuner",
+        }
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "跳过单位无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_pick_research(category: str = "tech", timeout: float = 8.0) -> dict:
+    """选第一个"可研究且未完成"的科技/市政（InGame 官方 API CanResearch）。
+
+    用于 set_research 兜底：默认科技可能已完成（如用户已学采矿），此时自动改选
+    第一个可用项（POTTERY/ANIMAL_HUSBANDRY/SAILING...）。返回 {"ok", "item", "category"}。
+    """
+    cat = (category or "tech").strip().lower()
+    if cat not in ("tech", "civic"):
+        return {"ok": False, "error": "BAD_CATEGORY", "detail": "category 需为 tech/civic"}
+    if cat == "tech":
+        gi_table, has_m, player_m = "Technologies", "HasTech", "GetTechs"
+        type_field = "TechnologyType"
+    else:
+        gi_table, has_m, player_m = "Civics", "HasCivic", "GetCulture"
+        type_field = "CivicType"
+    lua = f"""
+local id = Game.GetLocalPlayer()
+local pick = ""
+pcall(function()
+  for row in GameInfo.{gi_table}() do
+    local p = Players[id]:{player_m}()
+    if p and not p:{has_m}(row.Index) then
+      local ok = false
+      pcall(function() ok = p:CanResearch(row.Index) end)
+      if ok then pick = row.{type_field}; break end
+    end
+  end
+end)
+print("PICK=" .. pick)
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("PICK="):
+            continue
+        item = line[len("PICK="):].strip()
+        if not item:
+            return {"ok": False, "error": "NO_AVAILABLE",
+                    "detail": f"当前没有可研究的{cat}（可能全部完成或需先解决前置）"}
+        return {"ok": True, "app": app_id, "item": item, "category": cat, "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "自动选研究无回执（Tuner 输出丢失），请重试"}
+
+
+async def close_ui_popups(timeout: float = 10.0) -> dict:
+    """关闭挡路的 UI 弹窗并清理全部通知（InGame）。
+
+    **实测铁证**：文明6 顾问弹窗（AdvisorPopup/AdvisorBase）与科技完成弹窗等会挡住
+    ActionPanel——blocker 全清、UI.RequestAction(ACTION_ENDTURN) 仍被弹窗拦截、
+    回合不推进（卡 10→10 复现）；SetHide 关弹窗后立即 11→12 推进。
+    因此结束回合前必须先关弹窗。弹窗可能连续弹出（提示队列），循环 3 遍。
+    返回 {"ok", "closed", "dismissed"}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local paths = {"/InGame/AdvisorPopup/AdvisorBase", "/InGame/AdvisorPopup",
+               "/InGame/TechCivicCompletedPopup", "/InGame/NewTurnPanel",
+               "/InGame/EraCompletePopup", "/InGame/GreatPeoplePopup",
+               "/InGame/ChooseArtifact", "/InGame/UnitPromotionPopup",
+               "/InGame/RazeCity", "/InGame/EspionagePopup", "/InGame/EventPopup"}
+local closed = 0
+for pass = 1, 3 do
+  for _, p in ipairs(paths) do
+    pcall(function()
+      local c = ContextPtr:LookUpControl(p)
+      if c then c:SetHide(true); closed = closed + 1 end
+    end)
+  end
+end
+local dismissed = 0
+pcall(function()
+  local list = NotificationManager.GetList(me)
+  if list then
+    for _, nid in ipairs(list) do
+      local e = NotificationManager.Find(me, nid)
+      if e and not e:IsDismissed() then
+        pcall(function() NotificationManager.SendActivated(me, nid) end)
+        pcall(function() NotificationManager.Dismiss(me, nid) end)
+        dismissed = dismissed + 1
+      end
+    end
+  end
+end)
+print("CLOSED=" .. tostring(closed) .. "&DISMISSED=" .. tostring(dismissed))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or "&" not in line:
+            continue
+        kv = {p.split("=")[0]: p.split("=", 1)[1] for p in line.split("&") if "=" in p}
+        return {"ok": True, "app": app_id,
+                "closed": _to_int(kv.get("CLOSED", "0")),
+                "dismissed": _to_int(kv.get("DISMISSED", "0")),
+                "detail": f"已关闭 {kv.get('CLOSED', '0')} 个弹窗控件、清理 {kv.get('DISMISSED', '0')} 条通知",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "关闭弹窗无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_resolve_soft_blockers(timeout: float = 10.0) -> dict:
+    """自动解决可安全消除的结束回合 blocker（InGame 官方 API）。
+
+    处理：GOVERNOR_IDLE（总督空闲：SendActivated+Dismiss）、
+    CONSIDER_GOVERNMENT_CHANGE（考虑更换政体：置 considered=true）、
+    WORLD_CONGRESS_LOOK（世界议会查看：RequestPlayerOperation + dismiss）、
+    SPY_CHOOSE_ESCAPE_ROUTE（间谍选最快撤退路线）。
+    返回 {"ok", "resolved": [类型列表]}。
+    生产/科技/市政/单位/议会投票等策略性 blocker 不在本函数内处理（由调用方决策）。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local resolved = {}
+local mark = function(name)
+  local dup = false
+  for _, v in ipairs(resolved) do if v == name then dup = true break end end
+  if not dup then resolved[#resolved+1] = name end
+end
+-- 遍历通知，按类型自动处理
+pcall(function()
+  local list = NotificationManager.GetList(me)
+  if list then
+    for _, nid in ipairs(list) do
+      local e = NotificationManager.Find(me, nid)
+      if e and not e:IsDismissed() then
+        local bt = e:GetEndTurnBlocking()
+        if bt then
+          if bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_GOVERNOR_IDLE then
+            pcall(function() NotificationManager.SendActivated(me, nid) end)
+            pcall(function() NotificationManager.Dismiss(me, nid) end)
+            mark("GOVERNOR_IDLE")
+          elseif bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK then
+            pcall(function() NotificationManager.Dismiss(me, nid) end)
+            mark("WORLD_CONGRESS_LOOK")
+          elseif bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_SPY_CHOOSE_ESCAPE_ROUTE then
+            pcall(function() NotificationManager.Dismiss(me, nid) end)
+            mark("SPY_ESCAPE_ROUTE")
+          end
+        end
+      end
+    end
+  end
+end)
+-- 考虑更换政体（不依赖通知）
+pcall(function()
+  local p = Players[me]
+  if p and p:GetCulture() and p:GetCulture():GetGovernmentChangeConsidered() == false then
+    p:GetCulture():SetGovernmentChangeConsidered(true)
+    mark("GOVERNMENT_CHANGE")
+  end
+end)
+-- 世界议会"已查看"标记
+pcall(function()
+  UI.RequestPlayerOperation(me, PlayerOperations.WORLD_CONGRESS_LOOKED_AT_AVAILABLE, {})
+end)
+print("RESOLVED=" .. table.concat(resolved, ","))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("RESOLVED="):
+            continue
+        names = [n for n in line[len("RESOLVED="):].split(",") if n]
+        return {"ok": True, "app": app_id, "resolved": names,
+                "detail": "已自动解决：" + ("、".join(names) if names else "无（无需处理）"),
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "软 blocker 处理无回执（Tuner 输出丢失），请重试"}
