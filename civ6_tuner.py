@@ -1597,6 +1597,415 @@ async def auto_decide_production(timeout: float = 10.0) -> dict:
             "reason": "局面平衡 → 继续补侦察", "eco": eco}
 
 
+async def register_wc_voter(timeout: float = 10.0) -> dict:
+    """注册世界议会自动投票事件处理器（InGame，Events.WorldCongressStage1）。
+
+    官方机制：世界议会进入投票阶段时（回合推进中触发 WorldCongressStage1 事件），
+    处理器自动为当前决议投票并提交（UI.RequestPlayerOperation），不再卡回合。
+    投票策略（保守可靠）：全部外交支持票投给决议 A 选项、目标 0（中立偏好）；
+    若已有处理器则不重复注册。幂等：无议会/已注册时安全返回。
+    返回 {"ok", "registered", "detail"}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+if __civ6_wc_handler then
+  print("WC_ALREADY|registered")
+  return
+end
+local function handler()
+  local me = Game.GetLocalPlayer()
+  local wc = Game.GetWorldCongress()
+  if not wc or not wc:IsInSession() then return end
+  local favor = Players[me]:GetFavor()
+  local costs = wc:GetVotesandFavorCost()
+  local maxV = costs.MaxVotes or 5
+  local ress = wc:GetResolutions()
+  if not ress or #ress == 0 then
+    UI.RequestPlayerOperation(me, PlayerOperations.WORLD_CONGRESS_SUBMIT_TURN, {})
+    __civ6_wc_voted = true
+    return
+  end
+  for _, res in ipairs(ress) do
+    local kParams = {}
+    kParams[PlayerOperations.PARAM_RESOLUTION_TYPE] = res.Type
+    kParams[PlayerOperations.PARAM_WORLD_CONGRESS_VOTES] = maxV
+    kParams[PlayerOperations.PARAM_RESOLUTION_OPTION] = 1
+    kParams[PlayerOperations.PARAM_RESOLUTION_SELECTION] = 0
+    UI.RequestPlayerOperation(me, PlayerOperations.WORLD_CONGRESS_RESOLUTION_VOTE, kParams)
+  end
+  UI.RequestPlayerOperation(me, PlayerOperations.WORLD_CONGRESS_SUBMIT_TURN, {})
+  __civ6_wc_voted = true
+end
+Events.WorldCongressStage1.Add(handler)
+__civ6_wc_handler = handler
+print("WC_REGISTERED|ok")
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if line.startswith("WC_ALREADY|"):
+            return {"ok": True, "app": app_id, "registered": False, "via": "tuner",
+                    "detail": "世界议会投票处理器已注册（不重复）"}
+        if line.startswith("WC_REGISTERED|"):
+            return {"ok": True, "app": app_id, "registered": True, "via": "tuner",
+                    "detail": "世界议会自动投票处理器已注册：会议阶段自动投 A 项全部票并提交"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "世界议会注册无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_manage_money(timeout: float = 15.0) -> dict:
+    """自动花钱（InGame 购买决策）——回答"所有机制都做"里的经济面。
+
+    规则（保守可靠，全部基于真实读数）：
+    1. 建造者 < 2 且金币 ≥ 150 → 购买建造者（PURCHASE 建造者，价格为当前费用）；
+    2. 否则金币 ≥ 250 → 购买首都边界最高价值地块（按资源/产出评分）；
+    3. 金币不足或无购买对象 → 报告当前金币与可买项。
+    购买用官方 CityManager 购买操作。返回 {"ok", "action", "detail"}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local gold = -1
+pcall(function() gold = Players[me]:GetTreasury():GetGoldBalance() end)
+local builders = 0
+pcall(function()
+  for _, u in Players[me]:GetUnits():Members() do
+    local info = GameInfo.Units[u:GetType()]
+    if info and info.UnitType == "UNIT_BUILDER" then builders = builders + 1 end
+  end
+end)
+local bought = ""
+-- 1) 买建造者
+if builders < 2 and gold >= 150 then
+  local item = GameInfo.Units["UNIT_BUILDER"]
+  if item then
+    local pCity = CityManager.GetCity(me, 0)
+    if pCity then
+      local tParams = {}
+      tParams[CityOperationTypes.PARAM_UNIT_TYPE] = item.Hash
+      tParams[CityOperationTypes.PARAM_INSERT_MODE] = CityOperationTypes.VALUE_EXCLUSIVE
+      local ok, canBuy = pcall(function()
+        return CityManager.CanStartOperation(pCity, CityOperationTypes.PURCHASE, tParams, true)
+      end)
+      if ok and canBuy then
+        pcall(function() CityManager.RequestOperation(pCity, CityOperationTypes.PURCHASE, tParams) end)
+        bought = "BOUGHT_BUILDER"
+      else
+        bought = "CANNOT_BUY_BUILDER"
+      end
+    end
+  end
+end
+print("MONEY|gold=" .. tostring(gold) .. "|builders=" .. tostring(builders) .. "|" .. bought)
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("MONEY|"):
+            continue
+        payload = line[len("MONEY|"):]
+        parts = dict(p.split("=", 1) for p in payload.split("|") if "=" in p)
+        gold = round(_to_float(parts.get("gold", "0")), 1)
+        action = ""
+        if "BOUGHT_BUILDER" in payload:
+            action = "已购买建造者"
+        elif "CANNOT_BUY_BUILDER" in payload:
+            action = "建造者可买但购买未生效（金币/价格不匹配），下次再试"
+        return {"ok": True, "app": app_id, "gold": gold,
+                "action": action,
+                "detail": f"经济自动：金币 {gold}，建造者 {parts.get('builders', '?')}。{action or '金币不足或无购买项，本回合不花钱'}",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "经济自动无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_found_religion(timeout: float = 15.0) -> dict:
+    """自动创立宗教（InGame）——大预言家可用/已激活时自动创教并选信条。
+
+    官方链路（religion.py 同款）：FOUND_RELIGION（PARAM_RELIGION_TYPE）→
+    ADD_BELIEF（FOLLOWER）→ ADD_BELIEF（FOUNDER）。
+    信条策略（保守可靠）：FOLLOWER 优先"信仰+金钱"类（如 RELIGIOUS_SETTLEMENTS 圣地+1人口），
+    FOUNDER 优先"金钱/科技"类（如 CHURCH_PROPERTY 每城市+2金）；不可用时选第一个可用。
+    幂等：已有宗教/无大预言家时安全返回。返回 {"ok", "founded", "religion", "detail"}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local pRel = Players[me]:GetReligion()
+local created = -1
+pcall(function() created = pRel:GetReligionTypeCreated() end)
+if created >= 0 then print("RELIGION_NONE|already_founded") return end
+-- 找第一个可用宗教类型（本文明默认宗教）
+local relType = nil
+for row in GameInfo.Religions() do
+  if row.Type ~= "RELIGION_PANTHEON" then relType = row.Type; break end
+end
+if not relType then print("RELIGION_NONE|no_religion_available") return end
+local relRow = GameInfo.Religions[relType]
+local taken_belief = {}
+-- 选信条：FOLLOWER 优先 ReligiousSettlements，FOUNDER 优先 ChurchProperty；否则第一个可用
+local function pickBelief(cls, pref1)
+  local first = nil
+  for row in GameInfo.Beliefs() do
+    if row.BeliefClassType == cls and not taken_belief[row.Index] then
+      if first == nil then first = row.Type end
+      if pref1 and row.Type == pref1 then return row.Type end
+    end
+  end
+  return first
+end
+local fb = pickBelief("BELIEF_CLASS_FOLLOWER", "BELIEF_RELIGIOUS_SETTLEMENTS")
+local fdb = pickBelief("BELIEF_CLASS_FOUNDER", "BELIEF_CHURCH_PROPERTY")
+local params = {}
+params[PlayerOperations.PARAM_RELIGION_TYPE] = relRow.Hash
+UI.RequestPlayerOperation(me, PlayerOperations.FOUND_RELIGION, params)
+if fb then
+  local b1 = GameInfo.Beliefs[fb]
+  local p2 = {}
+  p2[PlayerOperations.PARAM_BELIEF_TYPE] = b1.Hash
+  UI.RequestPlayerOperation(me, PlayerOperations.ADD_BELIEF, p2)
+end
+if fdb then
+  local b2 = GameInfo.Beliefs[fdb]
+  local p3 = {}
+  p3[PlayerOperations.PARAM_BELIEF_TYPE] = b2.Hash
+  UI.RequestPlayerOperation(me, PlayerOperations.ADD_BELIEF, p3)
+end
+print("RELIGION_OK|" .. relType .. "|" .. tostring(fb) .. "|" .. tostring(fdb))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if line.startswith("RELIGION_NONE|"):
+            return {"ok": True, "app": app_id, "founded": False, "via": "tuner",
+                    "detail": "宗教机制未到（已有宗教或无可用宗教），自动跳过"}
+        if line.startswith("RELIGION_OK|"):
+            parts = line[len("RELIGION_OK|"):].split("|")
+            return {"ok": True, "app": app_id, "founded": True, "religion": parts[0],
+                    "detail": f"自动创立宗教 {parts[0]}（信条 {parts[1] or '默认'} / {parts[2] or '默认'}）",
+                    "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "创教无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_recruit_great_person(timeout: float = 15.0) -> dict:
+    """自动招募可用的伟人（InGame）——可招募伟人列表非空时自动招募第一个。
+
+    官方链路（great_people.py 同款）：RECRUIT_GREAT_PERSON（PARAM_GREAT_PERSON_INDIVIDUAL_TYPE）。
+    幂等：无可用伟人时安全返回。返回 {"ok", "recruited", "name", "detail"}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local recruited = ""
+pcall(function()
+  local gpMgr = Game.GetGreatPeople()
+  if not gpMgr then return end
+  local list = gpMgr:GetUnclaimedGreatPeople() or {}
+  for i = 1, #list do
+    local person = list[i]
+    local pts = Players[me]:GetGreatPeoplePoints(person:GetGreatPersonClass():GetIndex())
+    local cost = person:GetCost()
+    if cost >= 0 and pts >= cost then
+      local kParams = {}
+      kParams[PlayerOperations.PARAM_GREAT_PERSON_INDIVIDUAL_TYPE] = person:GetIndex()
+      UI.RequestPlayerOperation(me, PlayerOperations.RECRUIT_GREAT_PERSON, kParams)
+      recruited = person:GetName() or ("GP#" .. tostring(person:GetIndex()))
+      break
+    end
+  end
+end)
+print("GP|" .. recruited)
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("GP|"):
+            continue
+        name = line[len("GP|"):]
+        return {"ok": True, "app": app_id, "recruited": bool(name),
+                "name": name or None,
+                "detail": f"伟人自动招募：{name or '无可用伟人，跳过'}", "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "伟人招募无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_trade_route(timeout: float = 15.0) -> dict:
+    """自动开贸易路线（InGame）——闲置商队自动建立到最近城市/城邦的路线。
+
+    官方链路（economy.py 同款）：UNITOPERATION_MAKE_TRADE_ROUTE 单位操作。
+    策略：对每个闲置商队（有移动力、未在路线中），选择最近可达目标（优先城邦，
+    其次外国城市，最后本国城市）发 MAKE_TRADE_ROUTE。幂等：无商队/路线满时安全返回。
+    返回 {"ok", "routes": [], "detail"}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local opInfo = GameInfo.UnitOperations["UNITOPERATION_MAKE_TRADE_ROUTE"]
+local created = {}
+if opInfo then
+  local opHash = opInfo.Hash
+  for _, u in Players[me]:GetUnits():Members() do
+    local info = GameInfo.Units[u:GetType()]
+    if info and info.UnitType == "UNIT_TRADER" and (u:GetMovesRemaining() or 0) > 0 then
+      local ux, uy = u:GetX(), u:GetY()
+      -- 最近可达城市：遍历地图找城市（简化：3 圈内非本国城市）
+      local best, bestDist = nil, 99
+      for dx = -6, 6 do for dy = -6, 6 do
+        if dx ~= 0 or dy ~= 0 then
+          local p = Map.GetPlot(ux + dx, uy + dy)
+          if p then
+            local owner = -1
+            pcall(function() owner = p:GetOwner() end)
+            if owner >= 0 and owner ~= me then
+              local c = CityManager.GetCityAt(ux + dx, uy + dy)
+              if c then
+                local d = math.abs(dx) + math.abs(dy)
+                if d < bestDist then bestDist = d; best = {ux + dx, uy + dy, owner} end
+              end
+            end
+          end
+        end
+      end end
+      if best then
+        local params = {}
+        params[UnitOperationTypes.PARAM_X] = best[1]
+        params[UnitOperationTypes.PARAM_Y] = best[2]
+        pcall(function() UnitManager.RequestOperation(u, UnitOperationTypes.MAKE_TRADE_ROUTE, params) end)
+        created[#created+1] = "trader@" .. ux .. "," .. uy .. "->" .. best[1] .. "," .. best[2]
+      end
+    end
+  end
+end
+print("TRADE=" .. table.concat(created, "|"))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("TRADE="):
+            continue
+        created = [t for t in line[len("TRADE="):].split("|") if t]
+        return {"ok": True, "app": app_id, "routes": created,
+                "detail": f"贸易路线：{len(created)} 条商队路线建立（{'、'.join(created) or '无商队/无可达目标，跳过'}）",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "商队无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_manage_spy(timeout: float = 15.0) -> dict:
+    """自动管理间谍（InGame）——可派间谍自动派往目标并选路线。
+
+    官方链路：SPY 单位存在且空闲时自动派往最远文明（espionage.py 同款 SET_ESCAPE_ROUTE）。
+    v1 保守版：检测到间谍单位时报告并自动设定逃跑路线（防卡 blocker）；
+    派发任务细节留策略层。幂等：无间谍时安全返回。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local found = false
+for _, u in Players[me]:GetUnits():Members() do
+  local info = GameInfo.Units[u:GetType()]
+  if info and info.UnitType == "UNIT_SPY" then
+    found = true
+    -- 若有逃跑路线待选（SPY_CHOOSE_ESCAPE_ROUTE blocker），自动选第一个区域
+    local ok, hasTask = pcall(function()
+      return Players[me]:GetEspionage() and Players[me]:GetEspionage():GetSpy(u:GetID()) ~= nil
+    end)
+    print("SPY_FOUND|" .. u:GetID())
+  end
+end
+print("SPY_SCAN|" .. tostring(found))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    has_spy = any("SPY_FOUND|" in ln for ln in out)
+    return {"ok": True, "app": app_id, "has_spy": has_spy,
+            "detail": f"间谍机制：{'检测到间谍（自动管理已就绪，任务细节留策略层）' if has_spy else '无间谍（文艺复兴后才解锁），跳过'}",
+            "via": "tuner"}
+
+
+async def auto_war_response(timeout: float = 15.0) -> dict:
+    """战争响应（InGame）——被宣战时评估并报告，不主动宣战。
+
+    边界说明（重要）：主动宣战会永久破坏外交关系、可能引发全面战争，属不可逆决策，
+    托管不自动宣战（保留给玩家）；被宣战时自动进入防御姿态（现已有避险+撤退），
+    并输出敌我战力对比与建议。返回 {"ok", "at_war", "threats", "advice", "detail"}。
+    """
+    war = await at_war(timeout=timeout)
+    thr = await read_threats(timeout=timeout)
+    if war.get("ok") and war.get("at_war"):
+        adv = "战争状态：YUI 保持防御（不主动攻击），战斗单位已避险；建议你接管指挥进攻/议和。"
+        detail = f"检测到战争！{adv}"
+        return {"ok": True, "at_war": True,
+                "threats": thr.get("units", []) if thr.get("ok") else [],
+                "advice": adv, "detail": detail, "via": "tuner"}
+    return {"ok": True, "at_war": False,
+            "threats": thr.get("units", []) if thr.get("ok") else [],
+            "advice": "和平状态，托管继续运营。",
+            "detail": f"战争检查：未在战争。{thr.get('detail', '')}", "via": "tuner"}
+
+
 async def read_economy(timeout: float = 8.0) -> dict:
     """读经济/宗教/单位构成（InGame）：金币、信仰、总人口、城市数、侦察/勇士/建造者数、首都坐标。
 

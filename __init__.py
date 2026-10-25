@@ -766,6 +766,12 @@ class Civ6BuddyPlugin(NekoPluginBase):
                         "ENDTURN_BLOCKING_SPY_CHOOSE_ESCAPE_ROUTE"):
                 r = await civ6_tuner.auto_resolve_soft_blockers(timeout=10.0)
                 logs.append(f"自动软 blocker：{r.get('detail', r.get('error', ''))}")
+            elif bt == "ENDTURN_BLOCKING_WORLD_CONGRESS_SESSION":
+                # 世界议会投票阶段（MUST VOTE）：自动投票+提交（事件处理器注册后自动触发）
+                wc = await civ6_tuner.register_wc_voter(timeout=10.0)
+                logs.append(f"世界议会：{wc.get('detail', wc.get('error', ''))}")
+                if not wc.get("ok"):
+                    hard.append((bt, wc.get("detail", "")))
             elif bt == "ENDTURN_BLOCKING_FILL_CIVIC_SLOT":
                 fp = await civ6_tuner.auto_fill_policy_slots(timeout=12.0)
                 logs.append(f"填补政策槽：{fp.get('detail', fp.get('error', ''))}")
@@ -835,6 +841,22 @@ class Civ6BuddyPlugin(NekoPluginBase):
         # 关弹窗（顾问提示/科技完成等会挡住结束回合——实测不关弹窗 ACTION_ENDTURN 被拦截、回合不推进）
         cp = await civ6_tuner.close_ui_popups(timeout=10.0)
         logs.append(f"弹窗清理：{cp.get('detail', cp.get('error', ''))}")
+        # v0.6.0 全机制自动（每回合幂等调用，机制未解锁时安全跳过）：
+        # 世界议会投票处理器（防 WORLD_CONGRESS_SESSION 卡回合）、花钱、宗教、伟人、商队、间谍、战争响应
+        wc = await civ6_tuner.register_wc_voter(timeout=10.0)
+        logs.append(f"世界议会：{wc.get('detail', wc.get('error', ''))}")
+        mo = await civ6_tuner.auto_manage_money(timeout=12.0)
+        logs.append(f"经济自动：{mo.get('detail', mo.get('error', ''))}")
+        rg = await civ6_tuner.auto_found_religion(timeout=12.0)
+        logs.append(f"宗教：{rg.get('detail', rg.get('error', ''))}")
+        gp = await civ6_tuner.auto_recruit_great_person(timeout=12.0)
+        logs.append(f"伟人：{gp.get('detail', gp.get('error', ''))}")
+        tr = await civ6_tuner.auto_trade_route(timeout=12.0)
+        logs.append(f"商队：{tr.get('detail', tr.get('error', ''))}")
+        sp = await civ6_tuner.auto_manage_spy(timeout=12.0)
+        logs.append(f"间谍：{sp.get('detail', sp.get('error', ''))}")
+        wr = await civ6_tuner.auto_war_response(timeout=12.0)
+        logs.append(f"战争：{wr.get('detail', wr.get('error', ''))}")
         # endturn 自愈兜底：回合没推进 → 再关弹窗再结束，最多 3 轮（防"新弹窗连环卡死"）
         for attempt in range(3):
             e = await civ6_tuner.end_turn(timeout=8.0)
