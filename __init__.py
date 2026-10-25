@@ -446,6 +446,18 @@ class Civ6BuddyPlugin(NekoPluginBase):
                              f"（{'、'.join(units['units_with_moves'][:5])}）")
             else:
                 lines.append(f"单位状态：{units.get('total_units', 0)} 个，无待指挥单位")
+        eco = await civ6_tuner.read_economy(timeout=8.0)
+        if eco.get("ok"):
+            gold = eco.get("gold", -1)
+            faith = eco.get("faith", -1)
+            pop = eco.get("population", 0)
+            g = f"{gold:.0f}" if gold >= 0 else "?"
+            f_ = f"{faith:.0f}" if faith >= 0 else "?"
+            lines.append(f"经济：金币 {g}｜信仰 {f_}｜总人口 {pop}｜"
+                         f"单位 {eco.get('scouts', 0)}侦察/{eco.get('warriors', 0)}勇士/"
+                         f"{eco.get('builders', 0)}建造者")
+            if eco.get("pantheon", -1) < 0 and faith >= 25:
+                lines.append("💡 信仰已达 25：万神殿可选（YUI 会在回合管理中自动局面感知选择）")
         return {
             "output": "\n".join(lines),
             "is_error": False,
@@ -735,6 +747,11 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 logs.append(f"填补政策槽：{fp.get('detail', fp.get('error', ''))}")
                 if not fp.get("ok"):
                     hard.append((bt, fp.get("detail", "")))
+            elif bt == "ENDTURN_BLOCKING_PANTHEON":
+                pp = await civ6_tuner.auto_choose_pantheon(timeout=12.0)
+                logs.append(f"万神殿：{pp.get('detail', pp.get('error', ''))}")
+                if not pp.get("ok"):
+                    hard.append((bt, pp.get("detail", "")))
             elif bt == "ENDTURN_BLOCKING_UNITS":
                 u = await civ6_tuner.units_blocker_status(timeout=8.0)
                 if not u.get("ok"):

@@ -88,6 +88,14 @@ def _to_int(raw) -> int:
         return 0
 
 
+def _to_float(raw) -> float:
+    """数值字段安全转 float（失败返回 -1.0）。"""
+    try:
+        return float(str(raw or -1).strip())
+    except (TypeError, ValueError):
+        return -1.0
+
+
 def _pack(tag: int, payload: str) -> bytes:
     data = payload.encode("utf-8") + b"\x00"
     return struct.pack(HEADER_FMT, len(data), tag) + data
@@ -1177,24 +1185,223 @@ print("MOVED=" .. table.concat(targets, "|"))
     return {"ok": False, "error": "NO_RESPONSE", "detail": "侦察兵移动无回执（Tuner 输出丢失），请重试"}
 
 
+async def read_economy(timeout: float = 8.0) -> dict:
+    """读经济/宗教/单位构成（InGame）：金币、信仰、总人口、城市数、侦察/勇士/建造者数、首都坐标。
+
+    供 civ6_ops_status 汇报与政策/万神殿局面感知决策。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local gold, faith = -1, -1
+pcall(function() gold = Players[me]:GetTreasury():GetGoldBalance() end)
+pcall(function() faith = Players[me]:GetFaithBalance() end)
+if faith < 0 then pcall(function() faith = Players[me]:GetReligion():GetFaith() end) end
+local pop, cities = 0, 0
+pcall(function()
+  for _, c in Players[me]:GetCities():Members() do cities = cities + 1; pop = pop + c:GetPopulation() end
+end)
+local scouts, warriors, builders = 0, 0, 0
+pcall(function()
+  for _, u in Players[me]:GetUnits():Members() do
+    local info = GameInfo.Units[u:GetType()]
+    if info then
+      local ut = info.UnitType
+      if ut == "UNIT_SCOUT" then scouts = scouts + 1
+      elseif ut == "UNIT_WARRIOR" then warriors = warriors + 1
+      elseif ut == "UNIT_BUILDER" then builders = builders + 1 end
+    end
+  end
+end)
+local capX, capY = -1, -1
+pcall(function()
+  local cap = Players[me]:GetCities():GetCapitalCity()
+  if cap then capX, capY = cap:GetX(), cap:GetY() end
+end)
+local pan = -1
+pcall(function() pan = Players[me]:GetReligion():GetPantheon() end)
+print("ECO|gold=" .. tostring(gold) .. "|faith=" .. tostring(faith) .. "|pop=" .. tostring(pop) ..
+      "|cities=" .. tostring(cities) .. "|scouts=" .. tostring(scouts) ..
+      "|warriors=" .. tostring(warriors) .. "|builders=" .. tostring(builders) ..
+      "|cap=" .. tostring(capX) .. "," .. tostring(capY) .. "|pantheon=" .. tostring(pan))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("ECO|"):
+            continue
+        parts = dict(p.split("=", 1) for p in line[len("ECO|"):].split("|") if "=" in p)
+        cap = parts.get("cap", "-1,-1").split(",")
+        return {"ok": True, "app": app_id, "via": "tuner",
+                "gold": round(_to_float(parts.get("gold", "-1")), 1),
+                "faith": round(_to_float(parts.get("faith", "-1")), 1),
+                "population": _to_int(parts.get("pop", "0")),
+                "cities": _to_int(parts.get("cities", "0")),
+                "scouts": _to_int(parts.get("scouts", "0")),
+                "warriors": _to_int(parts.get("warriors", "0")),
+                "builders": _to_int(parts.get("builders", "0")),
+                "capital": (int(cap[0]) if cap[0].lstrip("-").isdigit() else -1,
+                            int(cap[1]) if len(cap) > 1 and cap[1].lstrip("-").isdigit() else -1),
+                "pantheon": _to_int(parts.get("pantheon", "-1"))}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "读经济无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_choose_pantheon(timeout: float = 12.0) -> dict:
+    """自动选择万神殿（InGame，FOUND_PANTHEON）——局面感知：扫描首都 3 圈地形匹配万神殿。
+
+    ENDTURN_BLOCKING_PANTHEON（"选择万神殿信仰"）出现时调用。匹配规则：
+    沙漠→DESERT_FOLKLORE、雨林→SACRED_PATH、冻土→DANCE_OF_THE_AURORA、
+    河边→RIVER_GODDESS、海岸→GOD_OF_THE_SEA、默认→DIVINE_SPARK（大预言家点）。
+    返回 {"ok", "chosen", "reason"}。已有万神殿或不可选时返回 ok=False + 明确原因。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local pReligion = Players[me]:GetReligion()
+local pan = -1
+pcall(function() pan = pReligion:GetPantheon() end)
+if pan >= 0 then print("RESULT|ALREADY|已有万神殿"); return end
+-- 首都位置
+local capX, capY = -1, -1
+pcall(function()
+  local cap = Players[me]:GetCities():GetCapitalCity()
+  if cap then capX, capY = cap:GetX(), cap:GetY() end
+end)
+-- 扫描首都 3 圈地形计数
+local terrain = {desert=0, forest=0, tundra=0, river=0, coast=0, marsh=0}
+pcall(function()
+  for dx = -3, 3 do for dy = -3, 3 do
+    if dx*dx + dy*dy <= 9 then
+      local p = Map.GetPlot(capX + dx, capY + dy)
+      if p then
+        local t = GameInfo.Terrains[p:GetTerrainType()]
+        local tt = t and t.TerrainType or ""
+        if tt:find("DESERT") then terrain.desert = terrain.desert + 1 end
+        if tt:find("TUNDRA") then terrain.tundra = terrain.tundra + 1 end
+        if tt:find("SNOW") then terrain.tundra = terrain.tundra + 1 end
+        if tt:find("COAST") or tt:find("OCEAN") then terrain.coast = terrain.coast + 1 end
+        if tt:find("MARSH") or tt:find("FLOODPLAINS") then terrain.marsh = terrain.marsh + 1 end
+        local feats = p:GetFeatureType()
+        local feat = feats and GameInfo.Features[feats]
+        local ft = feat and feat.FeatureType or ""
+        if ft:find("FOREST") or ft:find("RAINFOREST") then terrain.forest = terrain.forest + 1 end
+        if p:IsRiver() then terrain.river = terrain.river + 1 end
+      end
+    end
+  end
+end)
+-- 计算可选万神殿（未被其他玩家取走）
+local taken = {}
+pcall(function()
+  for i = 0, 63 do
+    if Players[i] and Players[i]:IsAlive() then
+      local pr = Players[i]:GetReligion()
+      if pr and pr:GetPantheon() >= 0 then taken[pr:GetPantheon()] = true end
+    end
+  end
+end)
+-- 局面匹配优先级
+local pick, reason = nil, ""
+local order = {}
+if terrain.desert >= 4 then table.insert(order, {"BELIEF_DESERT_FOLKLORE", "首都周边沙漠多，选沙漠传说（沙漠格+信仰）"}) end
+if terrain.forest >= 6 then table.insert(order, {"BELIEF_SACRED_PATH", "首都周边森林多，选神圣之路（森林格+文化）"}) end
+if terrain.tundra >= 4 then table.insert(order, {"BELIEF_DANCE_OF_THE_AURORA", "首都周边冻土多，选极光之舞（冻土格+信仰）"}) end
+if terrain.river >= 3 then table.insert(order, {"BELIEF_RIVER_GODDESS", "首都临河，选河神（河岸格+住房与信仰）"}) end
+if terrain.coast >= 4 then table.insert(order, {"BELIEF_GOD_OF_THE_SEA", "首都沿海，选海神（海岸格+产能）"}) end
+table.insert(order, {"BELIEF_DIVINE_SPARK", "无强地形匹配，选神启（+25% 大预言家点，冲宗教通用）"})
+for _, cand in ipairs(order) do
+  local b = GameInfo.Beliefs[cand[1]]
+  if b and not taken[b.Index] then pick = cand[1]; reason = cand[2]; break end
+end
+if pick == nil then print("RESULT|NONE|没有可用万神殿信仰"); return end
+local params = {}
+params[PlayerOperations.PARAM_BELIEF_TYPE] = GameInfo.Beliefs[pick].Hash
+UI.RequestPlayerOperation(me, PlayerOperations.FOUND_PANTHEON, params)
+print("RESULT|" .. pick .. "|" .. reason)
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("RESULT|"):
+            continue
+        parts = line[len("RESULT|"):].split("|", 1)
+        tag = parts[0]
+        if tag == "ALREADY":
+            return {"ok": False, "error": "ALREADY_HAS_PANTHEON", "detail": "已拥有万神殿，无需再选"}
+        if tag == "NONE":
+            return {"ok": False, "error": "NO_AVAILABLE", "detail": "没有可用万神殿信仰（可能全部被其他文明取走）"}
+        reason = parts[1] if len(parts) > 1 else ""
+        return {"ok": True, "app": app_id, "chosen": tag, "reason": reason,
+                "detail": f"已创立万神殿：{tag}（{reason}）", "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "选万神殿无回执（Tuner 输出丢失），请重试"}
+
+
 async def auto_fill_policy_slots(timeout: float = 12.0) -> dict:
-    """自动填满空政策槽位（InGame，官方 UNLOCK_POLICIES + RequestPolicyChanges 三步）。
+    """自动填满空政策槽位（InGame，官方 UNLOCK_POLICIES + RequestPolicyChanges 三步）——局面感知。
 
     用于 ENDTURN_BLOCKING_FILL_CIVIC_SLOT（"填补政策槽位"）：市政完成/政府变更后
-    出现空槽会挡住结束回合。策略：每个空槽按类型匹配第一个可用政策卡
-    （军事槽放军事卡、经济槽放经济卡，野外卡可进任意槽）。
-    返回 {"ok", "filled", "slots"}（filled=[{slot, slot_type, policy_type}]）。
+    出现空槽会挡住结束回合。**选择逻辑按局面打分**（不是机械填第一个）：
+    读人口/金币/侦察兵/勇士数 → PolicyType 白名单权重（城市规划+1产=最优先；
+    神王+1金=金币紧张时高；勘察+1移动=有侦察兵时高；纪律+15战力=有勇士时中；
+    农业+1粮=人口少时高）→ 每空槽取"槽型匹配且分数最高"的卡。
+    返回 {"ok", "filled", "slots", "picked"}（picked=["POLICY_X=理由", ...]）。
     """
     lua = """
 local me = Game.GetLocalPlayer()
 local pCulture = Players[me]:GetCulture()
 local numSlots = pCulture:GetNumPolicySlots()
-local slotTypeNames = {[0]="SLOT_ECONOMIC", [1]="SLOT_MILITARY", [2]="SLOT_DIPLOMATIC", [3]="SLOT_WILDCARD", [4]="SLOT_WILDCARD"}
-local slotTypeMap = {SLOT_ECONOMIC=0, SLOT_MILITARY=1, SLOT_DIPLOMATIC=2, SLOT_WILDCARD=3}
--- 收集空槽：槽类型 -> 槽位列表
-local emptyByType = {}
-local filled = 0
-local details = {}
+local slotTypeMap = {SLOT_ECONOMIC=0, SLOT_MILITARY=1, SLOT_DIPLOMATIC=2, SLOT_WILDCARD=3, SLOT_GREAT_PERSON=4}
+local slotNames = {[0]="SLOT_ECONOMIC", [1]="SLOT_MILITARY", [2]="SLOT_DIPLOMATIC", [3]="SLOT_WILDCARD", [4]="SLOT_WILDCARD"}
+-- 局面读数
+local pop, gold, scouts, warriors = 0, -1, 0, 0
+pcall(function()
+  for _, c in Players[me]:GetCities():Members() do pop = pop + c:GetPopulation() end
+end)
+pcall(function() gold = Players[me]:GetTreasury():GetGoldBalance() end)
+pcall(function()
+  for _, u in Players[me]:GetUnits():Members() do
+    local info = GameInfo.Units[u:GetType()]
+    if info then
+      local ut = info.UnitType
+      if ut == "UNIT_SCOUT" then scouts = scouts + 1
+      elseif ut == "UNIT_WARRIOR" then warriors = warriors + 1 end
+    end
+  end
+end)
+-- 政策评分表（按局面加权）
+local function score(policy)
+  local pt = policy.PolicyType or ""
+  if pt == "POLICY_URBAN_PLANNING" then return 100, "城市规划：+1产能（首都发展核心）" end
+  if pt == "POLICY_ILKUM" then return 92, "伊利库姆：工人+1移动（改良加速）" end
+  if pt == "POLICY_GOD_KING" then return (gold >= 0 and gold < 25) and 90 or 72, "神王：+1金币" end
+  if pt == "POLICY_SURVEY" then return (scouts > 0) and 88 or 45, "勘察：侦察兵+1移动（探图更快）" end
+  if pt == "POLICY_AGRICULTURE" then return (pop < 5) and 78 or 50, "农业：+1粮食（人口少时增长快）" end
+  if pt == "POLICY_DISCIPLINE" then return (warriors > 0) and 68 or 35, "纪律：+15近战战斗力" end
+  if pt == "POLICY_OVERSEAS_APPOINTMENTS" then return 62, "海外任命：每城+1金币（多城时强）" end
+  return 30
+end
 -- 预收集可用政策（UNLOCK 前 CanSlotPolicy 可靠）
 local usable = {}
 for policy in GameInfo.Policies() do
@@ -1205,55 +1412,40 @@ for policy in GameInfo.Policies() do
       if ok then
         local st = pCulture:GetSlotType(s)
         local pst = policy.GovernmentSlotType or "SLOT_WILDCARD"
-        if st < 3 or pst == "SLOT_WILDCARD" or pst == slotTypeNames[st] then
-          usable[#usable+1] = {policy=policy, slot=s}
+        if st < 3 or pst == "SLOT_WILDCARD" or pst == slotNames[st] then
+          local sc = score(policy)
+          usable[#usable+1] = {policy=policy, slot=s, sc=sc}
           break
         end
       end
     end
   end
 end
--- 计算空槽
-for s = 0, numSlots - 1 do
-  if pCulture:GetSlotPolicy(s) < 0 then
-    local st = pCulture:GetSlotType(s)
-    if not emptyByType[st] then emptyByType[st] = {} end
-    emptyByType[st][#emptyByType[st]+1] = s
-  end
-end
 UI.RequestPlayerOperation(me, PlayerOperations.UNLOCK_POLICIES, {})
 local clearList = {}
 local addList = {}
--- 逐槽匹配：优先同类型槽的直接可用政策（按 GameInfo 顺序=先解锁先选），野外卡兜底
+local picked = {}
 local taken = {}
 for s = 0, numSlots - 1 do
   if pCulture:GetSlotPolicy(s) < 0 then
-    local st = pCulture:GetSlotType(s)
-    local best = nil
+    local best, bestSc = nil, -1
     for _, u in ipairs(usable) do
-      if u.slot == s and not taken[u.policy.Index] then best = u.policy; break end
-    end
-    if best == nil then
-      for _, u in ipairs(usable) do
-        local pst = u.policy.GovernmentSlotType or "SLOT_WILDCARD"
-        if (pst == "SLOT_WILDCARD" or slotTypeMap[pst] == st) and not taken[u.policy.Index] then
-          best = u.policy; break
-        end
+      if u.slot == s and not taken[u.policy.Index] and u.sc > bestSc then
+        best, bestSc = u.policy, u.sc
       end
     end
     if best then
       taken[best.Index] = true
       addList[s] = best.Hash
       clearList[#clearList+1] = s
-      details[#details+1] = tostring(s) .. ":" .. best.PolicyType
+      picked[#picked+1] = best.PolicyType
     end
   end
 end
 if #addList > 0 then
   pcall(function() pCulture:RequestPolicyChanges(clearList, addList) end)
-  filled = #details
 end
-print("FILLED=" .. tostring(filled) .. "&SLOTS=" .. table.concat(details, "|"))
+print("FILLED=" .. tostring(#picked) .. "&SLOTS=" .. table.concat(picked, "|"))
 """
     try:
         app_id, states, reader, writer = await _handshake_retry()
@@ -1273,11 +1465,10 @@ print("FILLED=" .. tostring(filled) .. "&SLOTS=" .. table.concat(details, "|"))
         if not line or "&" not in line:
             continue
         kv = {p.split("=")[0]: p.split("=", 1)[1] for p in line.split("&") if "=" in p}
-        slots = kv.get("SLOTS", "")
+        picked = kv.get("SLOTS", "").split("|") if kv.get("SLOTS") else []
         filled = _to_int(kv.get("FILLED", "0"))
-        return {"ok": True, "app": app_id, "filled": filled,
-                "slots": slots.split("|") if slots else [],
-                "detail": f"已填 {filled} 个空政策槽（{slots}）" if filled else "无空槽或可用政策不足",
+        return {"ok": True, "app": app_id, "filled": filled, "picked": picked,
+                "detail": f"已填 {filled} 个空政策槽（{'、'.join(picked) or '无'}——按当前局面评分选取）",
                 "via": "tuner"}
     return {"ok": False, "error": "NO_RESPONSE", "detail": "填政策槽无回执（Tuner 输出丢失），请重试"}
 
