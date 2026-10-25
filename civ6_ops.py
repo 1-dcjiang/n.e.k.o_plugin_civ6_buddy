@@ -571,6 +571,10 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
     # 1) 初始截图
     screen = _shot(win)
 
+    # 1.5) ESC 预清扫：关掉任何残留面板（城市面板/科技树/外交/提示），文明6 ESC 无副作用
+    _press("esc", 0.35)
+    screen = _shot(win)
+
     # 2) 战争判断（Tuner 结果优先；未测得时像素横幅兜底）→ 交还
     war = war_state
     if war is None and _banner_war_present(screen):
@@ -589,7 +593,7 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
         log.append("检测到'选择研究'面板，已自动选择第一个科技（采矿业）")
         screen = _shot(win)
 
-    # 4) 弹窗清扫（最多 3 次 ESC）
+    # 4) 弹窗清扫（最多 3 次 ESC；仍挡→兜底点下一回合按钮→再验证）
     for i in range(3):
         if not _detect_popup_blocking(screen):
             break
@@ -597,11 +601,19 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
         screen = _shot(win)
         log.append(f"检测到弹窗，已按 ESC 关闭（第 {i + 1} 次）")
     else:
-        return {
-            "ok": False, "handoff": True, "reason": "POPUP_UNRESOLVED",
-            "output": "连续弹窗无法清除：停止运营，请手动处理游戏内弹窗后再说'继续运营'。",
-            "log": log, "channel": _EXEC.channel,
-        }
+        # 3 次 ESC 未清：研究/市政完成弹窗的确认按钮常与"下一回合"同位置，
+        # 直接点它关弹窗并推进；仍挡才判定无法自理。
+        btn = cfg.get("buttons", {}).get("next_turn") or _DEFAULT_BUTTONS["next_turn"]
+        _click_rel(win, float(btn[0]), float(btn[1]), delay=0.4)
+        screen = _shot(win)
+        if not _detect_popup_blocking(screen):
+            log.append("ESC 未清弹窗，点击'下一回合'按钮后弹窗消失")
+        else:
+            return {
+                "ok": False, "handoff": True, "reason": "POPUP_UNRESOLVED",
+                "output": "连续弹窗无法清除：停止运营，请手动处理游戏内弹窗后再说'继续运营'。",
+                "log": log, "channel": _EXEC.channel,
+            }
 
     # 4) 点"下一回合"（模板优先，兜底用默认相对坐标）
     clicked = _template_click_if_found(screen, win, "next_turn")

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -557,7 +558,10 @@ class Civ6BuddyPlugin(NekoPluginBase):
         turn_summaries: list = []
         for i in range(loop_turns):
             try:
-                result = civ6_ops.run_one_turn_ops(
+                # 同步点击段丢到线程执行：内部含阻塞 sleep/截图/点击，
+                # 直接 await 会卡死事件循环（实测 sleep(1s) 被拖到 5.7s）→ 运营"半天不动"。
+                result = await asyncio.to_thread(
+                    civ6_ops.run_one_turn_ops,
                     {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
                     war_state=war_pre if i == 0 else None,
                 )
@@ -628,9 +632,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
             except Exception:
                 pass
             if i < loop_turns - 1:
-                import asyncio as _asyncio
-
-                await _asyncio.sleep(0.5)
+                await asyncio.sleep(0.5)
         self._ops_active = False
         _ops_lock_clear()
         return {
