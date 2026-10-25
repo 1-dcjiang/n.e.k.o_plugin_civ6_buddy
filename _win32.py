@@ -60,6 +60,121 @@ _user32.AttachThreadInput.restype = wintypes.BOOL
 _kernel32.GetCurrentThreadId.argtypes = []
 _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
+# ── 键鼠（SetCursorPos / mouse_event / keybd_event）──
+_user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+_user32.SetCursorPos.restype = wintypes.BOOL
+
+_user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+_user32.mouse_event.restype = None
+
+_user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_void_p]
+_user32.keybd_event.restype = None
+
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+KEYEVENTF_KEYUP = 0x0002
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    """标准 BITMAPINFOHEADER（ctypes.wintypes 未提供，PrintWindow/GetDIBits 需要）。"""
+
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", ctypes.c_long),
+        ("biHeight", ctypes.c_long),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", ctypes.c_long),
+        ("biYPelsPerMeter", ctypes.c_long),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+def mouse_click_abs(screen_x: int, screen_y: int) -> None:
+    """绝对坐标左键单击（无需 pyautogui）。"""
+    _user32.SetCursorPos(int(screen_x), int(screen_y))
+    _user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, None)
+    _user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, None)
+
+
+def press_key(vk: int) -> None:
+    """虚拟键码按键（无需 pyautogui）。"""
+    _user32.keybd_event(vk, 0, 0, None)
+    _user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, None)
+
+
+# ── 屏幕区域截图（BitBlt，无需 pyautogui/PIL）──
+_gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+_gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+_gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+_gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+_gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+_gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_gdi32.SelectObject.restype = ctypes.c_void_p
+_gdi32.BitBlt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                          ctypes.c_void_p, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+_gdi32.BitBlt.restype = wintypes.BOOL
+_gdi32.GetDIBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT, wintypes.UINT,
+                             ctypes.c_void_p, ctypes.POINTER(BITMAPINFOHEADER), wintypes.UINT]
+_gdi32.GetDIBits.restype = ctypes.c_int
+_gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+_gdi32.DeleteDC.restype = wintypes.BOOL
+_gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+_gdi32.DeleteObject.restype = wintypes.BOOL
+
+_user32.GetDC.argtypes = [wintypes.HWND]
+_user32.GetDC.restype = ctypes.c_void_p
+_user32.ReleaseDC.argtypes = [wintypes.HWND, ctypes.c_void_p]
+_user32.ReleaseDC.restype = ctypes.c_int
+
+SRCCOPY = 0x00CC0020
+
+
+def screen_region_rgb(left: int, top: int, right: int, bottom: int) -> "np.ndarray":
+    """截取屏幕区域 → RGB numpy（纯 ctypes BitBlt，无 PIL/pyautogui 依赖）。"""
+    import numpy as np
+
+    w = int(right) - int(left)
+    h = int(bottom) - int(top)
+    if w < 2 or h < 2:
+        raise ValueError(f"屏幕区域尺寸异常 {w}x{h}")
+    screen_dc = _user32.GetDC(0)
+    if not screen_dc:
+        raise OSError("GetDC(NULL) 失败")
+    try:
+        mem_dc = _gdi32.CreateCompatibleDC(screen_dc)
+        if not mem_dc:
+            raise OSError("CreateCompatibleDC 失败")
+        try:
+            bmp = _gdi32.CreateCompatibleBitmap(screen_dc, w, h)
+            if not bmp:
+                raise OSError("CreateCompatibleBitmap 失败")
+            try:
+                _gdi32.SelectObject(mem_dc, bmp)
+                if not _gdi32.BitBlt(mem_dc, 0, 0, w, h, screen_dc, int(left), int(top), SRCCOPY):
+                    raise OSError("BitBlt 失败")
+                bmi = BITMAPINFOHEADER()
+                bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                bmi.biWidth = w
+                bmi.biHeight = -h
+                bmi.biPlanes = 1
+                bmi.biBitCount = 32
+                bmi.biCompression = 0
+                buf = ctypes.create_string_buffer(w * h * 4)
+                if not _gdi32.GetDIBits(mem_dc, bmp, 0, h, buf, ctypes.byref(bmi), 0):
+                    raise OSError("GetDIBits 失败")
+                arr = np.frombuffer(buf.raw, dtype=np.uint8).reshape(h, w, 4)
+                return np.ascontiguousarray(arr[:, :, [2, 1, 0]], dtype=np.uint8)  # BGRA→RGB
+            finally:
+                _gdi32.DeleteObject(bmp)
+        finally:
+            _gdi32.DeleteDC(mem_dc)
+    finally:
+        _user32.ReleaseDC(0, screen_dc)
+
 
 class win32gui:
     """win32gui 的 ctypes 等价实现。"""

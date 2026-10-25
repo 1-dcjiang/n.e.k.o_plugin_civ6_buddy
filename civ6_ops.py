@@ -54,15 +54,9 @@ class _Executor:
 
     @property
     def channel(self) -> str:
-        return "steam_manager" if self._sm is not None else "pyautogui_fallback"
+        return "steam_manager" if self._sm is not None else "ctypes_fallback"
 
-    def _pg_instance(self):  # 懒加载 pyautogui（方法名≠属性名，避免实例属性遮蔽）
-        if self._pg_mod is None:
-            import pyautogui
-            self._pg_mod = pyautogui
-        return self._pg_mod
-
-    def _pil_instance(self):  # 懒加载 PIL.Image
+    def _pil_instance(self):  # 懒加载 PIL.Image（仅 steam_manager 通道需要）
         if self._pil_mod is None:
             from PIL import Image
             self._pil_mod = Image
@@ -92,9 +86,14 @@ class _Executor:
                     return np.asarray(img.convert("RGB"), dtype=np.uint8)
             except Exception:
                 pass
-        img = self._pg_instance().screenshot(region=(win["left"], win["top"],
-                                                     win["right"] - win["left"], win["bottom"] - win["top"]))
-        return np.asarray(img.convert("RGB"), dtype=np.uint8)
+        # ctypes BitBlt 屏幕区域截图兜底（插件进程无 pyautogui/PIL）
+        try:
+            from ._win32 import screen_region_rgb
+        except ImportError:  # 包外直接加载
+            import _win32 as _win32_mod  # type: ignore
+
+            screen_region_rgb = _win32_mod.screen_region_rgb
+        return screen_region_rgb(win["left"], win["top"], win["right"], win["bottom"])
 
     def _capture_printwindow(self, win: dict) -> np.ndarray:
         """PrintWindow 抓取窗口内容（不依赖前台/遮挡状态）。
@@ -105,6 +104,12 @@ class _Executor:
         import ctypes
         from ctypes import wintypes
 
+        try:
+            from ._win32 import BITMAPINFOHEADER
+        except ImportError:  # 包外直接加载（测试/独立脚本）
+            import _win32 as _win32_mod  # type: ignore
+
+            BITMAPINFOHEADER = _win32_mod.BITMAPINFOHEADER
         hwnd = win.get("hwnd")
         if not hwnd:
             raise OpsError("BAD_HWND", "无效窗口句柄")
@@ -132,8 +137,8 @@ class _Executor:
                     if not user32.PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT):
                         raise OpsError("PRINTWINDOW_FAIL", "PrintWindow 返回失败")
                     # 读 DIB 像素
-                    bmi = wintypes.BITMAPINFOHEADER()
-                    bmi.biSize = ctypes.sizeof(wintypes.BITMAPINFOHEADER)
+                    bmi = BITMAPINFOHEADER()
+                    bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
                     bmi.biWidth = w
                     bmi.biHeight = -h  # 顶到底顺序
                     bmi.biPlanes = 1
@@ -158,10 +163,17 @@ class _Executor:
                 return
             except Exception:
                 pass
-        self._pg_instance().click(screen_x, screen_y)
+        # ctypes 兜底（插件进程无 pyautogui）
+        try:
+            from ._win32 import mouse_click_abs as _click
+        except ImportError:  # 包外直接加载
+            import _win32 as _win32_mod  # type: ignore
+
+            _click = _win32_mod.mouse_click_abs
+        _click(screen_x, screen_y)
 
     def press(self, key: str):
-        """按键。steam_manager 通道用虚拟键码；回退通道用 pyautogui 键名。"""
+        """按键。steam_manager 通道用虚拟键码；回退通道用 ctypes keybd_event。"""
         if self._sm is not None:
             try:
                 vk = _VK_MAP.get(key)
@@ -170,7 +182,15 @@ class _Executor:
                     return
             except Exception:
                 pass
-        self._pg_instance().press(key)
+        try:
+            from ._win32 import press_key as _press
+        except ImportError:  # 包外直接加载
+            import _win32 as _win32_mod  # type: ignore
+
+            _press = _win32_mod.press_key
+        vk = _VK_MAP.get(key)
+        if vk is not None:
+            _press(vk)
 
 
 # 常用键 → 虚拟键码（steam_manager.press_key 需要）
