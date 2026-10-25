@@ -608,36 +608,31 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
         log.append("检测到'选择研究'面板，已自动选择第一个科技（采矿业）")
         screen = _shot(win)
 
-    # 3.5) 残留面板清扫：只关闭"已确认存在"的面板，绝不无条件按 ESC。
-    # 实测铁证（v0.6.1）：文明6 按 ESC = 打开暂停菜单，无条件 ESC 会把正常游戏
-    # 误开菜单 → 菜单深色遮罩不被 _detect_popup_blocking 识别 → 菜单残留挡回合 → 任务卡死中止。
-    # 仅当检测到暂停菜单（用户手滑/外部 ESC）时才按 ESC 关闭它；浅色弹窗留给第 4 步循环。
+    # 3.5) 残留面板清扫：完全不用 ESC 键（v0.6.2 用户明确要求——文明6 按 ESC =
+    # 打开暂停菜单，任何 ESC 操作都有误开菜单风险，宁可交还也不冒险）。
+    # 暂停菜单（深色面板）：屏幕路径无法安全关闭 → 立即交还由用户处理。
     if _detect_pause_menu(screen):
-        _press("esc", 0.35)
-        screen = _shot(win)
-        log.append("检测到 ESC 暂停菜单，已按 ESC 关闭")
+        return {
+            "ok": False, "handoff": True, "reason": "PAUSE_MENU",
+            "output": "检测到 ESC 暂停菜单（深色面板）。运营暂停：请按一次 ESC 返回游戏，或点菜单'返回游戏'，然后再说'继续运营'。",
+            "log": log, "channel": _EXEC.channel,
+        }
 
-    # 4) 弹窗清扫（最多 3 次；浅色弹窗或深色暂停菜单 → ESC；仍挡→兜底点下一回合按钮→再验证）
+    # 4) 弹窗清扫（最多 3 次；不用 ESC）：浅色弹窗的确认按钮常与"下一回合"同位置，
+    #    直接点该按钮关闭弹窗；仍挡 → 交还（诚实报告，不盲目操作）。
     for i in range(3):
-        if not _detect_popup_blocking(screen) and not _detect_pause_menu(screen):
+        if not _detect_popup_blocking(screen):
             break
-        _press("esc", 0.45)
-        screen = _shot(win)
-        log.append(f"检测到弹窗/暂停菜单，已按 ESC 关闭（第 {i + 1} 次）")
-    else:
-        # 3 次 ESC 未清：研究/市政完成弹窗的确认按钮常与"下一回合"同位置，
-        # 直接点它关弹窗并推进；仍挡才判定无法自理。
         btn = cfg.get("buttons", {}).get("next_turn") or _DEFAULT_BUTTONS["next_turn"]
         _click_rel(win, float(btn[0]), float(btn[1]), delay=0.4)
         screen = _shot(win)
-        if not _detect_popup_blocking(screen):
-            log.append("ESC 未清弹窗，点击'下一回合'按钮后弹窗消失")
-        else:
-            return {
-                "ok": False, "handoff": True, "reason": "POPUP_UNRESOLVED",
-                "output": "连续弹窗无法清除：停止运营，请手动处理游戏内弹窗后再说'继续运营'。",
-                "log": log, "channel": _EXEC.channel,
-            }
+        log.append(f"检测到弹窗，点击'下一回合'位置关闭（第 {i + 1} 次）")
+    else:
+        return {
+            "ok": False, "handoff": True, "reason": "POPUP_UNRESOLVED",
+            "output": "连续弹窗无法清除：停止运营，请手动处理游戏内弹窗后再说'继续运营'。",
+            "log": log, "channel": _EXEC.channel,
+        }
 
     # 4) 点"下一回合"（模板优先，兜底用默认相对坐标）
     clicked = _template_click_if_found(screen, win, "next_turn")

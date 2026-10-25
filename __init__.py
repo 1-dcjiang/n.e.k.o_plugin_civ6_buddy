@@ -707,6 +707,11 @@ class Civ6BuddyPlugin(NekoPluginBase):
         结束回合 → 轮询真实回合数验证推进。返回交还/成功。"""
         from . import civ6_tuner
         logs: list = []
+        # 回合入口先关一次弹窗/ESC 菜单（v0.6.2 加固）：任务启动时游戏可能已卡在
+        # 暂停菜单（用户实测反馈"给她命令后就这样"），Lua 官方关闭菜单后再读 blockers，
+        # 避免菜单挡住 end_turn 导致任务被误判卡死中止。
+        cp0 = await civ6_tuner.close_ui_popups(timeout=10.0)
+        logs.append(f"回合入口弹窗/菜单清理：{cp0.get('detail', cp0.get('error', ''))}")
         b = await civ6_tuner.read_blockers(timeout=8.0)
         if not b.get("ok"):
             return {"handoff": True, "ok": False, "reason": "TUNER_OFF",
@@ -865,6 +870,15 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 return {"handoff": True, "ok": False, "reason": "ENDTURN_ERR",
                         "output": f"结束回合失败：{e.get('detail')}", "log": logs}
             for _ in range(3):
+                await asyncio.sleep(3.0)
+                s = await civ6_tuner.read_situation(timeout=6.0)
+                if s.get("ok") and int(s.get("turn", 0) or 0) > turn_before:
+                    return {"ok": True, "handoff": False,
+                            "turn_after": int(s.get("turn", 0) or 0), "log": logs}
+            # v0.6.2 加固：回合 30+ / mod 环境下 AI 结算实测 >40s（5 文明+9 城邦+
+            # R.E.D. mod 拖慢），原 9s 轮询必然误判"未推进"→ 自愈重发 endturn →
+            # 3 轮后交还 = 用户看到的"任务跑一半自动停"。放宽到 36s 窗口再判定。
+            for _ in range(9):
                 await asyncio.sleep(3.0)
                 s = await civ6_tuner.read_situation(timeout=6.0)
                 if s.get("ok") and int(s.get("turn", 0) or 0) > turn_before:
