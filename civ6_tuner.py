@@ -1091,6 +1091,92 @@ print("PICK=" .. pick)
     return {"ok": False, "error": "NO_RESPONSE", "detail": "自动选研究无回执（Tuner 输出丢失），请重试"}
 
 
+async def move_explorers(timeout: float = 20.0) -> dict:
+    """让侦察兵真正向外探路（InGame RequestOperation MOVE_TO，异步生效）。
+
+    回答"单位为什么不移动"：v0.5.1 的 skip_idle_units 只是原地结束移动力（保回合推进），
+    侦察兵不会动。本函数：对每个有移动力的侦察兵（UNIT_SCOUT），选择"远离首都方向"的
+    相邻可通行格（排除水域/山脉/已有我方单位），RequestOperation MOVE_TO 移动一格；
+    其余单位（勇士/建造者）不动——战斗单位不主动移动（不引战，打仗归玩家），
+    建造者等策略工具指挥。MOVE_TO 异步生效：调用方应先执行本函数（发命令），
+    Python 侧短等待后再由 skip_idle_units 结束剩余移动力（blocker 消除）。
+    返回 {"ok", "moved": n, "targets": ["9,13->10,13", ...]}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local capX, capY = -1, -1
+pcall(function()
+  local cap = Players[me]:GetCities():GetCapitalCity()
+  if cap then capX, capY = cap:GetX(), cap:GetY() end
+end)
+if capX < 0 then
+  pcall(function()
+    for _, c in Players[me]:GetCities():Members() do capX, capY = c:GetX(), c:GetY(); break end
+  end)
+end
+local targets = {}
+local seen = {}
+for _, u in Players[me]:GetUnits():Members() do
+  if u:GetX() ~= -9999 and not seen[u:GetID()] then
+    seen[u:GetID()] = true
+    local info = GameInfo.Units[u:GetType()]
+    if info and info.UnitType == "UNIT_SCOUT" and (u:GetMovesRemaining() or 0) > 0 then
+      local x, y = u:GetX(), u:GetY()
+      local best, bestScore = nil, -999999
+      for dx = -1, 1 do for dy = -1, 1 do
+        if dx ~= 0 or dy ~= 0 then
+          local nx, ny = x + dx, y + dy
+          local p = Map.GetPlot(nx, ny)
+          if p and not p:IsWater() and not p:IsMountain() then
+            local occ = false
+            local us = Map.GetUnitsAt(nx, ny)
+            if us then
+              for o in us:Units() do if o:GetOwner() == me then occ = true; break end end
+            end
+            if not occ then
+              local score = (nx - capX) * dx + (ny - capY) * dy
+              if score > bestScore then bestScore = score; best = {nx, ny} end
+            end
+          end
+        end
+      end end
+      if best then
+        local params = {}
+        params[UnitOperationTypes.PARAM_X] = best[1]
+        params[UnitOperationTypes.PARAM_Y] = best[2]
+        pcall(function() UnitManager.RequestOperation(u, UnitOperationTypes.MOVE_TO, params) end)
+        targets[#targets+1] = tostring(x) .. "," .. tostring(y) .. "->" .. tostring(best[1]) .. "," .. tostring(best[2])
+      end
+    end
+  end
+end
+print("MOVED=" .. table.concat(targets, "|"))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("MOVED="):
+            continue
+        targets = [t for t in line[len("MOVED="):].split("|") if t]
+        return {"ok": True, "app": app_id, "moved": len(targets),
+                "targets": targets,
+                "detail": f"侦察兵已向外探路：{len(targets)} 个单位移动（{'、'.join(targets) or '原地'}）",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "侦察兵移动无回执（Tuner 输出丢失），请重试"}
+
+
 async def auto_fill_policy_slots(timeout: float = 12.0) -> dict:
     """自动填满空政策槽位（InGame，官方 UNLOCK_POLICIES + RequestPolicyChanges 三步）。
 

@@ -740,7 +740,11 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 if not u.get("ok"):
                     hard.append((bt, u.get("detail", "")))
                 elif u.get("skip_idle_ok"):
-                    r = await civ6_tuner.skip_idle_units(force=False, timeout=8.0)
+                    # 先让侦察兵真正探路（远离首都方向），再结束剩余移动力
+                    me = await civ6_tuner.move_explorers(timeout=15.0)
+                    logs.append(f"侦察探路：{me.get('detail', me.get('error', '跳过'))}")
+                    await asyncio.sleep(2.0)
+                    r = await civ6_tuner.skip_idle_units(force=True, timeout=8.0)
                     logs.append(f"单位跳过：{r.get('detail', '跳过完成')}")
                 else:
                     if war_flag:
