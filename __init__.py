@@ -770,6 +770,27 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 logs.append(f"使节：{ev.get('detail', ev.get('error', ''))}")
                 if not ev.get("ok"):
                     hard.append((bt, ev.get("detail", "")))
+            elif bt == "ENDTURN_BLOCKING_UNIT_PROMOTION":
+                pr = await civ6_tuner.auto_promote_units(timeout=15.0)
+                logs.append(f"单位升级：{pr.get('detail', pr.get('error', ''))}")
+                if not pr.get("ok"):
+                    hard.append((bt, pr.get("detail", "")))
+            elif bt == "ENDTURN_BLOCKING_GOVERNOR_APPOINTMENT":
+                gp = await civ6_tuner.auto_appoint_governor(timeout=12.0)
+                logs.append(f"总督任命：{gp.get('detail', gp.get('error', ''))}")
+                if not gp.get("ok"):
+                    hard.append((bt, gp.get("detail", "")))
+            elif bt == "ENDTURN_BLOCKING_COMMEMORATION_AVAILABLE":
+                cm = await civ6_tuner.auto_choose_commemoration(timeout=12.0)
+                logs.append(f"时代纪念：{cm.get('detail', cm.get('error', ''))}")
+                if not cm.get("ok"):
+                    hard.append((bt, cm.get("detail", "")))
+            elif bt == "ENDTURN_BLOCKING_STACKED_UNITS":
+                # 军事单位堆叠：尝试跳过剩余移动力解除，失败则交还（移动方向是战术决策）
+                r = await civ6_tuner.skip_idle_units(force=True, timeout=8.0)
+                logs.append(f"堆叠单位：{r.get('detail', '完成')}")
+                if not r.get("ok"):
+                    hard.append((bt, r.get("detail", "")))
             elif bt == "ENDTURN_BLOCKING_UNITS":
                 u = await civ6_tuner.units_blocker_status(timeout=8.0)
                 if not u.get("ok"):
@@ -797,17 +818,23 @@ class Civ6BuddyPlugin(NekoPluginBase):
         # 关弹窗（顾问提示/科技完成等会挡住结束回合——实测不关弹窗 ACTION_ENDTURN 被拦截、回合不推进）
         cp = await civ6_tuner.close_ui_popups(timeout=10.0)
         logs.append(f"弹窗清理：{cp.get('detail', cp.get('error', ''))}")
-        e = await civ6_tuner.end_turn(timeout=8.0)
-        logs.append(e.get("detail", "结束回合"))
-        if not e.get("ok"):
-            return {"handoff": True, "ok": False, "reason": "ENDTURN_ERR",
-                    "output": f"结束回合失败：{e.get('detail')}", "log": logs}
-        for _ in range(3):
-            await asyncio.sleep(3.0)
-            s = await civ6_tuner.read_situation(timeout=6.0)
-            if s.get("ok") and int(s.get("turn", 0) or 0) > turn_before:
-                return {"ok": True, "handoff": False,
-                        "turn_after": int(s.get("turn", 0) or 0), "log": logs}
+        # endturn 自愈兜底：回合没推进 → 再关弹窗再结束，最多 3 轮（防"新弹窗连环卡死"）
+        for attempt in range(3):
+            e = await civ6_tuner.end_turn(timeout=8.0)
+            logs.append(e.get("detail", "结束回合"))
+            if not e.get("ok"):
+                return {"handoff": True, "ok": False, "reason": "ENDTURN_ERR",
+                        "output": f"结束回合失败：{e.get('detail')}", "log": logs}
+            for _ in range(3):
+                await asyncio.sleep(3.0)
+                s = await civ6_tuner.read_situation(timeout=6.0)
+                if s.get("ok") and int(s.get("turn", 0) or 0) > turn_before:
+                    return {"ok": True, "handoff": False,
+                            "turn_after": int(s.get("turn", 0) or 0), "log": logs}
+            # 未推进：可能冒出新的拦截弹窗（如奇观/尤里卡）——再关一次再试
+            if attempt < 2:
+                cp2 = await civ6_tuner.close_ui_popups(timeout=10.0)
+                logs.append(f"自愈重试{attempt + 1}：{cp2.get('detail', cp2.get('error', ''))}")
         return {"handoff": True, "ok": False, "reason": "TURN_NOT_ADVANCED",
                 "output": "结束回合后回合数未推进（可能卡在结算/弹窗）。控制权交还，请看一眼游戏。",
                 "log": logs}

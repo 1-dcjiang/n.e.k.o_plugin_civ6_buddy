@@ -1594,6 +1594,228 @@ print("RESULT|" .. target.name .. "|dist=" .. tostring(target.dist))
     return {"ok": False, "error": "NO_RESPONSE", "detail": "派使节无回执（Tuner 输出丢失），请重试"}
 
 
+async def auto_promote_units(timeout: float = 15.0) -> dict:
+    """自动升级有可用升级点的单位（GameCore SetPromotion——InGame RequestCommand(PROMOTE) 静默失败已证）。
+
+    用于 ENDTURN_BLOCKING_UNIT_PROMOTION（"单位可以升级"）。升级是纯强化、不引战、
+    不改变战略方向——自动选择第一个可用的同职业升级（按游戏数据顺序），
+    SetPromotion 后清零 stored promotions（否则引擎持续报 blocker）。
+    返回 {"ok", "promoted": ["SCOUT→ALERTNESS", ...]}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local prereqMap = {}
+for row in GameInfo.UnitPromotionPrereqs() do
+  local pt = row.UnitPromotion
+  if not prereqMap[pt] then prereqMap[pt] = {} end
+  table.insert(prereqMap[pt], row.PrereqUnitPromotion)
+end
+local results = {}
+for _, unit in Players[me]:GetUnits():Members() do
+  local exp = unit:GetExperience()
+  if exp then
+    local stored = 0
+    pcall(function() stored = exp:GetStoredPromotions() end)
+    if stored > 0 then
+      local ui = GameInfo.Units[unit:GetType()]
+      local promClass = ui and ui.PromotionClass or ""
+      local chosen = nil
+      for promo in GameInfo.UnitPromotions() do
+        if promo.PromotionClass == promClass and not exp:HasPromotion(promo.Index) then
+          local prereqs = prereqMap[promo.UnitPromotionType]
+          local okPrereq = true
+          if prereqs and #prereqs > 0 then
+            okPrereq = false
+            for _, reqType in ipairs(prereqs) do
+              local reqInfo = GameInfo.UnitPromotions[reqType]
+              if reqInfo and exp:HasPromotion(reqInfo.Index) then okPrereq = true break end
+            end
+          end
+          if okPrereq then
+            local can = false
+            pcall(function() can = exp:CanPromote(promo.Index) end)
+            if can then chosen = promo break end
+          end
+        end
+      end
+      if chosen then
+        exp:SetPromotion(chosen.Index)
+        local storedNow = 0
+        pcall(function() storedNow = exp:GetStoredPromotions() end)
+        if storedNow > 0 then pcall(function() exp:ChangeStoredPromotions(-storedNow) end) end
+        local okApply = exp:HasPromotion(chosen.Index)
+        local ut = ui and ui.UnitType or "?"
+        results[#results+1] = ut .. "→" .. chosen.UnitPromotionType .. "|ok=" .. tostring(okApply)
+      else
+        local ut = ui and ui.UnitType or "?"
+        results[#results+1] = ut .. "→NONE"
+      end
+    end
+  end
+end
+print("RESULT|" .. table.concat(results, ";;"))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua,
+                                state_index=_gamecore_state_index(states), timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("RESULT|"):
+            continue
+        payload = line[len("RESULT|"):]
+        if not payload.strip():
+            return {"ok": True, "app": app_id, "promoted": [],
+                    "detail": "没有需要升级的单位（无可用升级点）", "via": "tuner"}
+        items = [p for p in payload.split(";;") if p.strip()]
+        promoted = []
+        for it in items:
+            tag, _, ok = it.partition("|")
+            promoted.append(tag)
+        return {"ok": True, "app": app_id, "promoted": promoted,
+                "detail": f"已升级 {len(promoted)} 个单位：" + "、".join(promoted) + "（自动选第一个可用升级，纯强化不引战）",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "单位升级无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_appoint_governor(timeout: float = 12.0) -> dict:
+    """自动任命并分配总督（InGame APPOINT_GOVERNOR + ASSIGN_GOVERNOR）。
+
+    用于 ENDTURN_BLOCKING_GOVERNOR_APPOINTMENT（"可以任命一位总督"）。
+    选择第一个尚未任命的总督类型，任命后自动分配到首都（收益确定性最高）。
+    总督是对内治理（产能/科技/忠诚加成），不改变玩家战略方向，自动处理安全。
+    返回 {"ok", "governor", "city"}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local pGovs = nil
+pcall(function() pGovs = Players[me]:GetGovernors() end)
+if not pGovs then print("RESULT|NO_POINT|当前版本不支持总督系统（无 Rise&Fall/GS）"); return end
+local canAppoint = false
+pcall(function() canAppoint = pGovs:CanAppoint() end)
+if not canAppoint then print("RESULT|NO_POINT|没有可用总督任命点数"); return end
+local appointed = {}
+pcall(function()
+  local list = pGovs:GetGovernorsAppointed()
+  if list then
+    for _, idx in ipairs(list) do appointed[idx] = true end
+  end
+end)
+local chosen = nil
+for gov in GameInfo.Governors() do
+  if not appointed[gov.Index] then chosen = gov break end
+end
+if not chosen then print("RESULT|ALL_APPOINTED|所有总督都已任命"); return end
+local params = {}
+params[PlayerOperations.PARAM_GOVERNOR_TYPE] = chosen.Index
+UI.RequestPlayerOperation(me, PlayerOperations.APPOINT_GOVERNOR, params)
+local cityName = "?"
+pcall(function()
+  local city = Players[me]:GetCities():GetCapitalCity()
+  if city then
+    cityName = Locale.Lookup(city:GetName())
+    local params2 = {}
+    params2[PlayerOperations.PARAM_GOVERNOR_TYPE] = chosen.Index
+    params2[PlayerOperations.PARAM_CITY_DEST] = city:GetID()
+    params2[PlayerOperations.PARAM_PLAYER_ONE] = me
+    UI.RequestPlayerOperation(me, PlayerOperations.ASSIGN_GOVERNOR, params2)
+  end
+end)
+print("RESULT|" .. chosen.GovernorType .. "|" .. (Locale.Lookup(chosen.Name) or "?") .. "|" .. cityName)
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("RESULT|"):
+            continue
+        parts = line[len("RESULT|"):].split("|", 1)
+        tag = parts[0]
+        if tag == "NO_POINT":
+            return {"ok": False, "error": "NO_POINT", "detail": "没有可用总督任命点数（可能刚用过）"}
+        if tag == "ALL_APPOINTED":
+            return {"ok": False, "error": "ALL_APPOINTED", "detail": "所有总督都已任命"}
+        detail = parts[1] if len(parts) > 1 else ""
+        return {"ok": True, "app": app_id, "governor": tag, "detail": f"已任命总督 {detail} 并分配到首都",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "任命总督无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_choose_commemoration(timeout: float = 12.0) -> dict:
+    """自动选择时代纪念（黄金时代致敬）（InGame COMMEMORATE）。
+
+    用于 ENDTURN_BLOCKING_COMMEMORATION_AVAILABLE（"可以选择一个纪念"）。
+    选择第一个可用的纪念（GetPlayerCommemorateChoices），纪念是时代增益，
+    不改变战略方向，自动处理安全。返回 {"ok", "commemoration"}。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local pEras = nil
+pcall(function() pEras = Game.GetEras() end)
+if not pEras then print("RESULT|NONE|当前版本不支持纪念系统"); return end
+local allowed = 0
+pcall(function() allowed = pEras:GetPlayerNumAllowedCommemorations(me) or 0 end)
+if allowed <= 0 then print("RESULT|NONE|当前没有可选纪念"); return end
+local choices = pEras:GetPlayerCommemorateChoices(me)
+local chosen = nil
+if choices then
+  for _, idx in ipairs(choices) do
+    local row = GameInfo.CommemorationTypes[idx]
+    if row then chosen = {idx=idx, type=row.CommemorationType} break end
+  end
+end
+if not chosen then print("RESULT|NONE|没有可用纪念选项"); return end
+local params = {}
+params[PlayerOperations.PARAM_COMMEMORATION_TYPE] = chosen.idx
+UI.RequestPlayerOperation(me, PlayerOperations.COMMEMORATE, params)
+print("RESULT|" .. chosen.type)
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("RESULT|"):
+            continue
+        parts = line[len("RESULT|"):].split("|", 1)
+        tag = parts[0]
+        if tag == "NONE":
+            return {"ok": False, "error": "NONE", "detail": "当前没有可选纪念"}
+        return {"ok": True, "app": app_id, "commemoration": tag, "detail": f"已选择纪念 {tag}", "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "选择纪念无回执（Tuner 输出丢失），请重试"}
+
+
 async def auto_fill_policy_slots(timeout: float = 12.0) -> dict:
     """自动填满空政策槽位（InGame，官方 UNLOCK_POLICIES + RequestPolicyChanges 三步）——局面感知。
 
