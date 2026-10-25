@@ -34,6 +34,38 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4318
 
 
+def _parse_lua_states(raw: list[str]) -> dict[int, str]:
+    """LSQ 返回交错 [index, name] 列表 → {index: name}。
+
+    示例：['0','Main State','1','DebugHotloadCache',...,'3','GameCore_Tuner',...]"""
+    result: dict[int, str] = {}
+    i = 0
+    while i + 1 < len(raw):
+        try:
+            idx = int(raw[i].strip())
+        except ValueError:
+            i += 1
+            continue
+        result[idx] = raw[i + 1].strip()
+        i += 2
+    return result
+
+
+def _gamecore_state_index(states: list[str], fallback: int = 0) -> int:
+    """从 LSQ 原始列表解析出可执行 Lua 的 state 索引。
+
+    优先 GameCore_Tuner（游戏核心状态：Players/Game 可用）；
+    次选 InGame；都没有才回退 0。"""
+    parsed = _parse_lua_states(states)
+    for idx, name in parsed.items():
+        if name == "GameCore_Tuner":
+            return idx
+    for idx, name in parsed.items():
+        if name == "InGame":
+            return idx
+    return fallback
+
+
 class TunerError(Exception):
     """FireTuner 连接/执行错误。"""
 
@@ -85,7 +117,8 @@ async def _drain(reader: asyncio.StreamReader, timeout: float = 0.2) -> None:
             await asyncio.wait_for(reader.readexactly(HEADER_SIZE), timeout=timeout)
         except asyncio.TimeoutError:
             return
-        except asyncio.IncompleteReadError:
+        except (asyncio.IncompleteReadError, ConnectionResetError, ConnectionAbortedError, OSError):
+            # 服务端关闭连接/重置 = 没有更多数据，幂等返回
             return
 
 
@@ -111,9 +144,25 @@ async def handshake(
         _, raw = await _recv(reader, timeout)
         states = [s.strip() for s in raw.replace("\x00", "\n").split("\n") if s.strip()]
         return app_id, states, reader, writer
-    except Exception:
+    except TunerError:
         writer.close()
         raise
+    except Exception as exc:
+        writer.close()
+        raise TunerError(f"握手失败：{exc}") from None
+
+
+def _parse_output_payload(payload: str) -> str | None:
+    """从 print 输出帧提取内容。
+
+    FireTuner 的 print 输出帧格式：`O\x00<context_name>: <value>`
+    （O + null + Lua state 名 + ': ' + 值）。非输出帧（空 ack 等）返回 None。"""
+    if not payload.startswith("O"):
+        return None
+    sep = payload.find(": ", 2)
+    if sep >= 0:
+        return payload[sep + 2:]
+    return payload.lstrip("O").lstrip("\x00").strip()
 
 
 async def execute_lua(
@@ -122,26 +171,60 @@ async def execute_lua(
     code: str,
     state_index: int = 0,
     timeout: float = 8.0,
-) -> str:
-    """在指定 Lua state 执行脚本，返回游戏 print 输出。"""
+) -> list[str]:
+    """在指定 Lua state 执行脚本，**循环收集**全部 print 输出行。
+
+    FireTuner 的 print 输出是多帧异步流（`O\\x00<state>: <value>`），
+    单帧读取会丢行/错位。此处：执行前清陈旧帧 → 发 CMD → 循环读帧
+    直到超时 → 解析输出行 → 再清尾部。"""
+    await _drain(reader, timeout=0.1)
     await _send(writer, TAG_COMMAND, f"CMD:{state_index}:{code}")
-    _, payload = await _recv(reader, timeout)
-    await _drain(reader)
-    return payload
+    lines: list[str] = []
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        try:
+            _, payload = await _recv(reader, min(remaining, 2.0))
+        except TunerError:
+            break  # 读取超时/帧损坏 → 停止收集
+        text = _parse_output_payload(payload)
+        if text is not None and text.strip():
+            lines.append(text.strip())
+    await _drain(reader, timeout=0.2)
+    return lines
+
+
+async def _handshake_retry(retries: int = 2, delay: float = 0.5):
+    """握手带重试：游戏 Tuner 单连接限制下，紧接的连接可能被 RST（前连接未释放），
+    短暂等待后重试即可成功。"""
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return await handshake()
+        except TunerError as exc:
+            last = exc
+            if attempt < retries:
+                await asyncio.sleep(delay)
+    raise last if last else TunerError("握手失败")
 
 
 async def tuner_status() -> dict:
     """只读探测：Tuner 是否可用。无 Tuner 时返回明确错误码。"""
     try:
-        app_id, states, reader, writer = await handshake()
+        app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc), "states": []}
     try:
         writer.close()
     except Exception:
         pass
+    parsed = _parse_lua_states(states)
     return {"ok": True, "app": app_id, "states": states,
-            "detail": f"Tuner 已连接（{app_id}，Lua states：{len(states)}）"}
+            "gamecore_index": _gamecore_state_index(states),
+            "state_count": len(parsed),
+            "detail": f"Tuner 已连接（{app_id}，Lua states：{len(parsed)} 个，GameCore={_gamecore_state_index(states)}）"}
 
 
 # ── Lua 脚本（焦点式市民分配，游戏官方机制） ──
@@ -154,14 +237,16 @@ if not ok or pPlayer == nil then print("ERR:NO_PLAYER") return end
 local yRow = GameInfo.Yields[targetYield]
 if yRow == nil then print("ERR:YIELD_NOT_FOUND|" .. targetYield) return end
 local okApply = pcall(function()
-  -- 遍历该玩家城市，设置焦点（DEFAULT 清空全部焦点）
-  for i, pCity in ipairs(pPlayer:GetCities()) do
+  -- 遍历该玩家全部城市（GetCities():Members()），设置焦点（DEFAULT 清空全部焦点）
+  for i, pCity in pPlayer:GetCities():Members() do
     local citz = pCity:GetCitizens()
     for yr in GameInfo.Yields() do
-      if citz:IsFavoredYield(yr.Index) then citz:SetYieldFocus(yr.Index, false) end
+      local okFav, fav = pcall(function() return citz:IsFavoredYield(yr.Index) end)
+      if okFav and fav then pcall(function() citz:SetYieldFocus(yr.Index, false) end) end
     end
     if targetYield ~= "YIELD_DEFAULT" then
-      citz:SetYieldFocus(yRow.Index, true)
+      local okSet = pcall(function() citz:SetYieldFocus(yRow.Index, true) end)
+      if not okSet then print("ERR:SETFOCUS_FAILED|" .. pCity:GetName()) end
     end
     print("OK|" .. pCity:GetName() .. "|focus=" .. targetYield)
   end
@@ -173,12 +258,20 @@ LUA_LIST_CITIES = """
 local ok, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
 if not ok or pPlayer == nil then print("ERR:NO_PLAYER") return end
 local okList = pcall(function()
-  for i, c in ipairs(pPlayer:GetCities()) do
-    local g = c:GetGrowth()
+  for i, c in pPlayer:GetCities():Members() do
+    local pop, growth = c:GetPopulation(), nil
+    local okG = pcall(function()
+      local g = c:GetGrowth()
+      if g then growth = tostring(g:GetTurnsUntilGrowth()) end
+    end)
+    if not okG then growth = "?" end
+    local yields = {{}}
+    for y = 0, 5 do
+      local okY, v = pcall(function() return c:GetYield(y) end)
+      yields[y + 1] = okY and tostring(v) or "?"
+    end
     print(string.format("%s|pop=%d|food=%s|prod=%s|gold=%s|sci=%s|cult=%s|faith=%s|growth=%s",
-      c:GetName(), c:GetPopulation(),
-      c:GetYield(0), c:GetYield(1), c:GetYield(2), c:GetYield(3), c:GetYield(4), c:GetYield(5),
-      tostring(g and g:GetTurnsUntilGrowth())))
+      c:GetName(), pop, yields[1], yields[2], yields[3], yields[4], yields[5], yields[6], growth))
   end
 end)
 if not okList then print("ERR:LISTCITIES_FAILED") end
@@ -188,11 +281,12 @@ if not okList then print("ERR:LISTCITIES_FAILED") end
 async def list_cities(timeout: float = 8.0) -> dict:
     """读本城全部城市的人口与六项产出（FireTuner）。"""
     try:
-        app_id, states, reader, writer = await handshake()
+        app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc), "cities": []}
     try:
-        out = await execute_lua(reader, writer, LUA_LIST_CITIES, state_index=0, timeout=timeout)
+        out = await execute_lua(reader, writer, LUA_LIST_CITIES,
+                                state_index=_gamecore_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc), "cities": []}
     finally:
@@ -201,7 +295,7 @@ async def list_cities(timeout: float = 8.0) -> dict:
         except Exception:
             pass
     cities = []
-    for line in out.strip().split("\n"):
+    for line in out:
         line = line.strip()
         if not line:
             continue
@@ -228,9 +322,19 @@ local ok, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] 
 if not ok or pPlayer == nil then print("ERR:NO_PLAYER") return end
 local ok2, pDiplo = pcall(function() return pPlayer:GetDiplomacy() end)
 if not ok2 or pDiplo == nil then print("ERR:NO_DIPLOMACY") return end
-local ok3, count = pcall(function() return pDiplo:GetAtWarCount() end)
-if not ok3 then print("ERR:ATWAR_API") return end
-print("OK|at_war=" .. tostring(count or 0))
+local count = 0
+-- 遍历全部玩家槽（硬编码 0..62：GetNumPlayers 在该环境不可靠），逐人查 IsAtWarWith
+for i = 0, 62 do
+  local p = Players[i]
+  if p ~= nil then
+    local okAlive, alive = pcall(function() return p:IsAlive() end)
+    if okAlive and alive then
+      local okWar, atWar = pcall(function() return pDiplo:IsAtWarWith(i) end)
+      if okWar and atWar then count = count + 1 end
+    end
+  end
+end
+print("OK|at_war=" .. tostring(count))
 """
 
 
@@ -240,11 +344,12 @@ async def at_war(timeout: float = 8.0) -> dict:
     返回 {"ok": True, "at_war": int, ...}；Tuner 不可用返回明确错误码
     （调用方据此回退到像素横幅检测，不阻断运营）。"""
     try:
-        app_id, states, reader, writer = await handshake()
+        app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, LUA_AT_WAR, state_index=0, timeout=timeout)
+        out = await execute_lua(reader, writer, LUA_AT_WAR,
+                                state_index=_gamecore_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -252,7 +357,7 @@ async def at_war(timeout: float = 8.0) -> dict:
             writer.close()
         except Exception:
             pass
-    for line in out.strip().split("\n"):
+    for line in out:
         line = line.strip()
         if not line:
             continue
@@ -263,7 +368,7 @@ async def at_war(timeout: float = 8.0) -> dict:
                 return {"ok": True, "app": app_id, "at_war": int(line.split("=")[1])}
             except (IndexError, ValueError):
                 return {"ok": False, "error": "BAD_RESPONSE", "detail": line}
-    return {"ok": False, "error": "NO_RESPONSE", "detail": out.strip()}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "|".join(out)}
 
 
 async def set_focus(yield_name: str, timeout: float = 8.0) -> dict:
@@ -278,12 +383,12 @@ async def set_focus(yield_name: str, timeout: float = 8.0) -> dict:
         return {"ok": False, "error": "BAD_YIELD",
                 "detail": f"未知焦点 {yield_name}，可用：FOOD/PRODUCTION/GOLD/SCIENCE/CULTURE/FAITH/DEFAULT"}
     try:
-        app_id, states, reader, writer = await handshake()
+        app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc), "results": []}
     try:
         out = await execute_lua(reader, writer, LUA_SET_FOCUS.format(yield_type=yield_name),
-                                state_index=0, timeout=timeout)
+                                state_index=_gamecore_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc), "results": []}
     finally:
@@ -292,7 +397,7 @@ async def set_focus(yield_name: str, timeout: float = 8.0) -> dict:
         except Exception:
             pass
     results = []
-    for line in out.strip().split("\n"):
+    for line in out:
         line = line.strip()
         if not line:
             continue

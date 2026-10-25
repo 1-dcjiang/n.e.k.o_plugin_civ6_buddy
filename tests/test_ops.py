@@ -107,7 +107,12 @@ def test_citizen_assignment_all_tiles():
 
 
 def test_run_one_turn_ops_no_game_raises():
-    """无游戏窗口时必须抛 GAME_NOT_RUNNING（异常路径，不依赖 GUI）。"""
+    """无游戏窗口时必须抛 GAME_NOT_RUNNING（异常路径，不依赖 GUI）。
+
+    游戏在运行时该用例不成立（_find_window 会真找到窗口并操作游戏），
+    检测到文明6 窗口在 → 跳过。"""
+    if _civ6_ops_mod._find_window_probe():
+        pytest.skip("文明6 正在运行：无游戏用例无法成立（避免真操作游戏）")
     with pytest.raises(OpsError) as ei:
         _civ6_ops_mod.run_one_turn_ops({}, war_state=None)
     assert ei.value.code == "GAME_NOT_RUNNING"

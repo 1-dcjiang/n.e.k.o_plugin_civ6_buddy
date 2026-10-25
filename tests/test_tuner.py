@@ -2,13 +2,30 @@
 
 覆盖：帧打包/解包、非法帧防御、set_focus 参数校验、
 无 Tuner 时 list_cities/tuner_status 返回明确错误码。
+
+注：『无游戏』用例的前提是 4318 没有监听；游戏开着（Tuner 在线）时
+这些用例自动跳过（避免误连真实游戏/误改游戏状态）。
 """
 
 import importlib
+import socket
 
 import pytest
 
 _tuner = importlib.import_module("civ6_tuner")
+
+
+def _tuner_listening() -> bool:
+    """只读探测：4318（游戏 FireTuner）当前是否在监听。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", 4318)) == 0
+
+
+skip_if_game = pytest.mark.skipif(
+    _tuner_listening(),
+    reason="游戏 Tuner（4318）在监听：『无游戏』用例不成立，跳过以免误连真实游戏",
+)
 
 
 def test_pack_unpack_roundtrip():
@@ -33,6 +50,7 @@ def test_unpack_rejects_bad_length():
         _tuner._unpack(buf)
 
 
+@skip_if_game
 def test_tuner_status_no_game():
     import asyncio
     r = asyncio.run(_tuner.tuner_status())
@@ -41,6 +59,7 @@ def test_tuner_status_no_game():
     assert r["error"] == "GAME_TUNER_OFF"
 
 
+@skip_if_game
 def test_list_cities_no_game():
     import asyncio
     r = asyncio.run(_tuner.list_cities())
@@ -49,6 +68,7 @@ def test_list_cities_no_game():
     assert r["cities"] == []
 
 
+@skip_if_game
 def test_set_focus_validates_yield():
     import asyncio
     r = asyncio.run(_tuner.set_focus("NOPE"))
@@ -66,6 +86,7 @@ def test_lua_scripts_contain_guards():
     assert "YIELD_DEFAULT" in _tuner.LUA_SET_FOCUS
 
 
+@skip_if_game
 def test_at_war_no_game():
     import asyncio
     r = asyncio.run(_tuner.at_war())
@@ -75,7 +96,7 @@ def test_at_war_no_game():
 
 
 def test_at_war_lua_guard():
-    # 战争脚本含本地玩家守卫 + 战争计数
+    # 战争脚本含本地玩家守卫 + 逐玩家 IsAtWarWith 战争计数
     assert "ERR:NO_PLAYER" in _tuner.LUA_AT_WAR
-    assert "GetAtWarCount" in _tuner.LUA_AT_WAR
+    assert "IsAtWarWith" in _tuner.LUA_AT_WAR
     assert "at_war=" in _tuner.LUA_AT_WAR

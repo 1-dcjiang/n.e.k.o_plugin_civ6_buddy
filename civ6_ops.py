@@ -43,8 +43,8 @@ class _Executor:
 
     def __init__(self):
         self._sm = None
-        self._pg = None
-        self._PIL = None
+        self._pg_mod = None
+        self._pil_mod = None
         try:
             from plugin.plugins.steam_manager import control as _sm_control
             self._sm = _sm_control
@@ -55,32 +55,100 @@ class _Executor:
     def channel(self) -> str:
         return "steam_manager" if self._sm is not None else "pyautogui_fallback"
 
-    def _pg(self):  # noqa: N802 - 懒加载
-        if self._pg is None:
+    def _pg_instance(self):  # 懒加载 pyautogui（方法名≠属性名，避免实例属性遮蔽）
+        if self._pg_mod is None:
             import pyautogui
-            self._pg = pyautogui
-        return self._pg
+            self._pg_mod = pyautogui
+        return self._pg_mod
 
-    def _PIL(self):  # noqa: N802
-        if self._PIL is None:
+    def _pil_instance(self):  # 懒加载 PIL.Image
+        if self._pil_mod is None:
             from PIL import Image
-            self._PIL = Image
-        return self._PIL
+            self._pil_mod = Image
+        return self._pil_mod
 
     def capture(self, win: dict) -> np.ndarray:
-        """截取窗口区域 → RGB numpy（供模板匹配/验证）。主通道截 BMP 后读入，回退通道直接截屏。"""
+        """截取游戏窗口内容 → RGB numpy。
+
+        通道顺序（从可靠到兜底）：
+        1. PrintWindow 直接向窗口要内容（被遮挡/未前台也能拿到游戏画面——治本）；
+        2. steam_manager 屏幕区域截 BMP（YUI 现成通道）；
+        3. pyautogui 屏幕区域截图（最兜底）。
+        窗口级错误（无效句柄/尺寸异常）直接抛 OpsError 暴露，不做静默降级——
+        调用方拿到稳定错误码，避免误以为截到了游戏画面。"""
+        try:
+            return self._capture_printwindow(win)
+        except OpsError:
+            raise
+        except Exception:
+            pass
         if self._sm is not None:
             try:
                 path = self._sm.capture_window_bmp(
                     {"rect": (win["left"], win["top"], win["right"], win["bottom"])})
                 if path:
-                    img = self._PIL().open(path)
+                    img = self._pil_instance().open(path)
                     return np.asarray(img.convert("RGB"), dtype=np.uint8)
             except Exception:
                 pass
-        img = self._pg().screenshot(region=(win["left"], win["top"],
-                                            win["right"] - win["left"], win["bottom"] - win["top"]))
+        img = self._pg_instance().screenshot(region=(win["left"], win["top"],
+                                                     win["right"] - win["left"], win["bottom"] - win["top"]))
         return np.asarray(img.convert("RGB"), dtype=np.uint8)
+
+    def _capture_printwindow(self, win: dict) -> np.ndarray:
+        """PrintWindow 抓取窗口内容（不依赖前台/遮挡状态）。
+
+        游戏窗口被其他窗口完全覆盖时，屏幕区域截图会抓到遮挡层；
+        PrintWindow 直接向目标窗口请求绘制，拿到的永远是游戏画面。
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        hwnd = win.get("hwnd")
+        if not hwnd:
+            raise OpsError("BAD_HWND", "无效窗口句柄")
+        w = win["right"] - win["left"]
+        h = win["bottom"] - win["top"]
+        if w < 2 or h < 2:
+            raise OpsError("BAD_WINDOW_SIZE", f"窗口尺寸异常 {w}x{h}")
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        hwnd_dc = user32.GetWindowDC(hwnd)
+        if not hwnd_dc:
+            raise OpsError("PRINTWINDOW_NODC", "GetWindowDC 失败")
+        try:
+            mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
+            if not mem_dc:
+                raise OpsError("PRINTWINDOW_NODC", "CreateCompatibleDC 失败")
+            try:
+                bmp = gdi32.CreateCompatibleBitmap(hwnd_dc, w, h)
+                if not bmp:
+                    raise OpsError("PRINTWINDOW_NODC", "CreateCompatibleBitmap 失败")
+                try:
+                    gdi32.SelectObject(mem_dc, bmp)
+                    PW_RENDERFULLCONTENT = 2
+                    if not user32.PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT):
+                        raise OpsError("PRINTWINDOW_FAIL", "PrintWindow 返回失败")
+                    # 读 DIB 像素
+                    bmi = wintypes.BITMAPINFOHEADER()
+                    bmi.biSize = ctypes.sizeof(wintypes.BITMAPINFOHEADER)
+                    bmi.biWidth = w
+                    bmi.biHeight = -h  # 顶到底顺序
+                    bmi.biPlanes = 1
+                    bmi.biBitCount = 32
+                    bmi.biCompression = 0  # BI_RGB
+                    buf = ctypes.create_string_buffer(w * h * 4)
+                    if not gdi32.GetDIBits(mem_dc, bmp, 0, h, buf, ctypes.byref(bmi), 0):
+                        raise OpsError("PRINTWINDOW_FAIL", "GetDIBits 失败")
+                    arr = np.frombuffer(buf.raw, dtype=np.uint8).reshape(h, w, 4)
+                    return np.ascontiguousarray(arr[:, :, [2, 1, 0]], dtype=np.uint8)  # BGRA→RGB
+                finally:
+                    gdi32.DeleteObject(bmp)
+            finally:
+                gdi32.DeleteDC(mem_dc)
+        finally:
+            user32.ReleaseDC(hwnd, hwnd_dc)
 
     def click_abs(self, screen_x: int, screen_y: int):
         if self._sm is not None:
@@ -89,7 +157,7 @@ class _Executor:
                 return
             except Exception:
                 pass
-        self._pg().click(screen_x, screen_y)
+        self._pg_instance().click(screen_x, screen_y)
 
     def press(self, key: str):
         """按键。steam_manager 通道用虚拟键码；回退通道用 pyautogui 键名。"""
@@ -101,7 +169,7 @@ class _Executor:
                     return
             except Exception:
                 pass
-        self._pg().press(key)
+        self._pg_instance().press(key)
 
 
 # 常用键 → 虚拟键码（steam_manager.press_key 需要）
@@ -121,6 +189,27 @@ _EXEC = _Executor()
 # ── 窗口层 ──
 
 _WIN_TITLES = ("Civilization VI", "Sid Meier's Civilization VI", "CivilizationVI")
+
+
+def _find_window_probe() -> bool:
+    """只读探测：文明6 窗口当前是否存在（测试/状态检查用，不抛错、不操作）。"""
+    try:
+        import win32gui
+    except Exception:
+        return False
+    found = []
+
+    def _enum(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        title = win32gui.GetWindowText(hwnd)
+        for t in _WIN_TITLES:
+            if t.casefold() in title.casefold():
+                found.append(hwnd)
+                return
+
+    win32gui.EnumWindows(_enum, None)
+    return bool(found)
 
 
 def _find_window():
@@ -148,19 +237,45 @@ def _find_window():
 
 
 def _front_and_size(win: dict) -> dict:
-    """把游戏窗口前置（不最小化），并返回窗口内工作区尺寸。"""
+    """把游戏窗口前置（不最小化），并返回窗口内工作区尺寸。
+
+    Windows 前台锁：后台进程直接 SetForegroundWindow 经常失败；
+    先 AttachThreadInput 挂到前台线程再 SetForegroundWindow + BringWindowToTop，
+    成功率大幅提高。最终用 GetForegroundWindow 校验。
+    """
+    import win32api
+    import win32con
     import win32gui
+    import win32process
+    hwnd = win["hwnd"]
     try:
-        win32gui.ShowWindow(win["hwnd"], 9)  # SW_RESTORE
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
     except Exception:
         pass
+    time.sleep(0.1)
+    fg = win32gui.GetForegroundWindow()
+    fg_thread = win32process.GetWindowThreadProcessId(fg)[0]
+    my_thread = win32api.GetCurrentThreadId()
+    attached = False
+    if fg_thread != my_thread:
+        attached = win32process.AttachThreadInput(fg_thread, my_thread, True)
     try:
-        win32gui.SetForegroundWindow(win["hwnd"])
-    except Exception:
-        pass
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        try:
+            win32gui.BringWindowToTop(hwnd)
+        except Exception:
+            pass
+    finally:
+        if attached:
+            win32process.AttachThreadInput(fg_thread, my_thread, False)
     time.sleep(0.35)
-    left, top, right, bottom = win32gui.GetWindowRect(win["hwnd"])
-    return {**win, "left": left, "top": top, "right": right, "bottom": bottom}
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    fg_now = win32gui.GetForegroundWindow()
+    return {**win, "left": left, "top": top, "right": right, "bottom": bottom,
+            "fronted": fg_now == hwnd}
 
 
 def _shot(win: dict):
