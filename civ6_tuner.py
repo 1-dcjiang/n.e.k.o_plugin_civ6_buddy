@@ -1091,6 +1091,111 @@ print("PICK=" .. pick)
     return {"ok": False, "error": "NO_RESPONSE", "detail": "自动选研究无回执（Tuner 输出丢失），请重试"}
 
 
+async def auto_fill_policy_slots(timeout: float = 12.0) -> dict:
+    """自动填满空政策槽位（InGame，官方 UNLOCK_POLICIES + RequestPolicyChanges 三步）。
+
+    用于 ENDTURN_BLOCKING_FILL_CIVIC_SLOT（"填补政策槽位"）：市政完成/政府变更后
+    出现空槽会挡住结束回合。策略：每个空槽按类型匹配第一个可用政策卡
+    （军事槽放军事卡、经济槽放经济卡，野外卡可进任意槽）。
+    返回 {"ok", "filled", "slots"}（filled=[{slot, slot_type, policy_type}]）。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local pCulture = Players[me]:GetCulture()
+local numSlots = pCulture:GetNumPolicySlots()
+local slotTypeNames = {[0]="SLOT_ECONOMIC", [1]="SLOT_MILITARY", [2]="SLOT_DIPLOMATIC", [3]="SLOT_WILDCARD", [4]="SLOT_WILDCARD"}
+local slotTypeMap = {SLOT_ECONOMIC=0, SLOT_MILITARY=1, SLOT_DIPLOMATIC=2, SLOT_WILDCARD=3}
+-- 收集空槽：槽类型 -> 槽位列表
+local emptyByType = {}
+local filled = 0
+local details = {}
+-- 预收集可用政策（UNLOCK 前 CanSlotPolicy 可靠）
+local usable = {}
+for policy in GameInfo.Policies() do
+  if pCulture:IsPolicyUnlocked(policy.Index) then
+    for s = 0, numSlots - 1 do
+      local ok = false
+      pcall(function() ok = pCulture:CanSlotPolicy(policy.Index, s) end)
+      if ok then
+        local st = pCulture:GetSlotType(s)
+        local pst = policy.GovernmentSlotType or "SLOT_WILDCARD"
+        if st < 3 or pst == "SLOT_WILDCARD" or pst == slotTypeNames[st] then
+          usable[#usable+1] = {policy=policy, slot=s}
+          break
+        end
+      end
+    end
+  end
+end
+-- 计算空槽
+for s = 0, numSlots - 1 do
+  if pCulture:GetSlotPolicy(s) < 0 then
+    local st = pCulture:GetSlotType(s)
+    if not emptyByType[st] then emptyByType[st] = {} end
+    emptyByType[st][#emptyByType[st]+1] = s
+  end
+end
+UI.RequestPlayerOperation(me, PlayerOperations.UNLOCK_POLICIES, {})
+local clearList = {}
+local addList = {}
+-- 逐槽匹配：优先同类型槽的直接可用政策（按 GameInfo 顺序=先解锁先选），野外卡兜底
+local taken = {}
+for s = 0, numSlots - 1 do
+  if pCulture:GetSlotPolicy(s) < 0 then
+    local st = pCulture:GetSlotType(s)
+    local best = nil
+    for _, u in ipairs(usable) do
+      if u.slot == s and not taken[u.policy.Index] then best = u.policy; break end
+    end
+    if best == nil then
+      for _, u in ipairs(usable) do
+        local pst = u.policy.GovernmentSlotType or "SLOT_WILDCARD"
+        if (pst == "SLOT_WILDCARD" or slotTypeMap[pst] == st) and not taken[u.policy.Index] then
+          best = u.policy; break
+        end
+      end
+    end
+    if best then
+      taken[best.Index] = true
+      addList[s] = best.Hash
+      clearList[#clearList+1] = s
+      details[#details+1] = tostring(s) .. ":" .. best.PolicyType
+    end
+  end
+end
+if #addList > 0 then
+  pcall(function() pCulture:RequestPolicyChanges(clearList, addList) end)
+  filled = #details
+end
+print("FILLED=" .. tostring(filled) .. "&SLOTS=" .. table.concat(details, "|"))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or "&" not in line:
+            continue
+        kv = {p.split("=")[0]: p.split("=", 1)[1] for p in line.split("&") if "=" in p}
+        slots = kv.get("SLOTS", "")
+        filled = _to_int(kv.get("FILLED", "0"))
+        return {"ok": True, "app": app_id, "filled": filled,
+                "slots": slots.split("|") if slots else [],
+                "detail": f"已填 {filled} 个空政策槽（{slots}）" if filled else "无空槽或可用政策不足",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "填政策槽无回执（Tuner 输出丢失），请重试"}
+
+
 async def close_ui_popups(timeout: float = 10.0) -> dict:
     """关闭挡路的 UI 弹窗并清理全部通知（InGame）。
 

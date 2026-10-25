@@ -730,6 +730,11 @@ class Civ6BuddyPlugin(NekoPluginBase):
                         "ENDTURN_BLOCKING_SPY_CHOOSE_ESCAPE_ROUTE"):
                 r = await civ6_tuner.auto_resolve_soft_blockers(timeout=10.0)
                 logs.append(f"自动软 blocker：{r.get('detail', r.get('error', ''))}")
+            elif bt == "ENDTURN_BLOCKING_FILL_CIVIC_SLOT":
+                fp = await civ6_tuner.auto_fill_policy_slots(timeout=12.0)
+                logs.append(f"填补政策槽：{fp.get('detail', fp.get('error', ''))}")
+                if not fp.get("ok"):
+                    hard.append((bt, fp.get("detail", "")))
             elif bt == "ENDTURN_BLOCKING_UNITS":
                 u = await civ6_tuner.units_blocker_status(timeout=8.0)
                 if not u.get("ok"):
