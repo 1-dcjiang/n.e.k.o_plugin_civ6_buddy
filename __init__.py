@@ -421,6 +421,9 @@ class Civ6BuddyPlugin(NekoPluginBase):
             "点下一回合）。何时用：用户说'接管运营/你替我玩/你来全盘操作/运营交给你'。"
             "【硬流程·必须执行】接管成功后，立即（同一次任务内）调用 civ6_ops_tick 且 "
             "loop_turns=20~50 自动连续运营，直到交还/战争/卡住为止；"
+            "【严禁调用 steam_manager】运营托管期间禁止调用 steam_manager 任何工具"
+            "（含 status/list/capture/run 等一切入口）——游戏局面由 civ6_buddy 提供，"
+            "Steam 管理器无需介入；确需 Steam 操作必须先 civ6_ops_handoff 交还。"
             "严禁只接管不运营，严禁回复'你说继续我就点下一回合'后停手等待——用户说'全盘操作'"
             "就是授权你连续运营，不需要每回合都等'继续'。"
             "运营执行会自动定位并前置游戏窗口（PrintWindow 拿游戏画面），不需要玩家手动切到游戏窗口。"
@@ -443,11 +446,15 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 f"已接管运营（第 {turn} 回合）。分工规则：运营归我（处理弹窗、选科技、点下一回合），"
                 "打仗归你。立即开始连续运营：调用 civ6_ops_tick 带 loop_turns=20 自动推进，"
                 "每回合用真实状态汇报在干什么；战争状态或你说'我来打'就立即交还控制权。"
+                "严禁调用 steam_manager（运营期间它已让位，调用只会产生无意义回执打断运营）——"
+                "游戏局面由 civ6_buddy 的 situation/tuner/tick 提供。"
             ),
             "is_error": False, "active": True, "turn": turn,
             "next_action": (
                 "civ6_ops_tick(loop_turns=20)：立即自动连续运营 20 回合，不要等待用户再次喊'继续'；"
                 "每回合用 turn_summaries 汇报当前研究/城市/人口状态。"
+                "严禁调用 steam_manager 任何工具（其回执会打断运营节奏）；"
+                "如确需 Steam 操作，先 civ6_ops_handoff 交还后再调用。"
             ),
         }
 
