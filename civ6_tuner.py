@@ -2790,6 +2790,27 @@ for pass = 1, 3 do
     end)
   end
 end
+-- ESC 主菜单（InGameTopOptionsMenu）：官方关闭事件 + 弹出队列移除（实测铁证：
+-- 菜单弹出时游戏暂停、blockers 正常但 ACTION_ENDTURN 不推进 → 任务被误判卡死中止）
+pcall(function()
+  local c = ContextPtr:LookUpControl("/InGame/InGameTopOptionsMenu")
+  if c and not c:IsHidden() then
+    LuaEvents.InGameTopOptionsMenu_Close()
+    UIManager:DequeuePopup(c)
+    c:SetHide(true)
+    closed = closed + 1
+  end
+end)
+-- 子菜单（选项/读档/存档 LuaContext）兜底关闭
+for _, p in ipairs({"/InGame/Options", "/InGame/LoadGameMenu", "/InGame/SaveGameMenu",
+                    "/InGame/InGameTopOptionsMenu/Options",
+                    "/InGame/InGameTopOptionsMenu/LoadGameMenu",
+                    "/InGame/InGameTopOptionsMenu/SaveGameMenu"}) do
+  pcall(function()
+    local c = ContextPtr:LookUpControl(p)
+    if c and not c:IsHidden() then c:SetHide(true); closed = closed + 1 end
+  end)
+end
 -- 自然奇观发现全屏弹窗（NaturalWonderPopup，侦察探路触发——实测挡住 ACTION_ENDTURN 回合不推进）
 pcall(function() LuaEvents.NaturalWonderPopup_Shown() end)
 pcall(function() LuaEvents.NaturalWonderPopup_Closed() end)
@@ -2870,6 +2891,28 @@ if c then print("NW2=" .. tostring(not c:IsHidden())) else print("NW2=false") en
                     extra = extra + f"（复查失败：{e}）"
             except Exception as e:
                 extra = f"（右键关闭奇观弹窗失败：{e}）"
+        # ESC 主菜单兜底：Lua 关闭可能不完整（UI 层 modal），复查菜单仍可见则激活窗口按 ESC
+        try:
+            menu_check = """
+local c = ContextPtr:LookUpControl("/InGame/InGameTopOptionsMenu")
+if c then print("MENU2=" .. tostring(not c:IsHidden())) else print("MENU2=false") end
+"""
+            _app2, _st2, r3, w3 = await _handshake_retry()
+            o3 = await execute_lua(r3, w3, menu_check, state_index=INGAME_STATE, timeout=8.0)
+            try:
+                w3.close()
+            except Exception:
+                pass
+            menu_visible = False
+            for l3 in o3:
+                l3 = l3.strip()
+                if l3.startswith("MENU2="):
+                    menu_visible = l3[len("MENU2="):].strip() == "true"
+                    break
+            if menu_visible:
+                extra = extra + "（ESC 菜单仍可见，按 ESC 键关闭）" + _esc_game_window()
+        except Exception as e:
+            extra = extra + f"（菜单复查失败：{e}）"
         return {"ok": True, "app": app_id, "closed": closed, "dismissed": dismissed,
                 "nw_closed": not nw or ("（右键后已关闭）" in extra),
                 "detail": f"已关闭 {closed} 个弹窗控件、清理 {dismissed} 条通知{extra}",
@@ -2934,6 +2977,44 @@ def _right_click_game_window() -> str:
         return "（已激活游戏窗口并右键中央）"
     except Exception as e:
         return f"（右键失败：{e}）"
+
+
+def _esc_game_window() -> str:
+    """在游戏窗口激活后按 ESC（关闭 ESC 主菜单/弹窗的原生路径）。返回结果描述。
+
+    与 _right_click_game_window 同安全铁律：必须先激活游戏窗口再按键，
+    防止键盘操作落到无关前台窗口。"""
+    import time as _time
+
+    hwnd = None
+    try:
+        import win32gui as _wg
+
+        def _cb(h, _):
+            nonlocal hwnd
+            if hwnd is None and _wg.IsWindowVisible(h) and _wg.GetWindowText(h):
+                tl = _wg.GetWindowText(h).lower()
+                if "civilization" in tl or "sid meier" in tl or "文明" in tl:
+                    hwnd = h
+        _wg.EnumWindows(_cb, None)
+    except Exception:
+        pass
+    try:
+        if hwnd is not None:
+            try:
+                import win32con as _wc2
+                import win32gui as _wg2
+                _wg2.ShowWindow(hwnd, _wc2.SW_RESTORE)
+                _wg2.SetForegroundWindow(hwnd)
+                _time.sleep(0.6)
+            except Exception:
+                pass
+        import pyautogui as _pg
+        _pg.press("esc")
+        _time.sleep(1.0)
+        return "（已按 ESC 键）"
+    except Exception as e:
+        return f"（按 ESC 失败：{e}）"
 
 
 async def auto_resolve_soft_blockers(timeout: float = 10.0) -> dict:

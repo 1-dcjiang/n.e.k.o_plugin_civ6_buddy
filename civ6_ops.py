@@ -528,6 +528,24 @@ def _detect_popup_blocking(screen: np.ndarray) -> bool:
     return light_frac > 0.45
 
 
+def _detect_pause_menu(screen: np.ndarray) -> bool:
+    """ESC 暂停菜单检测（InGameTopOptionsMenu）。
+
+    实测铁证（v0.6.1）：文明6 里按 ESC = 打开暂停菜单（深色遮罩+面板），
+    而 _detect_popup_blocking 只认浅色弹窗、认不出深色菜单——若在无弹窗时按 ESC
+    会误开菜单，菜单挡住 ActionPanel 后回合不推进、任务被误判卡死中止。
+    特征：菜单中央区域（40%-60% x、25%-70% y）为深色面板+遮罩，灰度<70 占比>0.6
+    （战争迷雾为灰蓝色 90-140，不会误报）。"""
+    if np is None or screen.size == 0:
+        return False
+    h, w = screen.shape[:2]
+    cx0, cy0, cx1, cy1 = int(w * 0.40), int(h * 0.25), int(w * 0.60), int(h * 0.70)
+    region = screen[cy0:cy1, cx0:cx1]
+    gray = region.mean(axis=2)
+    dark_frac = float((gray < 70).mean())
+    return dark_frac > 0.6
+
+
 def _research_panel_open(screen: np.ndarray) -> bool:
     """左侧'选择研究'科技面板检测：文明6 科技侧栏是暗色面板，
     屏幕左侧 x<12%、y 15%-60% 区域暗色（灰度<100）占比 >0.6 → 需要选科技。"""
@@ -590,18 +608,22 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
         log.append("检测到'选择研究'面板，已自动选择第一个科技（采矿业）")
         screen = _shot(win)
 
-    # 3.5) ESC 预清扫：选科技之后关掉任何残留面板（城市面板/科技树/外交/提示）。
-    # 注意顺序：ESC 会吞掉"选择研究"面板，必须先选科技再做预清扫，否则科技永远不选。
-    _press("esc", 0.35)
-    screen = _shot(win)
+    # 3.5) 残留面板清扫：只关闭"已确认存在"的面板，绝不无条件按 ESC。
+    # 实测铁证（v0.6.1）：文明6 按 ESC = 打开暂停菜单，无条件 ESC 会把正常游戏
+    # 误开菜单 → 菜单深色遮罩不被 _detect_popup_blocking 识别 → 菜单残留挡回合 → 任务卡死中止。
+    # 仅当检测到暂停菜单（用户手滑/外部 ESC）时才按 ESC 关闭它；浅色弹窗留给第 4 步循环。
+    if _detect_pause_menu(screen):
+        _press("esc", 0.35)
+        screen = _shot(win)
+        log.append("检测到 ESC 暂停菜单，已按 ESC 关闭")
 
-    # 4) 弹窗清扫（最多 3 次 ESC；仍挡→兜底点下一回合按钮→再验证）
+    # 4) 弹窗清扫（最多 3 次；浅色弹窗或深色暂停菜单 → ESC；仍挡→兜底点下一回合按钮→再验证）
     for i in range(3):
-        if not _detect_popup_blocking(screen):
+        if not _detect_popup_blocking(screen) and not _detect_pause_menu(screen):
             break
         _press("esc", 0.45)
         screen = _shot(win)
-        log.append(f"检测到弹窗，已按 ESC 关闭（第 {i + 1} 次）")
+        log.append(f"检测到弹窗/暂停菜单，已按 ESC 关闭（第 {i + 1} 次）")
     else:
         # 3 次 ESC 未清：研究/市政完成弹窗的确认按钮常与"下一回合"同位置，
         # 直接点它关弹窗并推进；仍挡才判定无法自理。
