@@ -332,10 +332,30 @@ class Civ6BuddyPlugin(NekoPluginBase):
     # ══════════ 进阶版：屏幕自动化运营（推荐制） ══════════
 
     @llm_tool(
+        name="civ6_ops_peek",
+        description=(
+            "确认文明6 游戏窗口与画面（只读：不点击、不切窗口、不抢焦点）。"
+            "用 PrintWindow 直接抓取游戏画面（即使被其他窗口遮挡也能拿到游戏本体）并返回截图。"
+            "何时用：用户说'你看看游戏/确认下窗口/截个图看看游戏'。"
+            "重要：确认游戏窗口不要用系统截屏——那会截到最上层的聊天/终端窗口；本工具才能拿到真正的游戏画面。"
+            "运营执行（点下一回合等）请用 civ6_ops_takeover / civ6_ops_tick，它们会自动定位并前置游戏窗口。"
+        ),
+        parameters={"type": "object", "properties": {}, "required": []},
+        timeout=30.0,
+    )
+    async def civ6_ops_peek(self, **_):
+        try:
+            r = civ6_ops.peek_window()
+        except Exception as exc:
+            return _wrap_err(exc)
+        return r
+
+    @llm_tool(
         name="civ6_ops_takeover",
         description=(
             "进入'运营托管'：玩家只负责打仗，YUI 接管本回合运营（推荐制：处理弹窗、点下一回合）。"
             "何时用：用户说'接管运营/你替我点下一回合/运营交给你'。"
+            "运营执行会自动定位并前置游戏窗口（PrintWindow 拿游戏画面），不需要玩家手动切到游戏窗口。"
             "参数无。只读+点击游戏内按钮，不改存档。之后每回合用 civ6_ops_tick 执行，"
             "用户/战争打断用 civ6_ops_handoff 交还。"
         ),

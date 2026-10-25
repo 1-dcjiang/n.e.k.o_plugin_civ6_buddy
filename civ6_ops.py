@@ -185,6 +185,38 @@ _VK_MAP = {
 
 _EXEC = _Executor()
 
+import os as _os
+_FRAME_DIR = str(Path(_os.environ.get("TEMP", ".")) / "civ6_buddy" / "frames")
+
+
+def peek_window() -> dict:
+    """确认游戏窗口：PrintWindow 直抓游戏画面（只读，不点击、不切窗口、不抢焦点）。
+
+    与系统截屏的区别：系统截屏抓屏幕最上层窗口（聊天/终端遮挡游戏时就截到遮挡层）；
+    PrintWindow 直接向目标窗口请求绘制，被遮挡也能拿到游戏本体。
+    返回截图路径（供上层/YUI 查看）。"""
+    if not _find_window_probe():
+        return {"ok": False, "error": "GAME_NOT_RUNNING",
+                "detail": "未找到文明6 窗口：游戏未运行或未进入一局游戏（不要停在主菜单）。"}
+    try:
+        win = _find_window()
+        arr = _EXEC.capture(win)
+    except OpsError as exc:
+        return {"ok": False, "error": exc.code, "detail": str(exc)}
+    h, w = arr.shape[:2]
+    std = float(arr.std())
+    Path(_FRAME_DIR).mkdir(parents=True, exist_ok=True)
+    path = str(Path(_FRAME_DIR) / f"peek_{int(time.time() * 1000)}.png")
+    from PIL import Image
+    Image.fromarray(arr).save(path)
+    if std < 6:
+        return {"ok": True, "screenshot": path, "size": f"{w}x{h}", "suspicious": True,
+                "detail": "截图内容接近纯色：游戏窗口可能被最小化。运营执行（civ6_ops_takeover/civ6_ops_tick）"
+                          "会自动恢复窗口并前置，不需要你手动操作；确认窗口请以这张图为准。"}
+    return {"ok": True, "screenshot": path, "size": f"{w}x{h}",
+            "detail": "已用 PrintWindow 直接抓取游戏画面（即使被其他窗口遮挡也能拿到游戏本体）。"
+                      "后续运营执行会自动定位并前置游戏窗口，无需手动切换。"}
+
 
 # ── 窗口层 ──
 

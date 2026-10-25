@@ -106,6 +106,15 @@ def test_citizen_assignment_all_tiles():
     assert set(r["assign"]) == {1, 2}  # 人口大于地块数，全分配
 
 
+def test_peek_window_no_game_stable_code():
+    """无游戏窗口时 peek_window 返回稳定错误码（不崩溃）。游戏在运行则跳过。"""
+    if _civ6_ops_mod._find_window_probe():
+        pytest.skip("文明6 正在运行：无游戏用例无法成立")
+    r = _civ6_ops_mod.peek_window()
+    assert r["ok"] is False
+    assert r["error"] == "GAME_NOT_RUNNING"
+
+
 def test_run_one_turn_ops_no_game_raises():
     """无游戏窗口时必须抛 GAME_NOT_RUNNING（异常路径，不依赖 GUI）。
 
