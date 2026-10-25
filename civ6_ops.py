@@ -102,7 +102,6 @@ class _Executor:
         PrintWindow 直接向目标窗口请求绘制，拿到的永远是游戏画面。
         """
         import ctypes
-        from ctypes import wintypes
 
         try:
             from ._win32 import BITMAPINFOHEADER

@@ -7,8 +7,8 @@
 """
 import pytest
 
-from civ6_ops import _Executor, _front_and_size, OpsError
 from _win32 import BITMAPINFOHEADER, mouse_click_abs, press_key, screen_region_rgb
+from civ6_ops import OpsError, _Executor
 
 
 def test_executor_lazy_load_returns_modules():

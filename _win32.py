@@ -133,7 +133,7 @@ _user32.ReleaseDC.restype = ctypes.c_int
 SRCCOPY = 0x00CC0020
 
 
-def screen_region_rgb(left: int, top: int, right: int, bottom: int) -> "np.ndarray":
+def screen_region_rgb(left: int, top: int, right: int, bottom: int):
     """截取屏幕区域 → RGB numpy（纯 ctypes BitBlt，无 PIL/pyautogui 依赖）。"""
     import numpy as np
 

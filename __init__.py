@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from pathlib import Path
 
 from plugin.sdk.plugin import NekoPluginBase, lifecycle, llm_tool, neko_plugin, plugin_entry
@@ -17,6 +19,50 @@ from plugin.sdk.plugin import NekoPluginBase, lifecycle, llm_tool, neko_plugin, 
 from . import civ6_advice, civ6_data, civ6_ops, civ6_parser, civ6_sdk, civ6_tuner
 
 _logger = logging.getLogger("N.E.K.O.Plugin_civ6_buddy.civ6_buddy")
+
+
+# ── 运营锁（跨插件优先级） ──
+# 运营托管期间写锁文件 `%LOCALAPPDATA%\N.E.K.O\config\civ6_ops_active`（带时间戳），
+# steam_manager 等插件见新鲜锁（<5 分钟）即让位，避免抢占 Neko 运营注意力。
+# 锁带时间戳：civ6_buddy 每回合刷新；崩溃/被杀导致残留锁在 5 分钟后自动失效，不误伤。
+def _ops_lock_path() -> str:
+    return os.path.join(
+        os.environ.get("LOCALAPPDATA", ""), "N.E.K.O", "config", "civ6_ops_active"
+    )
+_OPS_LOCK_TTL = 300.0
+
+
+def _ops_lock_set() -> None:
+    """写/刷新运营锁（内容=写入时间戳）。"""
+    p = _ops_lock_path()
+    if not p:
+        return
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
+
+
+def _ops_lock_clear() -> None:
+    p = _ops_lock_path()
+    if p:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def ops_lock_active(ttl: float = _OPS_LOCK_TTL) -> bool:
+    """锁存在且新鲜（mtime 距今 < ttl）→ 运营托管中。供其他插件（steam_manager）查询。"""
+    p = _ops_lock_path()
+    if not p or not os.path.isfile(p):
+        return False
+    try:
+        return (time.time() - os.path.getmtime(p)) < ttl
+    except OSError:
+        return False
 
 _ERR_HINTS: dict[str, str] = {
     "SAVES_DIR_NOT_FOUND": "存档目录不存在：请先打开文明6新建一局并自动存档，或在本插件 config 中配置 saves_dir",
@@ -386,6 +432,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
     async def civ6_ops_takeover(self, **_):
         self._load_config()
         self._ops_active = True
+        _ops_lock_set()  # 运营锁：steam_manager 等插件见锁让位
         try:
             sit = civ6_parser.parse_save("", self._saves_dir)
         except civ6_parser.Civ6Error as exc:
@@ -509,6 +556,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 )
             except civ6_ops.OpsError as exc:
                 self._ops_active = False
+                _ops_lock_clear()
                 out = _wrap_err(exc)
                 out["handoff"] = True
                 out["turns_done"] = turns_done
@@ -516,6 +564,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
             logs += result.get("log", [])
             if result.get("handoff"):
                 self._ops_active = False
+                _ops_lock_clear()
                 return {
                     "output": f"已执行 {turns_done} 回合后停止：{result.get('output', '运营停止')}",
                     "is_error": not result.get("ok", False),
@@ -531,6 +580,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 no_advance += 1
                 if no_advance >= 2:
                     self._ops_active = False
+                    _ops_lock_clear()
                     return {
                         "output": (
                             f"已执行 {turns_done} 回合后停止：连续 2 次点击后回合数未推进"
@@ -546,6 +596,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 no_advance = 0
                 turns_done += 1
                 t0 = t1
+                _ops_lock_set()  # 刷新运营锁保鲜（防 5 分钟 TTL 失效）
                 # 语义摘要：让托管方知道每个回合'在干什么'（研究/城市/人口真实状态）
                 try:
                     sem = await _semantic_line(t0)
@@ -559,6 +610,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 wr2 = await civ6_tuner.at_war()
                 if wr2.get("ok") and wr2.get("at_war", 0) > 0:
                     self._ops_active = False
+                    _ops_lock_clear()
                     return {
                         "output": f"已执行 {turns_done} 回合，Tuner 检测到战争状态，控制权交还给你。",
                         "is_error": False, "handoff": True,
@@ -573,6 +625,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
 
                 await _asyncio.sleep(0.5)
         self._ops_active = False
+        _ops_lock_clear()
         return {
             "output": f"连续运营完成：共执行 {turns_done}/{loop_turns} 回合（回合推进至 {t0}）。"
                       + ("" if turns_done == loop_turns else "部分回合未推进已提前停止。"),
@@ -763,6 +816,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
     )
     async def civ6_ops_handoff(self, **_):
         self._ops_active = False
+        _ops_lock_clear()
         return {"output": "运营托管已结束，控制权交还给你。需要再托管时说'接管运营'。",
                 "is_error": False, "active": False}
 
