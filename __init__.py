@@ -458,6 +458,19 @@ class Civ6BuddyPlugin(NekoPluginBase):
                          f"{eco.get('builders', 0)}建造者")
             if eco.get("pantheon", -1) < 0 and faith >= 25:
                 lines.append("💡 信仰已达 25：万神殿可选（YUI 会在回合管理中自动局面感知选择）")
+        dip = await civ6_tuner.read_diplomacy(timeout=8.0)
+        if dip.get("ok"):
+            rel = "、".join(f"{c['name']}({c['state']})" for c in dip.get("civs", [])) or "无"
+            lines.append(f"外交：使节 {dip.get('tokens', 0)}｜关系 {rel}")
+            cs_list = dip.get("city_states", [])
+            if cs_list:
+                cs_txt = "、".join(
+                    f"{c['name']}(使节{c.get('envoys', 0)},距{c.get('dist', '?')})" for c in cs_list[:3])
+                lines.append(f"城邦：{cs_txt}")
+        cul = await civ6_tuner.read_culture(timeout=8.0)
+        if cul.get("ok"):
+            lines.append(f"文化：产出 {cul.get('culture_yield', '?')}/回合｜旅游业绩 {cul.get('tourism', '?')}｜"
+                         f"巨作 {cul.get('great_works', 0)} 件｜市政 {cul.get('civic', '?')}")
         return {
             "output": "\n".join(lines),
             "is_error": False,
@@ -752,6 +765,11 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 logs.append(f"万神殿：{pp.get('detail', pp.get('error', ''))}")
                 if not pp.get("ok"):
                     hard.append((bt, pp.get("detail", "")))
+            elif bt == "ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN":
+                ev = await civ6_tuner.auto_send_envoy(timeout=12.0)
+                logs.append(f"使节：{ev.get('detail', ev.get('error', ''))}")
+                if not ev.get("ok"):
+                    hard.append((bt, ev.get("detail", "")))
             elif bt == "ENDTURN_BLOCKING_UNITS":
                 u = await civ6_tuner.units_blocker_status(timeout=8.0)
                 if not u.get("ok"):

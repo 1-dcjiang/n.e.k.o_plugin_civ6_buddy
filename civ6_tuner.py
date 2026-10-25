@@ -1358,6 +1358,242 @@ print("RESULT|" .. pick .. "|" .. reason)
     return {"ok": False, "error": "NO_RESPONSE", "detail": "选万神殿无回执（Tuner 输出丢失），请重试"}
 
 
+async def read_diplomacy(timeout: float = 10.0) -> dict:
+    """读外交局面（InGame）：与每个文明的关系状态 + 城邦（名字/距离/能否派使节/使节数）+ 可用使节。
+
+    供 civ6_ops_status 外交面板与 GIVE_INFLUENCE_TOKEN 自动决策。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local rows = {}
+-- 我方使节资源
+local tokens = 0
+pcall(function() tokens = Players[me]:GetInfluence():GetTokensToGive() end)
+-- 我方首都（算距离用）
+local capX, capY = -1, -1
+pcall(function()
+  local cap = Players[me]:GetCities():GetCapitalCity()
+  if cap then capX, capY = cap:GetX(), cap:GetY() end
+end)
+-- 我方对各文明的关系状态（对方AI视角）
+local rels = {}
+for i = 0, 63 do
+  if Players[i] and i ~= me and Players[i]:IsAlive() then
+    local cfg = PlayerConfigurations[i]
+    local civName = cfg and Locale.Lookup(cfg:GetCivilizationShortDescription()) or "?"
+    local stateIdx = -1
+    pcall(function() stateIdx = Players[i]:GetDiplomaticAI():GetDiplomaticStateIndex(me) end)
+    local stName = "?"
+    pcall(function()
+      local st = GameInfo.DiplomaticStates[stateIdx]
+      if st then stName = st.StateType or tostring(stateIdx) end
+    end)
+    local isMajor, isBarb = true, false
+    pcall(function() isMajor = Players[i]:IsMajor() end)
+    pcall(function() isBarb = Players[i]:IsBarbarian() end)
+    if not isMajor and not isBarb then
+      local csx, csy = -1, -1
+      pcall(function()
+        for _, c in Players[i]:GetCities():Members() do csx, csy = c:GetX(), c:GetY(); break end
+      end)
+      local dist = -1
+      pcall(function() dist = Map.GetPlotsDistance(capX, capY, csx, csy) end)
+      local canGive = false
+      pcall(function() canGive = Players[me]:GetInfluence():CanGiveTokensToPlayer(i) end)
+      local envoys = 0
+      pcall(function() envoys = Players[me]:GetInfluence():GetEnvoys(i) end)
+      rows[#rows+1] = "CS|" .. civName .. "|dist=" .. tostring(dist) ..
+                      "|envoys=" .. tostring(envoys) .. "|can=" .. tostring(canGive)
+    else
+      rows[#rows+1] = "CIV|" .. civName .. "|" .. stName
+    end
+  end
+end
+print("DIPLOMACY|tokens=" .. tostring(tokens) .. "&ROWS=" .. table.concat(rows, ";"))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("DIPLOMACY|"):
+            continue
+        payload = line[len("DIPLOMACY|"):]
+        kv = {p.split("=", 1)[0]: p.split("=", 1)[1] for p in payload.split("&") if "=" in p}
+        tokens = _to_int(kv.get("tokens", "0"))
+        civs, cs = [], []
+        for r in kv.get("ROWS", "").split(";"):
+            if not r:
+                continue
+            parts = r.split("|")
+            if parts[0] == "CIV":
+                civs.append({"name": parts[1], "state": parts[2] if len(parts) > 2 else "?"})
+            elif parts[0] == "CS":
+                d = {}
+                for f in parts[2:]:
+                    if "=" in f:
+                        k, v = f.split("=", 1)
+                        d[k] = v
+                cs.append({"name": parts[1], "dist": _to_int(d.get("dist", "-1")),
+                           "envoys": _to_int(d.get("envoys", "0")),
+                           "can_send": str(d.get("can", "false")).lower() == "true"})
+        return {"ok": True, "app": app_id, "tokens": tokens, "civs": civs, "city_states": cs,
+                "detail": f"外交：使节 {tokens}；文明关系 {len(civs)} 家；城邦 {len(cs)} 个", "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "读外交无回执（Tuner 输出丢失），请重试"}
+
+
+async def read_culture(timeout: float = 10.0) -> dict:
+    """读文化局面（InGame）：每回合文化产出、旅游业绩、巨作数、当前市政。
+
+    供 civ6_ops_status 文化面板——文化胜利要素可视化（读，不自动决策）。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local cultYield, tourism, gwCount = -1, -1, 0
+pcall(function() cultYield = Players[me]:GetCulture():GetCultureYield() end)
+pcall(function() tourism = Players[me]:GetStats():GetTourism() end)
+-- 巨作计数：遍历我方城市建筑槽
+pcall(function()
+  for _, c in Players[me]:GetCities():Members() do
+    local bldgs = c:GetBuildings()
+    for b in GameInfo.Buildings() do
+      local slots = -1
+      pcall(function() slots = bldgs:GetNumGreatWorkSlots(b.Index) end)
+      if slots > 0 then
+        for s = 0, slots - 1 do
+          local ok, gw = pcall(function() return bldgs:GetGreatWorkInSlot(b.Index, s) end)
+          if ok and gw >= 0 then gwCount = gwCount + 1 end
+        end
+      end
+    end
+  end
+end)
+local civic = -1
+pcall(function() civic = Players[me]:GetCulture():GetCurrentCivic() or -1 end)
+local civicName = "?"
+pcall(function()
+  local ci = GameInfo.Civics[civic]
+  if ci then civicName = ci.CivicType end
+end)
+print("CULTURE|yield=" .. tostring(cultYield) .. "|tourism=" .. tostring(tourism) ..
+      "|gw=" .. tostring(gwCount) .. "|civic=" .. tostring(civicName))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("CULTURE|"):
+            continue
+        parts = dict(p.split("=", 1) for p in line[len("CULTURE|"):].split("|") if "=" in p)
+        return {"ok": True, "app": app_id,
+                "culture_yield": round(_to_float(parts.get("yield", "-1")), 1),
+                "tourism": round(_to_float(parts.get("tourism", "-1")), 1),
+                "great_works": _to_int(parts.get("gw", "0")),
+                "civic": parts.get("civic", "?"),
+                "detail": f"文化：产出 {_to_float(parts.get('yield', '-1')):.1f}/回合｜旅游业绩 {parts.get('tourism', '?')}｜巨作 {parts.get('gw', '0')} 件｜市政 {parts.get('civic', '?')}",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "读文化无回执（Tuner 输出丢失），请重试"}
+
+
+async def auto_send_envoy(timeout: float = 12.0) -> dict:
+    """自动派遣使节（ENDTURN_BLOCKING_GIVE_INFLUENCE_TOKEN）——局面感知：派给离首都最近的城邦。
+
+    使节是早期外交硬资源：对每个"可派"城邦（CanGiveTokensToPlayer），按距离近者优先派发，
+    宗主国加成+视野收益明确，不伤害任何文明关系（城邦外交独立）。已满/无可派时明确返回。
+    """
+    lua = """
+local me = Game.GetLocalPlayer()
+local pInfluence = Players[me]:GetInfluence()
+if pInfluence:GetTokensToGive() <= 0 then print("RESULT|NO_TOKENS|没有可用使节"); return end
+local capX, capY = -1, -1
+pcall(function()
+  local cap = Players[me]:GetCities():GetCapitalCity()
+  if cap then capX, capY = cap:GetX(), cap:GetY() end
+end)
+-- 收集可派城邦（按距离升序）
+local cands = {}
+for i = 0, 63 do
+  if Players[i] and i ~= me and Players[i]:IsAlive() then
+    local cfg = PlayerConfigurations[i]
+    local isMajor, isBarb = true, false
+    pcall(function() isMajor = Players[i]:IsMajor() end)
+    pcall(function() isBarb = Players[i]:IsBarbarian() end)
+    if not isMajor and not isBarb then
+      local can = false
+      pcall(function() can = pInfluence:CanGiveTokensToPlayer(i) end)
+      if can then
+        local csx, csy = -1, -1
+        pcall(function()
+          for _, c in Players[i]:GetCities():Members() do csx, csy = c:GetX(), c:GetY(); break end
+        end)
+        local dist = -1
+        pcall(function() dist = Map.GetPlotsDistance(capX, capY, csx, csy) end)
+        local name = cfg and Locale.Lookup(cfg:GetPlayerName()) or "?"
+        cands[#cands+1] = {id=i, dist=dist, name=name}
+      end
+    end
+  end
+end
+table.sort(cands, function(a, b) return a.dist < b.dist end)
+if #cands == 0 then print("RESULT|NONE|没有可派的城邦（未发现或都不可派）"); return end
+local target = cands[1]
+local params = {}
+params[PlayerOperations.PARAM_PLAYER_ONE] = target.id
+params[PlayerOperations.PARAM_FLAGS] = 0
+UI.RequestPlayerOperation(me, PlayerOperations.GIVE_INFLUENCE_TOKEN, params)
+print("RESULT|" .. target.name .. "|dist=" .. tostring(target.dist))
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line or not line.startswith("RESULT|"):
+            continue
+        parts = line[len("RESULT|"):].split("|", 1)
+        tag = parts[0]
+        if tag == "NO_TOKENS":
+            return {"ok": False, "error": "NO_TOKENS", "detail": "没有可用使节（可能刚用完）"}
+        if tag == "NONE":
+            return {"ok": False, "error": "NO_CANDIDATE", "detail": "没有可派的城邦（未发现城邦或都不可派）"}
+        detail = parts[1] if len(parts) > 1 else ""
+        return {"ok": True, "app": app_id, "sent_to": tag, "reason": detail,
+                "detail": f"已向 {tag} 派遣使节（{detail}——离首都最近的城邦，宗主加成收益明确）",
+                "via": "tuner"}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "派使节无回执（Tuner 输出丢失），请重试"}
+
+
 async def auto_fill_policy_slots(timeout: float = 12.0) -> dict:
     """自动填满空政策槽位（InGame，官方 UNLOCK_POLICIES + RequestPolicyChanges 三步）——局面感知。
 
@@ -1400,6 +1636,8 @@ local function score(policy)
   if pt == "POLICY_AGRICULTURE" then return (pop < 5) and 78 or 50, "农业：+1粮食（人口少时增长快）" end
   if pt == "POLICY_DISCIPLINE" then return (warriors > 0) and 68 or 35, "纪律：+15近战战斗力" end
   if pt == "POLICY_OVERSEAS_APPOINTMENTS" then return 62, "海外任命：每城+1金币（多城时强）" end
+  if pt == "POLICY_CHARTERS" then return 84, "特许状：国际商路金币+2（外交槽核心，配合商队）" end
+  if pt == "POLICY_DIPLOMATIC_LEAGUE" then return 66, "外交联盟：外交支持+2/回合（议会筹码）" end
   return 30
 end
 -- 预收集可用政策（UNLOCK 前 CanSlotPolicy 可靠）
@@ -1488,7 +1726,8 @@ local paths = {"/InGame/AdvisorPopup/AdvisorBase", "/InGame/AdvisorPopup",
                "/InGame/TechCivicCompletedPopup", "/InGame/NewTurnPanel",
                "/InGame/EraCompletePopup", "/InGame/GreatPeoplePopup",
                "/InGame/ChooseArtifact", "/InGame/UnitPromotionPopup",
-               "/InGame/RazeCity", "/InGame/EspionagePopup", "/InGame/EventPopup"}
+               "/InGame/RazeCity", "/InGame/EspionagePopup", "/InGame/EventPopup",
+               "/InGame/BoostUnlockedPopup"}
 local closed = 0
 for pass = 1, 3 do
   for _, p in ipairs(paths) do
@@ -1498,6 +1737,15 @@ for pass = 1, 3 do
     end)
   end
 end
+-- 自然奇观发现全屏弹窗（NaturalWonderPopup，侦察探路触发——实测挡住 ACTION_ENDTURN 回合不推进）
+pcall(function() LuaEvents.NaturalWonderPopup_Shown() end)
+pcall(function() LuaEvents.NaturalWonderPopup_Closed() end)
+pcall(function() Events.HideLeaderScreen() end)
+local nwVisible = false
+pcall(function()
+  local c = ContextPtr:LookUpControl("/InGame/NaturalWonderPopup")
+  if c then nwVisible = not c:IsHidden() end
+end)
 local dismissed = 0
 pcall(function()
   local list = NotificationManager.GetList(me)
@@ -1512,7 +1760,7 @@ pcall(function()
     end
   end
 end)
-print("CLOSED=" .. tostring(closed) .. "&DISMISSED=" .. tostring(dismissed))
+print("CLOSED=" .. tostring(closed) .. "&DISMISSED=" .. tostring(dismissed) .. "&NW=" .. tostring(nwVisible))
 """
     try:
         app_id, states, reader, writer = await _handshake_retry()
@@ -1532,12 +1780,99 @@ print("CLOSED=" .. tostring(closed) .. "&DISMISSED=" .. tostring(dismissed))
         if not line or "&" not in line:
             continue
         kv = {p.split("=")[0]: p.split("=", 1)[1] for p in line.split("&") if "=" in p}
-        return {"ok": True, "app": app_id,
-                "closed": _to_int(kv.get("CLOSED", "0")),
-                "dismissed": _to_int(kv.get("DISMISSED", "0")),
-                "detail": f"已关闭 {kv.get('CLOSED', '0')} 个弹窗控件、清理 {kv.get('DISMISSED', '0')} 条通知",
+        closed = _to_int(kv.get("CLOSED", "0"))
+        dismissed = _to_int(kv.get("DISMISSED", "0"))
+        nw = str(kv.get("NW", "false")).lower() == "true"
+        extra = ""
+        # 自然奇观弹窗是 blocking popup：SetHide/LuaEvents 都无法解锁 popup manager，
+        # 只有游戏原生右键路径（ScreenConsumer eRClick → OnClose → Close()）有效（实测铁证）。
+        # Lua 无法模拟输入，交 Python 侧用 pyautogui 右键游戏窗口中央。
+        if nw:
+            import asyncio as _asyncio
+
+            try:
+                await _asyncio.sleep(0.5)
+                extra = _right_click_game_window()
+                # 复查弹窗是否已关闭
+                check = """
+local c = ContextPtr:LookUpControl("/InGame/NaturalWonderPopup")
+if c then print("NW2=" .. tostring(not c:IsHidden())) else print("NW2=false") end
+"""
+                try:
+                    _app, _st, r2, w2 = await _handshake_retry()
+                    o2 = await execute_lua(r2, w2, check, state_index=INGAME_STATE, timeout=8.0)
+                    try:
+                        w2.close()
+                    except Exception:
+                        pass
+                    for l2 in o2:
+                        l2 = l2.strip()
+                        if l2.startswith("NW2="):
+                            if l2[len("NW2="):].strip() == "true":
+                                extra = extra + "（右键后仍可见，需人工关闭）"
+                            else:
+                                extra = extra + "（右键后已关闭）"
+                            break
+                except Exception as e:
+                    extra = extra + f"（复查失败：{e}）"
+            except Exception as e:
+                extra = f"（右键关闭奇观弹窗失败：{e}）"
+        return {"ok": True, "app": app_id, "closed": closed, "dismissed": dismissed,
+                "nw_closed": not nw or ("（右键后已关闭）" in extra),
+                "detail": f"已关闭 {closed} 个弹窗控件、清理 {dismissed} 条通知{extra}",
                 "via": "tuner"}
     return {"ok": False, "error": "NO_RESPONSE", "detail": "关闭弹窗无回执（Tuner 输出丢失），请重试"}
+
+
+def _right_click_game_window() -> str:
+    """在游戏窗口中央右键（关闭自然奇观等 blocking popup 的原生路径）。返回结果描述。"""
+    import time as _time
+
+    try:
+        import pyautogui as _pg
+        try:
+            wins = _pg.getWindowsWithTitle("Civilization")
+            if not wins:
+                wins = _pg.getWindowsWithTitle("Sid Meier")
+            if not wins:
+                wins = _pg.getWindowsWithTitle("文明")
+        except Exception:
+            wins = []
+        hwnd_rect = None
+        if wins:
+            w = wins[0]
+            try:
+                hwnd_rect = (w.left, w.top, w.right, w.bottom)
+            except Exception:
+                hwnd_rect = None
+        if hwnd_rect is None:
+            # 兜底：win32 枚举
+            try:
+                import win32con as _wc
+                import win32gui as _wg
+
+                def _cb(h, _):
+                    nonlocal hwnd_rect
+                    if hwnd_rect is None and _wg.IsWindowVisible(h) and _wg.GetWindowText(h):
+                        tl = _wg.GetWindowText(h).lower()
+                        if "civilization" in tl or "sid meier" in tl or "文明" in tl:
+                            hwnd_rect = _wg.GetWindowRect(h)
+                            try:
+                                _wg.ShowWindow(h, _wc.SW_RESTORE)
+                            except Exception:
+                                pass
+                _wg.EnumWindows(_cb, None)
+            except Exception:
+                pass
+        if hwnd_rect is None:
+            return "（未找到游戏窗口，无法右键）"
+        x1, y1, x2, y2 = hwnd_rect
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        _pg.click(cx, cy, button="right")
+        _time.sleep(1.5)
+        return "（已右键游戏窗口中央）"
+    except Exception as e:
+        return f"（右键失败：{e}）"
 
 
 async def auto_resolve_soft_blockers(timeout: float = 10.0) -> dict:
