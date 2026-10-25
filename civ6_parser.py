@@ -266,6 +266,43 @@ def _extract_mod_title(raw_title) -> str:
     return s.strip()
 
 
+def situation_from_live(live: dict) -> dict:
+    """Tuner 实时数据 → 局面 dict（兼容 format_situation；无存档信息）。"""
+    civ = live.get("civ") or ""
+    leader = civ6_data.leader_name("", "")
+    humans: list[dict] = []
+    if civ:
+        humans.append({
+            "id": "",
+            "leader_id": "",
+            "name": civ,
+            "leader": leader,
+            "alive": True,
+            "is_current_turn": True,
+            "ai_human": 3,
+            "player_name": "",
+        })
+    return {
+        "save": None,
+        "via": "tuner",
+        "game_turn": live.get("turn"),
+        "game_speed_id": "",
+        "game_speed": "实时",
+        "map_size_id": "",
+        "map_size": "实时",
+        "map_file": "",
+        "map_name": "实时",
+        "humans": humans,
+        "ais": [],
+        "city_states": [],
+        "barbarian_count": 0,
+        "mods": [],
+        "cities": live.get("cities", 0),
+        "current_research": live.get("tech", ""),
+        "player": live.get("player", -1),
+    }
+
+
 def format_situation(sit: dict) -> str:
     """局面 dict → 中文可读文本（工具 output 用）。"""
     if not sit:
@@ -276,7 +313,13 @@ def format_situation(sit: dict) -> str:
     msize = sit.get("map_size") or sit.get("map_size_id") or "未知"
     mname = sit.get("map_name") or sit.get("map_file") or "未知"
     lines.append(f"📊 当前局面：第 {turn if turn is not None else '?'} 回合（{speed}速度，{msize}，地图：{mname}）")
-    lines.append(f"存档：{sit['save']['rel']}（{sit['save']['mtime_text']}，{sit['save']['size']//1024}KB）")
+    save = sit.get("save")
+    if save:
+        lines.append(f"存档：{save.get('rel', '')}（{save.get('mtime_text', '')}，{save.get('size', 0)//1024}KB）")
+    elif sit.get("via") == "tuner":
+        lines.append("数据来源：FireTuner 实时读取（游戏内即时状态）")
+    else:
+        lines.append("数据来源：存档解析")
 
     humans = sit.get("humans") or []
     if humans:

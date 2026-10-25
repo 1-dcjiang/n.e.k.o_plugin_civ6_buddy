@@ -371,6 +371,94 @@ async def at_war(timeout: float = 8.0) -> dict:
     return {"ok": False, "error": "NO_RESPONSE", "detail": "|".join(out)}
 
 
+LUA_SITUATION = """
+local turn = 0
+local p = -1
+local civName = ""
+local cities = 0
+local techName = ""
+local okP, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
+if okP and pPlayer ~= nil then
+  p = Game.GetLocalPlayer() or -1
+  turn = Game.GetGameTurn() or 0
+  local okCiv, civType = pcall(function() return pPlayer:GetCivilizationType() end)
+  if okCiv and civType ~= nil and GameInfo.Civilizations[civType] ~= nil then
+    civName = tostring(GameInfo.Civilizations[civType].Name or "")
+  end
+  local okCities, cList = pcall(function() return pPlayer:GetCities() end)
+  if okCities and cList ~= nil then
+    local okCnt, cnt = pcall(function() return cList:GetCount() end)
+    if okCnt and cnt ~= nil then cities = cnt end
+  end
+  local okTechs, techs = pcall(function() return pPlayer:GetTechs() end)
+  if okTechs and techs ~= nil then
+    local okCur, cur = pcall(function() return techs:GetCurrentResearch() end)
+    if okCur and cur ~= nil and GameInfo.Technologies[cur] ~= nil then
+      techName = tostring(GameInfo.Technologies[cur].Name or "")
+    end
+  end
+end
+print("OK|turn=" .. tostring(turn) .. "|p=" .. tostring(p) .. "|civ=" .. tostring(civName) .. "|cities=" .. tostring(cities) .. "|tech=" .. tostring(techName))
+"""
+
+
+async def read_situation(timeout: float = 8.0) -> dict:
+    """Tuner 实时读取当前局面：回合 / 本地玩家 / 文明 / 城市数 / 当前研究科技。
+
+    返回 {"ok": True, "app", "turn", "player", "civ", "cities", "tech", "via": "tuner"}；
+    Tuner 不可用返回 {"ok": False, "error": "GAME_TUNER_OFF"|...}（调用方回退存档解析）。
+    """
+    try:
+        app_id, states, reader, writer = await _handshake_retry()
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(reader, writer, LUA_SITUATION,
+                                state_index=_gamecore_state_index(states), timeout=timeout)
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("ERR"):
+            return {"ok": False, "error": line.split("|")[0], "detail": line}
+        if line.startswith("OK|"):
+            vals: dict[str, str] = {}
+            for part in line[3:].split("|"):
+                if "=" in part:
+                    k, _, v = part.partition("=")
+                    vals[k] = v
+            try:
+                turn = int(vals.get("turn", "0"))
+            except ValueError:
+                turn = 0
+            try:
+                player = int(vals.get("p", "-1"))
+            except ValueError:
+                player = -1
+            try:
+                cities = int(vals.get("cities", "0"))
+            except ValueError:
+                cities = 0
+            return {
+                "ok": True,
+                "app": app_id,
+                "turn": turn,
+                "player": player,
+                "civ": vals.get("civ", ""),
+                "cities": cities,
+                "tech": vals.get("tech", ""),
+                "via": "tuner",
+            }
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "|".join(out)}
+
+
 async def set_focus(yield_name: str, timeout: float = 8.0) -> dict:
     """为本城全部城市设置产出焦点（市民分配，官方机制）。
     yield_name: FOOD/PRODUCTION/GOLD/SCIENCE/CULTURE/FAITH/DEFAULT(清空)。"""

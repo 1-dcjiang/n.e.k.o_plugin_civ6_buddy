@@ -14,7 +14,7 @@ from pathlib import Path
 
 from plugin.sdk.plugin import NekoPluginBase, lifecycle, llm_tool, neko_plugin, plugin_entry
 
-from . import civ6_advice, civ6_data, civ6_ops, civ6_parser, civ6_sdk
+from . import civ6_advice, civ6_data, civ6_ops, civ6_parser, civ6_sdk, civ6_tuner
 
 _logger = logging.getLogger("N.E.K.O.Plugin_civ6_buddy.civ6_buddy")
 
@@ -148,6 +148,24 @@ class Civ6BuddyPlugin(NekoPluginBase):
     )
     async def civ6_situation(self, **_):
         self._load_config()
+        # 优先 FireTuner 实时读取（游戏开着且启用 Tuner 时数据即时准确）
+        try:
+            live = await civ6_tuner.read_situation(timeout=8.0)
+            if live.get("ok"):
+                sit = civ6_parser.situation_from_live(live)
+                lines = civ6_parser.format_situation(sit)
+                if sit.get("cities"):
+                    lines += f"\n🏙️ 城市数：{sit['cities']}（实时）"
+                if sit.get("current_research"):
+                    lines += f"\n🔬 当前研究：{sit['current_research']}（实时）"
+                return {
+                    "output": lines,
+                    "is_error": False,
+                    "situation": sit,
+                    "via": "tuner",
+                }
+        except Exception:
+            pass  # Tuner 不可用/异常 → 回退存档解析
         try:
             sit = civ6_parser.parse_save("", self._saves_dir)
         except civ6_parser.Civ6Error as exc:
