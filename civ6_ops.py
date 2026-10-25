@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os as _os
+import sys
 import time
 from pathlib import Path
 
@@ -35,6 +36,15 @@ class OpsError(Exception):
         super().__init__(message)
         self.code = code
 
+def _win32_guard() -> None:
+    """win32 兼容层仅 Windows 可用（GitHub Actions CI 跑 Ubuntu/Linux）。
+
+    Linux 上 ctypes.WinDLL 不存在（_win32 模块级 AttributeError），
+    若任由 import 冒泡会把 OpsError 语义路径击穿；这里在真正导入前
+    给出稳定错误码，让上层走"如实汇报"而非裸崩溃（v0.6.4 教训）。
+    """
+    if not sys.platform.startswith("win"):
+        raise OpsError("WIN32_UNAVAILABLE", "win32 兼容层仅 Windows 可用（当前平台不支持屏幕自动化）")
 
 # ── 执行层：优先复用 steam_manager（YUI 现成键鼠操控），缺失回退 pyautogui ──
 
@@ -87,6 +97,7 @@ class _Executor:
             except Exception:
                 pass
         # ctypes BitBlt 屏幕区域截图兜底（插件进程无 pyautogui/PIL）
+        _win32_guard()
         try:
             from ._win32 import screen_region_rgb
         except ImportError:  # 包外直接加载
@@ -103,6 +114,7 @@ class _Executor:
         """
         import ctypes
 
+        _win32_guard()
         try:
             from ._win32 import BITMAPINFOHEADER
         except ImportError:  # 包外直接加载（测试/独立脚本）
@@ -163,6 +175,7 @@ class _Executor:
             except Exception:
                 pass
         # ctypes 兜底（插件进程无 pyautogui）
+        _win32_guard()
         try:
             from ._win32 import mouse_click_abs as _click
         except ImportError:  # 包外直接加载
@@ -181,6 +194,7 @@ class _Executor:
                     return
             except Exception:
                 pass
+        _win32_guard()
         try:
             from ._win32 import press_key as _press
         except ImportError:  # 包外直接加载
@@ -277,6 +291,8 @@ _WIN_TITLES = ("Civilization VI", "Sid Meier's Civilization VI", "CivilizationVI
 
 def _find_window_probe() -> bool:
     """只读探测：文明6 窗口当前是否存在（测试/状态检查用，不抛错、不操作）。"""
+    if not sys.platform.startswith("win"):
+        return False  # 非 Windows（CI/Linux）无 win32 窗口系统 → 视为无游戏窗口
     try:
         from ._win32 import win32gui
     except ImportError:  # 包外直接加载（测试/独立脚本）
@@ -302,6 +318,10 @@ def _find_window_probe() -> bool:
 
 def _find_window():
     """查找文明6 主窗口，返回 (hwnd, left, top, right, bottom)。未运行则抛 OpsError。"""
+    if not sys.platform.startswith("win"):
+        # 非 Windows（CI/Linux）无 win32 窗口系统：语义等价"找不到游戏窗口"，
+        # 保持 GAME_NOT_RUNNING 稳定错误码（v0.6.4 教训：不能抛 WIN32_UNAVAILABLE）。
+        raise OpsError("GAME_NOT_RUNNING", "当前平台无 win32 窗口系统（视为游戏未运行）")
     try:
         from ._win32 import win32gui
     except ImportError:  # 包外直接加载（测试/独立脚本）
@@ -336,6 +356,7 @@ def _front_and_size(win: dict) -> dict:
     先 AttachThreadInput 挂到前台线程再 SetForegroundWindow + BringWindowToTop，
     成功率大幅提高。最终用 GetForegroundWindow 校验。
     """
+    _win32_guard()
     try:
         from ._win32 import win32api, win32con, win32gui, win32process
     except ImportError:  # 包外直接加载（测试/独立脚本）
