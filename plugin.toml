@@ -25,7 +25,7 @@ YUI 会替你处理每回合的杂活，全部基于游戏官方数据（FireTun
 """
 short_description = "文明6陪玩：YUI 按官方数据自动托管运营（推回合/选科技市政/填政策/探路/关弹窗/派使节），你专心打仗；存档解析+FireTuner 只读，每步截图验证，不瞎点不挂机"
 keywords = ["文明6", "Civilization VI", "Civ6", "陪玩", "自动回合", "托管运营", "科技", "市政", "政策", "万神殿", "总督", "侦察兵探路", "弹窗处理", "外交使节", "FireTuner", "存档解析", "Civ6Save", "局面洞察", "胜利路线", "城邦", "领袖", "不瞎点", "截图验证", "键鼠接管", "交还", "situation", "advisor", "buddy", "coach", "takeover", "官方API"]
-version = "0.6.6"
+version = "0.6.7"
 type = "plugin"
 entry = "plugin.plugins.civ6_buddy:Civ6BuddyPlugin"
 
