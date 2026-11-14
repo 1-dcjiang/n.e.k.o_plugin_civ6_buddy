@@ -174,68 +174,99 @@ def _read_app_options(p: Path) -> str:
 
 
 def tuner_enabled(p: Path | None = None) -> bool:
-    """AppOptions.txt 是否已启用 Tuner（含 [Debug] 节下的 EnableTuner 1）。"""
+    """只认可真正 ``[Debug]`` 节内的 ``EnableTuner 1``，兼容等号写法。"""
     ap = p or app_options_path()
+    section = ""
     for line in _read_app_options(ap).splitlines():
-        s = line.strip().lower()
-        if "enabletuner" in s:
-            try:
-                return int(line.split()[-1]) == 1
-            except ValueError:
-                return False
+        header = re.fullmatch(r"\[([^]]+)]", line.strip())
+        if header:
+            section = header.group(1).strip().lower()
+            continue
+        if section != "debug":
+            continue
+        setting = re.match(r"(?i)^\s*EnableTuner\s*(?:=\s*)?([^\s;]+)", line)
+        if setting:
+            return setting.group(1) == "1"
     return False
 
 
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """同目录临时文件 + flush/fsync + replace，避免配置写一半。"""
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode if path.exists() else None
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def ensure_tuner_enabled(p: Path | None = None) -> dict:
-    """确保 AppOptions.txt 含 [Debug] EnableTuner 1。
-
-    - 文件不存在 → 创建（备份不算，首次创建无旧值）。
-    - 已有 EnableTuner 0 → 备份 .bak_<ts> 后改为 1。
-    - 已有 1 → 不动。
-    - 已有文件但无 EnableTuner 行 → 备份后追加；已有 [Debug] 节则不再重复添加节头。
-    返回 {"changed": bool, "backup": str|None, "path": str, "detail": str}。
-    """
+    """在真正的 ``[Debug]`` 节内启用 Tuner，保留 CRLF 并原子替换文件。"""
     ap = p or app_options_path()
-    text = _read_app_options(ap)
-    backup: str | None = None
+    raw = ap.read_bytes() if ap.exists() else b""
+    if not raw:
+        _atomic_write_bytes(ap, b"[Debug]\nEnableTuner 1\n")
+        return {"changed": True, "backup": None, "path": str(ap),
+                "detail": "AppOptions.txt 不存在，已创建并启用 Tuner"}
 
-    def _backup() -> None:
-        nonlocal backup
-        if backup is None:
-            ap.parent.mkdir(parents=True, exist_ok=True)
-            backup = str(ap) + f".bak_{time.strftime('%Y%m%d_%H%M%S')}"
-            Path(backup).write_text(text, encoding="utf-8")
+    text = raw.decode("utf-8-sig")
+    newline = "\r\n" if "\r\n" in text else "\n"
+    bom = b"\xef\xbb\xbf" if raw.startswith(b"\xef\xbb\xbf") else b""
+    lines = text.splitlines(keepends=True)
+    section = ""
+    debug_start = debug_end = -1
+    enable_index = -1
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        section_match = re.fullmatch(r"\[([^]]+)]", stripped)
+        if section_match:
+            section = section_match.group(1).strip().lower()
+            if section == "debug" and debug_start < 0:
+                debug_start = index
+            elif debug_start >= 0 and debug_end < 0:
+                debug_end = index
+        if section == "debug" and re.match(r"(?i)^\s*EnableTuner\s+", line):
+            enable_index = index
+    if debug_start >= 0 and debug_end < 0:
+        debug_end = len(lines)
 
-    if text:
-        lines = text.splitlines()
-        for i, line in enumerate(lines):
-            if "enabletuner" in line.strip().lower():
-                try:
-                    if int(line.split()[-1]) == 1:
-                        return {"changed": False, "backup": None,
-                                "path": str(ap), "detail": "EnableTuner 已为 1，无需修改"}
-                except ValueError:
-                    pass
-                _backup()
-                lines[i] = "EnableTuner 1"  # 保持原 [Debug] 节位置
-                ap.write_text("\n".join(lines) + "\n", encoding="utf-8")
-                return {"changed": True, "backup": backup, "path": str(ap),
-                        "detail": "EnableTuner 0 → 1（已备份原文件）"}
-        # 文件存在但没有 EnableTuner 行：备份后追加
-        _backup()
-        has_debug = any(line.strip().lower() == "[debug]" for line in lines)
-        if has_debug:
-            ap.write_text(text.rstrip("\n") + "\nEnableTuner 1\n", encoding="utf-8")
-            return {"changed": True, "backup": backup, "path": str(ap),
-                    "detail": "已追加 EnableTuner 1（复用已有 [Debug] 节）"}
-        ap.write_text(text.rstrip("\n") + "\n[Debug]\nEnableTuner 1\n", encoding="utf-8")
-        return {"changed": True, "backup": backup, "path": str(ap),
-                "detail": "已追加 [Debug] 节并启用 EnableTuner"}
-    # 文件不存在：直接创建
+    detail = ""
+    if enable_index >= 0:
+        # 同时兼容 ``EnableTuner 1`` 和 ``EnableTuner = 1``，必须检查值而非行尾空白。
+        setting = re.match(r"(?i)^\s*EnableTuner\s*(?:=\s*)?([^\s;]+)", lines[enable_index])
+        if setting and setting.group(1) == "1":
+            return {"changed": False, "backup": None, "path": str(ap),
+                    "detail": "[Debug] EnableTuner 已为 1，无需修改"}
+        ending = "\r\n" if lines[enable_index].endswith("\r\n") else "\n" if lines[enable_index].endswith("\n") else ""
+        lines[enable_index] = "EnableTuner 1" + ending
+        detail = "[Debug] EnableTuner 原值 → 1（已备份原文件）"
+    elif debug_start >= 0:
+        lines.insert(debug_end, "EnableTuner 1" + newline)
+        detail = "已在原 [Debug] 节内加入 EnableTuner 1（未追加到其他节）"
+    else:
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += newline
+        lines.extend(("[Debug]" + newline, "EnableTuner 1" + newline))
+        detail = "已追加独立 [Debug] 节并启用 EnableTuner"
+
     ap.parent.mkdir(parents=True, exist_ok=True)
-    ap.write_text("[Debug]\nEnableTuner 1\n", encoding="utf-8")
-    return {"changed": True, "backup": None, "path": str(ap),
-            "detail": "AppOptions.txt 不存在，已创建并启用 Tuner"}
+    backup = str(ap) + f".bak_{time.strftime('%Y%m%d_%H%M%S')}"
+    Path(backup).write_bytes(raw)
+    _atomic_write_bytes(ap, bom + "".join(lines).encode("utf-8"))
+    return {"changed": True, "backup": backup, "path": str(ap), "detail": detail}
 
 
 def trigger_steam_install(appid: int = SDK_APPID) -> dict:

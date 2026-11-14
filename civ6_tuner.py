@@ -6,9 +6,9 @@
 
 【Lua state 分工（实测铁律）】
 - GameCore（gamecore_index）：读局面常量（回合=Game.GetCurrentGameTurn、文明、科技名等）。
-- InGame（state 96）：UI 仿真层。写操作必须在此（RequestOperation / ACTION_ENDTURN
-  在此才生效）；生产队列的当前状态也必须在 InGame 读（GameCore 读到的是旧/空状态，
-  会误判"设置生产失败"）。
+- InGame：UI 仿真层。写操作必须在此（RequestOperation / ACTION_ENDTURN 在此才生效）；
+  状态索引由 LSQ 动态解析（历史实测曾为 96，不能硬编码）。生产队列也必须在 InGame 读，
+  GameCore 读到的是旧/空状态，会误判"设置生产失败"。
 
 【回合读取】正确 API 是 Game.GetCurrentGameTurn()（不是 GetGameTurn——后者在本
 游戏版本为 nil，会导致回合数恒为 0 的假 bug）。
@@ -374,14 +374,11 @@ _ITEM_KIND_TO_TABLE = {
 
 
 def _ingame_state_index(states: list[str] | None, fallback: int = INGAME_STATE) -> int:
-    """从 Lua states 中找 InGame 索引；找不到回退 96（文明6 固定 UI 层索引）。"""
-    if states:
-        for s in states:
-            if "InGame" in s:
-                # states 元素形如 "96 InGame" 或 "InGame"
-                for token in s.replace(",", " ").split():
-                    if token.isdigit():
-                        return int(token)
+    """按 LSQ 的交错 [index, name] 格式解析 InGame；仅无法识别时使用兼容回退。"""
+    parsed = _parse_lua_states(list(states or []))
+    for index, name in parsed.items():
+        if name == "InGame" or name.endswith("/InGame"):
+            return index
     return fallback
 
 
@@ -423,7 +420,7 @@ print(table.concat(s, "&"))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc), "cities": []}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc), "cities": []}
     finally:
@@ -460,20 +457,26 @@ print(table.concat(s, "&"))
     return {"ok": True, "app": app_id, "turn": turn, "cities": cities, "via": "tuner"}
 
 
+_ITEM_KIND_TO_PARAM = {
+    "unit": "PARAM_UNIT_TYPE",
+    "building": "PARAM_BUILDING_TYPE",
+    "district": "PARAM_DISTRICT_TYPE",
+    "project": "PARAM_PROJECT_TYPE",
+}
+
+
 async def set_city_production(
     item_kind: str = "unit",
     item_name: str = "UNIT_SCOUT",
     timeout: float = 10.0,
+    city_id: int | None = None,
+    plot_x: int | None = None,
+    plot_y: int | None = None,
 ) -> dict:
-    """为本地玩家的第一座城市设置生产项目（InGame 层 RequestOperation）。
+    """设置生产并读回项目哈希；不阻塞游戏 UI 线程，也不把已有队列当成功。
 
-    实测铁律：RequestOperation 是 fire-and-forget，即使 CanStartOperation=true 也可能
-    静默 no-op；必须在**同一段 Lua 内**等待后读取队列验证 size>=1，失败重试。
-    用 GameCore 跨 context 读队列会误判失败——本函数全部在 InGame 内完成。
-
-    参数 item_kind：unit/building/district/project；item_name：GameInfo 的 Type
-    （如 UNIT_SCOUT / BUILDING_MONUMENT / DISTRICT_CAMPUS / PROJECT_ENCAMPMENT_ARMORY）。
-    返回 {"ok", "city", "item", "kind", "queue_size", "detail"}；失败含 error。
+    未指定 ``city_id`` 时处理全部空队列城市；指定城市时允许替换其当前队列。
+    区域还必须明确 ``plot_x/plot_y``，避免缺少选址参数时静默失败。
     """
     kind = (item_kind or "unit").strip().lower()
     if kind not in _ITEM_KIND_TO_TABLE:
@@ -483,64 +486,127 @@ async def set_city_production(
         return {"ok": False, "error": "NO_ITEM", "detail": "缺少 item_name（如 UNIT_SCOUT）"}
     if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", item_name):
         return {"ok": False, "error": "BAD_ITEM", "detail": "item_name 仅允许大写 GameInfo Type（A-Z、0-9、下划线）"}
+    if city_id is not None and (not isinstance(city_id, int) or city_id < 0):
+        return {"ok": False, "error": "BAD_CITY", "detail": "city_id 必须是非负整数"}
+    if kind == "district" and (
+        city_id is None or not isinstance(plot_x, int) or not isinstance(plot_y, int)
+        or plot_x < 0 or plot_y < 0
+    ):
+        return {"ok": False, "error": "DISTRICT_LOCATION_REQUIRED",
+                "detail": "区域生产必须同时提供非负 city_id、plot_x、plot_y，不能沿用单位参数或自动猜地块"}
 
-    lua = f"""
+    param = _ITEM_KIND_TO_PARAM[kind]
+    selected_city = -1 if city_id is None else city_id
+    only_empty = "true" if city_id is None else "false"
+    x, y = -1 if plot_x is None else plot_x, -1 if plot_y is None else plot_y
+    request_lua = f"""
 local me = Game.GetLocalPlayer()
-local pCity = CityManager.GetCity(me, 0)
-if pCity == nil then print("ERR:CITY_NOT_FOUND") return end
 local item = GameInfo.{_ITEM_KIND_TO_TABLE[kind]}["{item_name}"]
 if item == nil then print("ERR:ITEM_NOT_FOUND|{item_name}") return end
-local bq = pCity:GetBuildQueue()
-local canProduce = false
-pcall(function() canProduce = bq:CanProduce(item.Hash, true) end)
-if not canProduce then print("ERR:CANNOT_PRODUCE|{item_name}") return end
-local tCheck = {{}}
-tCheck[CityOperationTypes.PARAM_UNIT_TYPE] = item.Hash
-local canStart = CityManager.CanStartOperation(pCity, CityOperationTypes.BUILD, tCheck, true)
-local done = false
-local lastSize = 0
-for i = 1, 3 do
-  local tParams = {{}}
-  tParams[CityOperationTypes.PARAM_UNIT_TYPE] = item.Hash
-  tParams[CityOperationTypes.PARAM_INSERT_MODE] = CityOperationTypes.VALUE_EXCLUSIVE
-  CityManager.RequestOperation(pCity, CityOperationTypes.BUILD, tParams)
-  local t0 = os.clock()
-  while os.clock() - t0 < 0.8 do end
-  local sz = 0
-  pcall(function() sz = bq:GetSize() or 0 end)
-  lastSize = sz
-  if sz >= 1 then
-    done = true
-    break
+local targets = {{}}
+local rejected = {{}}
+local occupied = 0
+local function consider(pCity)
+  if pCity == nil then return end
+  local id = pCity:GetID()
+  local bq = pCity:GetBuildQueue()
+  local size = bq:GetSize() or 0
+  if {only_empty} and size > 0 then occupied = occupied + 1; return end
+  local params = {{}}
+  params[CityOperationTypes.{param}] = item.Hash
+  params[CityOperationTypes.PARAM_INSERT_MODE] = CityOperationTypes.VALUE_EXCLUSIVE
+  if "{kind}" == "district" then
+    params[CityOperationTypes.PARAM_X] = {x}
+    params[CityOperationTypes.PARAM_Y] = {y}
+    if Map.GetPlot({x}, {y}) == nil then rejected[#rejected+1] = id .. ":PLOT"; return end
   end
+  local canProduce, canStart = false, false
+  pcall(function() canProduce = bq:CanProduce(item.Hash, true) end)
+  pcall(function() canStart = CityManager.CanStartOperation(pCity, CityOperationTypes.BUILD, params, true) end)
+  if not canProduce or not canStart then rejected[#rejected+1] = id .. ":UNAVAILABLE"; return end
+  CityManager.RequestOperation(pCity, CityOperationTypes.BUILD, params)
+  targets[#targets+1] = id
 end
--- 消除"未选择生产"的结束回合 blocker 通知（官方 UI 同款操作）
-local cleared = 0
-pcall(function()
-  local list = NotificationManager.GetList(me)
-  if list then
-    for _, nid in ipairs(list) do
-      local e = NotificationManager.Find(me, nid)
-      if e and not e:IsDismissed() then
-        local bt = e:GetEndTurnBlocking()
-        if bt and bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_PRODUCTION then
-          pcall(function() NotificationManager.SendActivated(me, nid) end)
-          pcall(function() NotificationManager.Dismiss(me, nid) end)
-          cleared = cleared + 1
-        end
-      end
-    end
-  end
-end)
-print("SET|canStart=" .. tostring(canStart) .. "|size=" .. tostring(lastSize)
-      .. "|done=" .. tostring(done) .. "|cleared=" .. tostring(cleared))
+if {selected_city} >= 0 then
+  local pCity = CityManager.GetCity(me, {selected_city})
+  if pCity == nil then print("ERR:CITY_NOT_FOUND|{selected_city}") return end
+  consider(pCity)
+else
+  for pCity in Players[me]:GetCities():Members() do consider(pCity) end
+end
+__civ6_prod_targets = targets
+print("REQUESTED=" .. tostring(#targets) .. "|OCCUPIED=" .. tostring(occupied)
+      .. "|REJECTED=" .. table.concat(rejected, ","))
 """
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.1, timeout)
+    last_detail = "设置生产无回执"
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        # 写请求只发一次；后续仅轮询读回，避免重试把同一项目重复入队。
+        requested = await execute_lua(
+            reader, writer, request_lua, state_index=_ingame_state_index(states), timeout=timeout,
+        )
+        request_line = next((line for line in requested if line.startswith(("REQUESTED=", "ERR:"))), "")
+        if request_line.startswith("ERR:"):
+            return {"ok": False, "error": request_line.split("|")[0], "detail": request_line}
+        if not request_line.startswith("REQUESTED="):
+            return {"ok": False, "error": "NO_RESPONSE", "detail": "生产请求无回执，未宣称成功"}
+        requested_count = _to_int(request_line.split("=", 1)[1].split("|", 1)[0])
+        rejected = request_line.split("REJECTED=", 1)[1] if "REJECTED=" in request_line else ""
+        if requested_count == 0:
+            if rejected:
+                return {"ok": False, "error": "CANNOT_PRODUCE", "detail": f"生产项目不可用：{rejected}"}
+            return {"ok": True, "app": app_id, "changed": 0, "queue_size": 0,
+                    "item": item_name, "kind": kind, "cities": [],
+                    "detail": "所有城市已有生产队列，本次未改写，也未把旧队列冒充为新设置"}
+
+        for attempt in range(3):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return {"ok": False, "error": "TIMEOUT", "detail": "生产读回总预算已耗尽，未宣称成功"}
+            await asyncio.sleep(min(0.35, remaining))
+            cleanup = "true" if attempt == 2 else "false"
+            verify_lua = f"""
+local me = Game.GetLocalPlayer()
+local item = GameInfo.{_ITEM_KIND_TO_TABLE[kind]}["{item_name}"]
+local targets = __civ6_prod_targets or {{}}
+local done, failed, queueSize = 0, 0, 0
+local failedIds = {{}}
+for _, id in ipairs(targets) do
+  local city = CityManager.GetCity(me, id)
+  local queue = city and city:GetBuildQueue() or nil
+  local size, current = 0, 0
+  if queue then
+    pcall(function() size = queue:GetSize() or 0 end)
+    pcall(function() current = queue:GetCurrentProductionTypeHash() or 0 end)
+  end
+  queueSize = queueSize + size
+  if size >= 1 and current == item.Hash then done = done + 1
+  else failed = failed + 1; failedIds[#failedIds+1] = id end
+end
+if done == #targets or {cleanup} then __civ6_prod_targets = nil end
+print("SET|done=" .. tostring(done) .. "|failed=" .. tostring(failed)
+      .. "|size=" .. tostring(queueSize) .. "|ids=" .. table.concat(failedIds, ","))
+"""
+            verified = await execute_lua(
+                reader, writer, verify_lua, state_index=_ingame_state_index(states),
+                timeout=max(0.1, deadline - loop.time()),
+            )
+            line = next((entry for entry in verified if entry.startswith("SET|")), "")
+            values = {part.split("=")[0]: part.split("=", 1)[1]
+                      for part in line[4:].split("|") if "=" in part}
+            done, failed = _to_int(values.get("done")), _to_int(values.get("failed"))
+            if line and done == requested_count and failed == 0:
+                return {"ok": True, "app": app_id, "changed": done,
+                        "queue_size": _to_int(values.get("size")), "item": item_name, "kind": kind,
+                        "detail": f"已读回验证 {done} 座城市的 {item_name} 生产队列（项目哈希匹配）"}
+            last_detail = f"第 {attempt + 1} 次读回未匹配：成功 {done}，失败 {failed}，城市 {values.get('ids', '')}"
+        return {"ok": False, "error": "SILENT_FAILURE", "detail": last_detail + "；未宣称设置成功"}
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -548,28 +614,6 @@ print("SET|canStart=" .. tostring(canStart) .. "|size=" .. tostring(lastSize)
             writer.close()
         except Exception:
             pass
-    for line in out:
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("ERR"):
-            return {"ok": False, "error": line.split("|")[0], "detail": line}
-        if line.startswith("SET|"):
-            parts = {p.split("=")[0]: p.split("=", 1)[1] for p in line[4:].split("|") if "=" in p}
-            size = _to_int(parts.get("size", "0"))
-            done = parts.get("done", "false") == "true"
-            if done and size >= 1:
-                return {
-                    "ok": True, "app": app_id, "city": "第一城",
-                    "item": item_name, "kind": kind, "queue_size": size,
-                    "detail": f"生产队列已设置（{item_name}，队列 {size} 项）",
-                }
-            return {
-                "ok": False, "error": "SILENT_FAILURE",
-                "detail": f"{item_name} canStart={parts.get('canStart')} 但队列仍空（size={size}）；"
-                          "游戏可能在等待其他确认，可换生产项重试",
-            }
-    return {"ok": False, "error": "NO_RESPONSE", "detail": "设置生产无回执（Tuner 输出丢失），请重试"}
 
 
 async def end_turn(timeout: float = 8.0) -> dict:
@@ -586,7 +630,7 @@ async def end_turn(timeout: float = 8.0) -> dict:
         out = await execute_lua(
             reader, writer,
             "UI.RequestAction(ActionTypes.ACTION_ENDTURN); print('ENDT_OK')",
-            state_index=INGAME_STATE, timeout=timeout,
+            state_index=_ingame_state_index(states), timeout=timeout,
         )
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
@@ -641,7 +685,7 @@ if found == 0 then print("NONE") end
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc), "blockers": []}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc), "blockers": []}
     finally:
@@ -731,7 +775,7 @@ print("{ok_prefix}|{item_name}|cleared=" .. tostring(cleared))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -793,7 +837,7 @@ print(table.concat(parts, "&"))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -918,7 +962,7 @@ print("PICK=" .. pick)
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1004,7 +1048,7 @@ print("MOVED=" .. table.concat(targets, "|"))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1034,11 +1078,17 @@ async def read_threats(timeout: float = 10.0) -> dict:
     """
     lua = """
 local me = Game.GetLocalPlayer()
-local capX, capY = -1, -1
-pcall(function()
-  local cap = Players[me]:GetCities():GetCapitalCity()
-  if cap then capX, capY = cap:GetX(), cap:GetY() end
-end)
+local function isHostile(owner)
+  if owner == nil or owner < 0 or owner == me then return false end
+  local other = Players[owner]
+  if other == nil then return false end
+  local barbarian = false
+  pcall(function() barbarian = other:IsBarbarian() end)
+  if barbarian then return true end
+  local atWar = false
+  pcall(function() atWar = Players[me]:GetDiplomacy():IsAtWarWith(owner) end)
+  return atWar
+end
 local rows = {}
 for _, u in Players[me]:GetUnits():Members() do
   local x, y = u:GetX(), u:GetY()
@@ -1050,37 +1100,27 @@ for _, u in Players[me]:GetUnits():Members() do
     local moves = 0
     pcall(function() moves = u:GetMovesRemaining() or 0 end)
     local tStr, tCount, tDist = -1, 0, 99
-    -- 扫描周围 5 格（曼哈顿/切比雪夫混合：|dx|<=2, |dy|<=2）
     for dx = -2, 2 do for dy = -2, 2 do
       if dx ~= 0 or dy ~= 0 then
         local nx, ny = x + dx, y + dy
-        local p = Map.GetPlot(nx, ny)
-        if p then
-          local owner = -1
-          pcall(function() owner = p:GetOwner() end)
-          if owner >= 0 and owner ~= me then
-            local eStr = -1
-            local eCount = 0
-            pcall(function()
-              local us = Map.GetUnitsAt(nx, ny)
-              if us then
-                for o in us:Units() do
-                  if o:GetOwner() == owner and o:GetX() == nx then
-                    eCount = eCount + 1
-                    local ei = GameInfo.Units[o:GetType()]
-                    local cs = 0
-                    if ei and ei.Combat then cs = ei.Combat end
-                    if cs > eStr then eStr = cs end
+        if Map.GetPlot(nx, ny) then
+          pcall(function()
+            local us = Map.GetUnitsAt(nx, ny)
+            if us then
+              for o in us:Units() do
+                -- 敌我由单位所有者和外交战争状态决定，与地块归属无关；平民不构成战斗威胁。
+                local ei = GameInfo.Units[o:GetType()]
+                local cs = ei and ei.Combat or 0
+                if isHostile(o:GetOwner()) and cs > 0 then
+                  tCount = tCount + 1
+                  if cs > tStr then
+                    tStr = cs
+                    tDist = math.max(math.abs(dx), math.abs(dy))
                   end
                 end
               end
-            end)
-            if eCount > 0 and eStr > tStr then
-              tStr = eStr
-              tCount = eCount
-              tDist = math.max(math.abs(dx), math.abs(dy))
             end
-          end
+          end)
         end
       end
     end end
@@ -1095,7 +1135,7 @@ print("THREATS|" .. table.concat(rows, ";;"))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1141,6 +1181,17 @@ pcall(function()
   local cap = Players[me]:GetCities():GetCapitalCity()
   if cap then capX, capY = cap:GetX(), cap:GetY() end
 end)
+local function isHostile(owner)
+  if owner == nil or owner < 0 or owner == me then return false end
+  local other = Players[owner]
+  if other == nil then return false end
+  local barbarian = false
+  pcall(function() barbarian = other:IsBarbarian() end)
+  if barbarian then return true end
+  local atWar = false
+  pcall(function() atWar = Players[me]:GetDiplomacy():IsAtWarWith(owner) end)
+  return atWar
+end
 local evaded = {}
 -- 先收集威胁信息（同 read_threats），对受威胁且有移动力的单位找远离方向
 local danger = {}
@@ -1153,30 +1204,20 @@ for _, u in Players[me]:GetUnits():Members() do
     local tStr, tCount, tDX, tDY = -1, 0, 0, 0
     for dx = -2, 2 do for dy = -2, 2 do
       if dx ~= 0 or dy ~= 0 then
-        local p = Map.GetPlot(x + dx, y + dy)
-        if p then
-          local owner = -1
-          pcall(function() owner = p:GetOwner() end)
-          if owner >= 0 and owner ~= me then
-            local eStr, eCount = -1, 0
-            pcall(function()
-              local us = Map.GetUnitsAt(x + dx, y + dy)
-              if us then
-                for o in us:Units() do
-                  if o:GetOwner() == owner then
-                    eCount = eCount + 1
-                    local ei = GameInfo.Units[o:GetType()]
-                    local cs = 0
-                    if ei and ei.Combat then cs = ei.Combat end
-                    if cs > eStr then eStr = cs end
-                  end
+        if Map.GetPlot(x + dx, y + dy) then
+          pcall(function()
+            local us = Map.GetUnitsAt(x + dx, y + dy)
+            if us then
+              for o in us:Units() do
+                local ei = GameInfo.Units[o:GetType()]
+                local cs = ei and ei.Combat or 0
+                if isHostile(o:GetOwner()) and cs > 0 then
+                  tCount = tCount + 1
+                  if cs > tStr then tStr = cs; tDX = dx; tDY = dy end
                 end
               end
-            end)
-            if eCount > 0 and eStr > tStr then
-              tStr = eStr; tCount = eCount; tDX = dx; tDY = dy
             end
-          end
+          end)
         end
       end
     end end
@@ -1231,7 +1272,7 @@ print("EVADED=" .. table.concat(evaded, "|"))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1363,7 +1404,7 @@ print("BUILT=" .. table.concat(built, "|") .. "|MOVED=" .. table.concat(moved, "
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1387,29 +1428,19 @@ print("BUILT=" .. table.concat(built, "|") .. "|MOVED=" .. table.concat(moved, "
 
 
 async def auto_decide_production(timeout: float = 10.0) -> dict:
-    """生产智能决策：按真实局面选城市该造什么（回答"很多没想起来的事也要做"）。
+    """按真实单位构成选择无需选址的有限配额生产；配额满足后交还玩家决策。
 
-    读经济/区域数据后按优先级决策（全部来自真实读数，不编造）：
-    1. 城市无区域 且 人口≥3 → district/DISTRICT_CAMPUS（学院，科技运营基础）；
-    2. 侦察兵 < 2 → unit/UNIT_SCOUT（探路开图）；
-    3. 建造者 < 2 → unit/UNIT_BUILDER（改良地块涨产能）；
-    4. 人口≥2 且勇士 < 1 → unit/UNIT_WARRIOR（保底防御）；
-    5. 兜底 → unit/UNIT_SCOUT。
-    返回 {"ok", "kind", "item", "reason", "eco": {...}}。
+    不自动选择需要城市与地块坐标的区域，也不在配额满足后无限补侦察兵。
+    返回 {"ok", "kind", "item", "reason", "eco"} 或 NO_REASONABLE_PRODUCTION。
     """
     eco = await read_economy(timeout=timeout)
     if not eco.get("ok"):
         return {"ok": False, "error": eco.get("error", "ECO_FAIL"),
                 "detail": eco.get("detail", "读经济失败")}
     pop = int(eco.get("population") or 0)
-    cities = int(eco.get("cities") or 0)
     scouts = int(eco.get("scouts") or 0)
     builders = int(eco.get("builders") or 0)
     warriors = int(eco.get("warriors") or 0)
-    districts = int(eco.get("districts") or 0)
-    if cities > 0 and districts == 0 and pop >= 3:
-        return {"ok": True, "kind": "district", "item": "DISTRICT_CAMPUS",
-                "reason": f"人口{pop} 无区域 → 建学院", "eco": eco}
     if scouts < 2:
         return {"ok": True, "kind": "unit", "item": "UNIT_SCOUT",
                 "reason": f"侦察兵{scouts} < 2 → 补侦察探路", "eco": eco}
@@ -1419,8 +1450,8 @@ async def auto_decide_production(timeout: float = 10.0) -> dict:
     if pop >= 2 and warriors < 1:
         return {"ok": True, "kind": "unit", "item": "UNIT_WARRIOR",
                 "reason": f"人口{pop} 无勇士 → 补防御", "eco": eco}
-    return {"ok": True, "kind": "unit", "item": "UNIT_SCOUT",
-            "reason": "局面平衡 → 继续补侦察", "eco": eco}
+    return {"ok": False, "error": "NO_REASONABLE_PRODUCTION", "eco": eco,
+            "detail": "侦察/建造者/勇士配额已满足；没有无需选址且可保守决定的生产，交还玩家选择"}
 
 
 async def register_wc_voter(timeout: float = 10.0) -> dict:
@@ -1471,7 +1502,7 @@ print("WC_REGISTERED|ok")
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1490,14 +1521,49 @@ print("WC_REGISTERED|ok")
     return {"ok": False, "error": "NO_RESPONSE", "detail": "世界议会注册无回执（Tuner 输出丢失），请重试"}
 
 
-async def auto_manage_money(timeout: float = 15.0) -> dict:
-    """自动花钱（InGame 购买决策）——回答"所有机制都做"里的经济面。
+async def unregister_wc_voter(timeout: float = 3.0) -> dict:
+    """注销本插件注册的世界议会处理器，避免交还后继续替玩家投票。"""
+    lua = """
+if __civ6_wc_handler then
+  local ok, err = pcall(function() Events.WorldCongressStage1.Remove(__civ6_wc_handler) end)
+  if not ok then print("WC_UNREGISTER_ERR|" .. tostring(err)) return end
+  __civ6_wc_handler = nil
+  __civ6_wc_voted = nil
+  print("WC_UNREGISTERED|ok")
+else
+  print("WC_UNREGISTERED|absent")
+end
+"""
+    try:
+        app_id, states, reader, writer = await _handshake_retry(retries=0)
+    except TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await execute_lua(
+            reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout,
+        )
+    except TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    for line in out:
+        line = line.strip()
+        if line.startswith("WC_UNREGISTERED|"):
+            return {"ok": True, "app": app_id, "registered": False, "via": "tuner",
+                    "detail": "世界议会自动投票处理器已注销" if line.endswith("|ok") else "世界议会处理器本未注册"}
+        if line.startswith("WC_UNREGISTER_ERR|"):
+            return {"ok": False, "error": "WC_UNREGISTER_FAILED", "detail": line}
+    return {"ok": False, "error": "NO_RESPONSE", "detail": "世界议会注销无回执，不能确认已清理"}
 
-    规则（保守可靠，全部基于真实读数）：
-    1. 建造者 < 2 且金币 ≥ 150 → 购买建造者（PURCHASE 建造者，价格为当前费用）；
-    2. 否则金币 ≥ 250 → 购买首都边界最高价值地块（按资源/产出评分）；
-    3. 金币不足或无购买对象 → 报告当前金币与可买项。
-    购买用官方 CityManager 购买操作。返回 {"ok", "action", "detail"}。
+
+async def auto_manage_money(timeout: float = 15.0) -> dict:
+    """自动花钱：建造者少于 2 且金币足够时，尝试购买一个建造者。
+
+    当前不会购买地块；购买请求是否实际成交以游戏反馈为准，不夸大为完整经济自动运营。
+    返回 {"ok", "action", "detail"}。
     """
     lua = """
 local me = Game.GetLocalPlayer()
@@ -1539,7 +1605,7 @@ print("MONEY|gold=" .. tostring(gold) .. "|builders=" .. tostring(builders) .. "
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1624,7 +1690,7 @@ print("RELIGION_OK|" .. relType .. "|" .. tostring(fb) .. "|" .. tostring(fdb))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1678,7 +1744,7 @@ print("GP|" .. recruited)
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1750,7 +1816,7 @@ print("TRADE=" .. table.concat(created, "|"))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1770,12 +1836,7 @@ print("TRADE=" .. table.concat(created, "|"))
 
 
 async def auto_manage_spy(timeout: float = 15.0) -> dict:
-    """自动管理间谍（InGame）——可派间谍自动派往目标并选路线。
-
-    官方链路：SPY 单位存在且空闲时自动派往最远文明（espionage.py 同款 SET_ESCAPE_ROUTE）。
-    v1 保守版：检测到间谍单位时报告并自动设定逃跑路线（防卡 blocker）；
-    派发任务细节留策略层。幂等：无间谍时安全返回。
-    """
+    """只扫描并报告间谍单位；不派遣任务、不选择逃跑路线、不删除间谍通知。"""
     lua = """
 local me = Game.GetLocalPlayer()
 local found = false
@@ -1783,10 +1844,6 @@ for _, u in Players[me]:GetUnits():Members() do
   local info = GameInfo.Units[u:GetType()]
   if info and info.UnitType == "UNIT_SPY" then
     found = true
-    -- 若有逃跑路线待选（SPY_CHOOSE_ESCAPE_ROUTE blocker），自动选第一个区域
-    local ok, hasTask = pcall(function()
-      return Players[me]:GetEspionage() and Players[me]:GetEspionage():GetSpy(u:GetID()) ~= nil
-    end)
     print("SPY_FOUND|" .. u:GetID())
   end
 end
@@ -1797,7 +1854,7 @@ print("SPY_SCAN|" .. tostring(found))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1805,23 +1862,25 @@ print("SPY_SCAN|" .. tostring(found))
             writer.close()
         except Exception:
             pass
-    has_spy = any("SPY_FOUND|" in ln for ln in out)
+    if not any(line.strip().startswith("SPY_SCAN|") for line in out):
+        return {"ok": False, "error": "NO_RESPONSE", "detail": "间谍扫描无回执，不能确认是否存在间谍"}
+    has_spy = any(line.strip().startswith("SPY_FOUND|") for line in out)
     return {"ok": True, "app": app_id, "has_spy": has_spy,
-            "detail": f"间谍机制：{'检测到间谍（自动管理已就绪，任务细节留策略层）' if has_spy else '无间谍（文艺复兴后才解锁），跳过'}",
+            "detail": f"间谍扫描：{'检测到间谍；仅报告，任务与逃跑路线由玩家决定' if has_spy else '未检测到间谍'}",
             "via": "tuner"}
 
 
 async def auto_war_response(timeout: float = 15.0) -> dict:
     """战争响应（InGame）——被宣战时评估并报告，不主动宣战。
 
-    边界说明（重要）：主动宣战会永久破坏外交关系、可能引发全面战争，属不可逆决策，
-    托管不自动宣战（保留给玩家）；被宣战时自动进入防御姿态（现已有避险+撤退），
-    并输出敌我战力对比与建议。返回 {"ok", "at_war", "threats", "advice", "detail"}。
+    边界说明（重要）：主动宣战会永久破坏外交关系、可能引发全面战争，属不可逆决策。
+    本函数只读战争与威胁状态并报告，不声称已经替玩家完成防御或移动；由上层立即交还。
+    返回 {"ok", "at_war", "threats", "advice", "detail"}。
     """
     war = await at_war(timeout=timeout)
     thr = await read_threats(timeout=timeout)
     if war.get("ok") and war.get("at_war"):
-        adv = "战争状态：YUI 保持防御（不主动攻击），战斗单位已避险；建议你接管指挥进攻/议和。"
+        adv = "检测到战争：停止运营并交还玩家，进攻、防御与议和均由玩家决定。"
         detail = f"检测到战争！{adv}"
         return {"ok": True, "at_war": True,
                 "threats": thr.get("units", []) if thr.get("ok") else [],
@@ -1885,7 +1944,7 @@ print("ECO|gold=" .. tostring(gold) .. "|faith=" .. tostring(faith) .. "|pop=" .
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -1991,7 +2050,7 @@ print("RESULT|" .. pick .. "|" .. reason)
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -2073,7 +2132,7 @@ print("DIPLOMACY|tokens=" .. tostring(tokens) .. "&ROWS=" .. table.concat(rows, 
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -2150,7 +2209,7 @@ print("CULTURE|yield=" .. tostring(cultYield) .. "|tourism=" .. tostring(tourism
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -2226,7 +2285,7 @@ print("RESULT|" .. target.name .. "|dist=" .. tostring(target.dist))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -2395,7 +2454,7 @@ print("RESULT|" .. chosen.GovernorType .. "|" .. (Locale.Lookup(chosen.Name) or 
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -2453,7 +2512,7 @@ print("RESULT|" .. chosen.type)
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -2559,7 +2618,8 @@ for s = 0, numSlots - 1 do
     end
   end
 end
-if #addList > 0 then
+if #picked > 0 then
+  -- addList 以槽位 0 起始，是稀疏表；picked 才是可安全取长度的密集列表。
   pcall(function() pCulture:RequestPolicyChanges(clearList, addList) end)
 end
 print("FILLED=" .. tostring(#picked) .. "&SLOTS=" .. table.concat(picked, "|"))
@@ -2569,7 +2629,7 @@ print("FILLED=" .. tostring(#picked) .. "&SLOTS=" .. table.concat(picked, "|"))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -2591,16 +2651,11 @@ print("FILLED=" .. tostring(#picked) .. "&SLOTS=" .. table.concat(picked, "|"))
 
 
 async def close_ui_popups(timeout: float = 10.0) -> dict:
-    """关闭挡路的 UI 弹窗并清理全部通知（InGame）。
+    """只关闭已知的 UI 控件；不批量激活/吞噬通知，不用右键猜测关闭弹窗。
 
-    **实测铁证**：文明6 顾问弹窗（AdvisorPopup/AdvisorBase）与科技完成弹窗等会挡住
-    ActionPanel——blocker 全清、UI.RequestAction(ACTION_ENDTURN) 仍被弹窗拦截、
-    回合不推进（卡 10→10 复现）；SetHide 关弹窗后立即 11→12 推进。
-    因此结束回合前必须先关弹窗。弹窗可能连续弹出（提示队列），循环 3 遍。
-    返回 {"ok", "closed", "dismissed"}。
+    自然奇观或菜单在官方调用后仍可见时返回失败，由上层交还玩家处理。
     """
     lua = """
-local me = Game.GetLocalPlayer()
 local paths = {"/InGame/AdvisorPopup/AdvisorBase", "/InGame/AdvisorPopup",
                "/InGame/TechCivicCompletedPopup", "/InGame/NewTurnPanel",
                "/InGame/EraCompletePopup", "/InGame/GreatPeoplePopup",
@@ -2616,8 +2671,6 @@ for pass = 1, 3 do
     end)
   end
 end
--- ESC 主菜单（InGameTopOptionsMenu）：官方关闭事件 + 弹出队列移除（实测铁证：
--- 菜单弹出时游戏暂停、blockers 正常但 ACTION_ENDTURN 不推进 → 任务被误判卡死中止）
 pcall(function()
   local c = ContextPtr:LookUpControl("/InGame/InGameTopOptionsMenu")
   if c and not c:IsHidden() then
@@ -2627,7 +2680,6 @@ pcall(function()
     closed = closed + 1
   end
 end)
--- 子菜单（选项/读档/存档 LuaContext）兜底关闭
 for _, p in ipairs({"/InGame/Options", "/InGame/LoadGameMenu", "/InGame/SaveGameMenu",
                     "/InGame/InGameTopOptionsMenu/Options",
                     "/InGame/InGameTopOptionsMenu/LoadGameMenu",
@@ -2637,37 +2689,25 @@ for _, p in ipairs({"/InGame/Options", "/InGame/LoadGameMenu", "/InGame/SaveGame
     if c and not c:IsHidden() then c:SetHide(true); closed = closed + 1 end
   end)
 end
--- 自然奇观发现全屏弹窗（NaturalWonderPopup，侦察探路触发——实测挡住 ACTION_ENDTURN 回合不推进）
-pcall(function() LuaEvents.NaturalWonderPopup_Shown() end)
 pcall(function() LuaEvents.NaturalWonderPopup_Closed() end)
 pcall(function() Events.HideLeaderScreen() end)
-local nwVisible = false
+local nwVisible, menuVisible = false, false
 pcall(function()
   local c = ContextPtr:LookUpControl("/InGame/NaturalWonderPopup")
   if c then nwVisible = not c:IsHidden() end
 end)
-local dismissed = 0
 pcall(function()
-  local list = NotificationManager.GetList(me)
-  if list then
-    for _, nid in ipairs(list) do
-      local e = NotificationManager.Find(me, nid)
-      if e and not e:IsDismissed() then
-        pcall(function() NotificationManager.SendActivated(me, nid) end)
-        pcall(function() NotificationManager.Dismiss(me, nid) end)
-        dismissed = dismissed + 1
-      end
-    end
-  end
+  local c = ContextPtr:LookUpControl("/InGame/InGameTopOptionsMenu")
+  if c then menuVisible = not c:IsHidden() end
 end)
-print("CLOSED=" .. tostring(closed) .. "&DISMISSED=" .. tostring(dismissed) .. "&NW=" .. tostring(nwVisible))
+print("CLOSED=" .. tostring(closed) .. "&NW=" .. tostring(nwVisible) .. "&MENU=" .. tostring(menuVisible))
 """
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:
@@ -2676,71 +2716,19 @@ print("CLOSED=" .. tostring(closed) .. "&DISMISSED=" .. tostring(dismissed) .. "
         except Exception:
             pass
     for line in out:
-        line = line.strip()
-        if not line or "&" not in line:
+        if not line.strip().startswith("CLOSED="):
             continue
-        kv = {p.split("=")[0]: p.split("=", 1)[1] for p in line.split("&") if "=" in p}
+        kv = {p.split("=")[0]: p.split("=", 1)[1] for p in line.strip().split("&") if "=" in p}
         closed = _to_int(kv.get("CLOSED", "0"))
-        dismissed = _to_int(kv.get("DISMISSED", "0"))
         nw = str(kv.get("NW", "false")).lower() == "true"
-        extra = ""
-        # 自然奇观弹窗是 blocking popup：SetHide/LuaEvents 都无法解锁 popup manager，
-        # 只有游戏原生右键路径（ScreenConsumer eRClick → OnClose → Close()）有效（实测铁证）。
-        # Lua 无法模拟输入，交 Python 侧用 ctypes 右键游戏窗口中央。
-        if nw:
-            try:
-                await asyncio.sleep(0.5)
-                extra = await asyncio.to_thread(_right_click_game_window)
-                # 复查弹窗是否已关闭
-                check = """
-local c = ContextPtr:LookUpControl("/InGame/NaturalWonderPopup")
-if c then print("NW2=" .. tostring(not c:IsHidden())) else print("NW2=false") end
-"""
-                try:
-                    _app, _st, r2, w2 = await _handshake_retry()
-                    o2 = await execute_lua(r2, w2, check, state_index=INGAME_STATE, timeout=8.0)
-                    try:
-                        w2.close()
-                    except Exception:
-                        pass
-                    for l2 in o2:
-                        l2 = l2.strip()
-                        if l2.startswith("NW2="):
-                            if l2[len("NW2="):].strip() == "true":
-                                extra = extra + "（右键后仍可见，需人工关闭）"
-                            else:
-                                extra = extra + "（右键后已关闭）"
-                            break
-                except Exception as e:
-                    extra = extra + f"（复查失败：{e}）"
-            except Exception as e:
-                extra = f"（右键关闭奇观弹窗失败：{e}）"
-        # ESC 主菜单兜底：Lua 关闭可能不完整（UI 层 modal），复查菜单仍可见则激活窗口按 ESC
-        try:
-            menu_check = """
-local c = ContextPtr:LookUpControl("/InGame/InGameTopOptionsMenu")
-if c then print("MENU2=" .. tostring(not c:IsHidden())) else print("MENU2=false") end
-"""
-            _app2, _st2, r3, w3 = await _handshake_retry()
-            o3 = await execute_lua(r3, w3, menu_check, state_index=INGAME_STATE, timeout=8.0)
-            try:
-                w3.close()
-            except Exception:
-                pass
-            menu_visible = False
-            for l3 in o3:
-                l3 = l3.strip()
-                if l3.startswith("MENU2="):
-                    menu_visible = l3[len("MENU2="):].strip() == "true"
-                    break
-            if menu_visible:
-                extra = extra + "（ESC 菜单 Lua 关闭未生效，交还人工处理——不按 ESC 键，避免再次误开菜单）"
-        except Exception as e:
-            extra = extra + f"（菜单复查失败：{e}）"
-        return {"ok": True, "app": app_id, "closed": closed, "dismissed": dismissed,
-                "nw_closed": not nw or ("（右键后已关闭）" in extra),
-                "detail": f"已关闭 {closed} 个弹窗控件、清理 {dismissed} 条通知{extra}",
-                "via": "tuner"}
+        menu = str(kv.get("MENU", "false")).lower() == "true"
+        result = {"app": app_id, "closed": closed, "dismissed": 0,
+                  "nw_closed": not nw, "menu_closed": not menu, "via": "tuner"}
+        if nw or menu:
+            visible = "、".join(name for name, shown in (("自然奇观", nw), ("暂停菜单", menu)) if shown)
+            return {**result, "ok": False, "error": "POPUP_UNRESOLVED",
+                    "detail": f"{visible}仍可见；未右键或吞噬通知，请手动关闭"}
+        return {**result, "ok": True, "detail": f"已处理 {closed} 个已知弹窗控件；未清理普通通知"}
     return {"ok": False, "error": "NO_RESPONSE", "detail": "关闭弹窗无回执（Tuner 输出丢失），请重试"}
 
 
@@ -2749,10 +2737,9 @@ async def auto_resolve_soft_blockers(timeout: float = 10.0) -> dict:
 
     处理：GOVERNOR_IDLE（总督空闲：SendActivated+Dismiss）、
     CONSIDER_GOVERNMENT_CHANGE（考虑更换政体：置 considered=true）、
-    WORLD_CONGRESS_LOOK / WORLD_CONGRESS_SPECIAL_SESSION（世界议会查看/特别会议：dismiss）、
-    SPY_CHOOSE_ESCAPE_ROUTE（间谍选最快撤退路线）。
+    WORLD_CONGRESS_LOOK / WORLD_CONGRESS_SPECIAL_SESSION（世界议会查看/特别会议：dismiss）。
     返回 {"ok", "resolved": [类型列表]}。
-    生产/科技/市政/单位/议会投票等策略性 blocker 不在本函数内处理（由调用方决策）。
+    生产/科技/市政/单位/议会投票/间谍逃跑路线等策略性 blocker 不在此处理，交玩家决策。
     """
     lua = """
 local me = Game.GetLocalPlayer()
@@ -2762,7 +2749,7 @@ local mark = function(name)
   for _, v in ipairs(resolved) do if v == name then dup = true break end end
   if not dup then resolved[#resolved+1] = name end
 end
--- 遍历通知，按类型自动处理
+-- 遍历通知，仅处理明确支持的软 blocker；宣战与间谍等普通/策略通知保持原样。
 pcall(function()
   local list = NotificationManager.GetList(me)
   if list then
@@ -2781,9 +2768,6 @@ pcall(function()
           elseif bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_WORLD_CONGRESS_SPECIAL_SESSION then
             pcall(function() NotificationManager.Dismiss(me, nid) end)
             mark("WORLD_CONGRESS_SPECIAL_SESSION")
-          elseif bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_SPY_CHOOSE_ESCAPE_ROUTE then
-            pcall(function() NotificationManager.Dismiss(me, nid) end)
-            mark("SPY_ESCAPE_ROUTE")
           end
         end
       end
@@ -2809,7 +2793,7 @@ print("RESOLVED=" .. table.concat(resolved, ","))
     except TunerError as exc:
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
     try:
-        out = await execute_lua(reader, writer, lua, state_index=INGAME_STATE, timeout=timeout)
+        out = await execute_lua(reader, writer, lua, state_index=_ingame_state_index(states), timeout=timeout)
     except TunerError as exc:
         return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
     finally:

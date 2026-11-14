@@ -51,18 +51,23 @@ def list_saves(saves_dir: str = "") -> list[dict]:
     if not os.path.isdir(root):
         raise Civ6Error("SAVES_DIR_NOT_FOUND", f"存档目录不存在：{root}")
     out: list[dict] = []
-    for p in sorted(Path(root).rglob("*.Civ6Save"), key=lambda x: x.stat().st_mtime, reverse=True):
+    # 自动存档可能在排序期间轮转；先逐个抓取 stat，再按快照排序，避免 key 内二次 stat。
+    entries: list[tuple[float, Path, os.stat_result]] = []
+    for path in Path(root).rglob("*.Civ6Save"):
         try:
-            st = p.stat()
+            stat = path.stat()
         except OSError:
             continue
-        rel = str(p.relative_to(root)).replace("\\", "/")
+        entries.append((stat.st_mtime, path, stat))
+    entries.sort(key=lambda entry: entry[0], reverse=True)
+    for mtime, path, stat in entries:
+        rel = str(path.relative_to(root)).replace("\\", "/")
         out.append({
-            "path": str(p),
+            "path": str(path),
             "rel": rel,
-            "size": st.st_size,
-            "mtime": st.st_mtime,
-            "mtime_text": _fmt_time(st.st_mtime),
+            "size": stat.st_size,
+            "mtime": mtime,
+            "mtime_text": _fmt_time(mtime),
             "kind": "auto" if "/auto/" in rel or rel.startswith("auto") else "manual",
         })
     return out

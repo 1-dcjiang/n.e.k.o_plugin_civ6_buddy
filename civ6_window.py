@@ -17,18 +17,24 @@ def right_click_game_window(win32_modules=None, sleep=None) -> str:
         except ImportError:  # 包外直接加载
             import _win32 as w32  # type: ignore
         gui, con, mouse = w32.win32gui, w32.win32con, w32
+        process_name = w32.window_process_name
     else:
         gui, con, mouse = win32_modules
+        process_name = getattr(mouse, "window_process_name", None)
 
     hwnd = None
     hwnd_rect = None
 
     def find_game_window(candidate, _param):
         nonlocal hwnd, hwnd_rect
-        if hwnd is not None or not gui.IsWindowVisible(candidate):
+        if hwnd is not None or not gui.IsWindowVisible(candidate) or process_name is None:
             return
-        title = gui.GetWindowText(candidate)
-        if title and any(word in title.lower() for word in ("civilization", "sid meier", "文明")):
+        try:
+            executable = str(process_name(candidate)).replace("\\", "/").rsplit("/", 1)[-1].lower()
+        except Exception:
+            return
+        # 标题可被浏览器/资源管理器伪造；只接受文明6游戏进程，失败时宁肯不点击。
+        if executable.startswith("civilizationvi") and executable.endswith(".exe"):
             hwnd = candidate
             hwnd_rect = gui.GetWindowRect(candidate)
 

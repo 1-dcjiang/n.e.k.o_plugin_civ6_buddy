@@ -181,11 +181,15 @@ class _FakeGui:
 
 
 class _FakeMouse:
-    def __init__(self):
+    def __init__(self, executable=r"C:\Games\CivilizationVI.exe"):
         self.calls = []
+        self.executable = executable
 
     def mouse_right_click_abs(self, x, y):
         self.calls.append((x, y))
+
+    def window_process_name(self, _hwnd):
+        return self.executable
 
 
 def test_right_click_activation_failure_never_clicks():
@@ -210,12 +214,23 @@ def test_right_click_requires_verified_foreground_window():
     assert mouse.calls == []
 
 
+@pytest.fixture(autouse=True)
+def _no_world_congress_network(monkeypatch):
+    async def unregister(timeout=0):
+        return {"ok": True, "registered": False}
+
+    monkeypatch.setattr(_main.civ6_tuner, "unregister_wc_voter", unregister)
+
+
 def _bare_plugin():
     plugin = _main.Civ6BuddyPlugin.__new__(_main.Civ6BuddyPlugin)
     plugin._saves_dir = ""
     plugin._ops_buttons = {}
     plugin._cfg_loaded = True
     plugin._ops_active = False
+    plugin._ops_tick_lock = asyncio.Lock()
+    plugin._ops_stop_event = asyncio.Event()
+    plugin._ops_screen_cancel = None
     return plugin
 
 

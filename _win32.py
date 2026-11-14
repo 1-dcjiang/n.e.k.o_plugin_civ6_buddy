@@ -60,6 +60,34 @@ _user32.AttachThreadInput.restype = wintypes.BOOL
 _kernel32.GetCurrentThreadId.argtypes = []
 _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+]
+_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+def window_process_name(hwnd: int) -> str:
+    """按窗口 PID 读取可执行文件全路径；失败返回空串，调用方不得降级猜标题。"""
+    pid = wintypes.DWORD()
+    if not _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)):
+        return ""
+    process = _kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not process:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not _kernel32.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(size)):
+            return ""
+        return buffer.value
+    finally:
+        _kernel32.CloseHandle(process)
+
+
 # ── 键鼠（SetCursorPos / mouse_event / keybd_event）──
 _user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
 _user32.SetCursorPos.restype = wintypes.BOOL

@@ -85,20 +85,47 @@ def _unpack(buf: bytes) -> tuple[int, str]:
     return tag, body.rstrip(b"\x00").decode("utf-8", errors="replace")
 
 
+class TunerTimeout(TunerError):
+    """仅在等待下一帧头时超时；帧体超时或断连均不可安全复用。"""
+
+
 async def _send(writer: asyncio.StreamWriter, tag: int, payload: str) -> None:
-    writer.write(_pack(tag, payload))
-    await writer.drain()
+    try:
+        writer.write(_pack(tag, payload))
+        await writer.drain()
+    except (ConnectionError, OSError) as exc:
+        raise TunerError(f"发送失败：{exc}") from exc
 
 
 async def _recv(reader: asyncio.StreamReader, timeout: float) -> tuple[int, str]:
+    # 先等首字节：只有完全没收到数据的帧头空闲才可恢复；已消费部分帧头后超时不能复用连接。
     try:
-        header = await asyncio.wait_for(reader.readexactly(HEADER_SIZE), timeout=timeout)
+        first = await asyncio.wait_for(reader.read(1), timeout=timeout)
     except asyncio.TimeoutError:
-        raise TunerError("读取超时（游戏无响应，可尝试重启游戏）") from None
+        raise TunerTimeout("读取超时（游戏暂无输出）") from None
+    except (ConnectionError, OSError) as exc:
+        raise TunerError(f"读取帧头失败：{exc}") from exc
+    if not first:
+        raise TunerError("连接已断开：未收到完整帧头")
+    try:
+        header = first + await asyncio.wait_for(reader.readexactly(HEADER_SIZE - 1), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise TunerError("读取部分帧头后超时，连接已不可安全复用") from None
+    except asyncio.IncompleteReadError as exc:
+        raise TunerError("连接已断开：帧头不完整") from exc
+    except (ConnectionError, OSError) as exc:
+        raise TunerError(f"读取帧头失败：{exc}") from exc
     length, tag = struct.unpack(HEADER_FMT, header)
     if length <= 0 or length > 10_000_000:
         raise TunerError(f"非法帧长度：{length}")
-    body = await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
+    try:
+        body = await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise TunerError("读取帧体超时，连接已不可安全复用") from None
+    except asyncio.IncompleteReadError as exc:
+        raise TunerError("连接已断开：帧体不完整") from exc
+    except (ConnectionError, OSError) as exc:
+        raise TunerError(f"读取帧体失败：{exc}") from exc
     return tag, body.rstrip(b"\x00").decode("utf-8", errors="replace")
 
 
@@ -176,11 +203,11 @@ async def execute_lua(
     state_index: int = 0,
     timeout: float = 8.0,
 ) -> list[str]:
-    """在指定 Lua state 执行脚本，**循环收集**全部 print 输出行。
+    """执行脚本并收集输出；安静等待不缩短调用方给定的总预算。
 
-    FireTuner 的 print 输出是多帧异步流（`O\\x00<state>: <value>`），
-    单帧读取会丢行/错位。此处：执行前清陈旧帧 → 发 CMD → 循环读帧
-    直到超时 → 解析输出行 → 再清尾部。"""
+    首个输出前可以安静等待完整 ``timeout``；首个输出后连续 0.6 秒无新帧才提前收尾。
+    帧头空闲超时可继续等，断连、帧体超时和帧损坏必须抛出，不能伪装成 NO_RESPONSE。
+    """
     await _drain(reader, timeout=0.1)
     await _send(writer, TAG_COMMAND, f"CMD:{state_index}:{code}")
     lines: list[str] = []
@@ -189,26 +216,23 @@ async def execute_lua(
     got_any = False
     last_data = loop.time()
     while True:
-        now = loop.time()
-        remaining = deadline - now
+        remaining = deadline - loop.time()
         if remaining <= 0:
             break
-        # 性能优化：脚本输出完成后 FireTuner 不再发帧，继续等待只会白耗 2 秒/步。
-        # 收到首个输出行后改用短等待片（0.2s），连续 0.6s 无新帧判定流结束提前返回。
-        wait = min(remaining, 2.0)
-        if got_any:
-            wait = min(wait, 0.2)
+        wait = min(remaining, 0.2 if got_any else 2.0)
         try:
             _, payload = await _recv(reader, wait)
-        except TunerError:
-            break  # 读取超时/帧损坏 → 停止收集
+        except TunerTimeout:
+            if got_any and (loop.time() - last_data) >= 0.6:
+                break
+            continue
         text = _parse_output_payload(payload)
         if text is not None and text.strip():
             lines.append(text.strip())
             got_any = True
             last_data = loop.time()
         elif got_any and (loop.time() - last_data) >= 0.6:
-            break  # 输出后 0.6s 无新帧 → 脚本已执行完
+            break
     await _drain(reader, timeout=0.2)
     return lines
 

@@ -1,5 +1,5 @@
 [project]
 name = "civ6_buddy"
-version = "0.6.7"
-description = "文明6陪玩：解析存档获知局面 + 推荐制屏幕自动化运营托管"
+version = "0.6.8"
+description = "文明6陪玩：存档局面分析 + FireTuner 官方数据运营托管"
 dependencies = []

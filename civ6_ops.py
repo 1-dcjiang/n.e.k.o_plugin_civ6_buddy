@@ -5,12 +5,10 @@
 - 只读游戏画面（截图），不碰游戏内存、不改存档。
 - 执行层**优先复用 steam_manager.control（YUI 现成键鼠操控）**，steam_manager
   缺失时才回退 pyautogui（通道在结果里如实标注）。
-- 执行方式 = "推荐制"：只点击游戏内固定按钮/推荐项目（下一回合、市政、
-  城市"推荐生产"等），配合固定相对坐标 + 像素模板匹配，**不依赖 OCR**。
-- 城市生产走游戏自带"推荐建造"按钮；科技树无推荐按钮，自动部分只做
-  "已就绪市政/政策"与"下一回合"，科技给建议留用户点（半自动）。
-- 战争检测：Tuner 官方 API（GetAtWarCount）优先、像素横幅兜底——检测到即停止运营、交还控制权。
-- 每一次操作后截图验证；识别不了就停下如实汇报，绝不猜点。
+- 屏幕兜底只点击实际匹配模板的按钮；不凭固定相对坐标、明暗面板或 OCR 猜测输入。
+- 生产、研究与单位运营优先走 FireTuner；模板缺失或窗口身份/前台状态不确定时交还。
+- 战争检测：Tuner 官方 API 优先、像素横幅兜底——检测到即停止运营、交还控制权。
+- 截图用于识别与结算检查，但不宣称每一步都有截图；识别不了就停下如实汇报。
 """
 
 from __future__ import annotations
@@ -299,59 +297,65 @@ def peek_window() -> dict:
 _WIN_TITLES = ("Civilization VI", "Sid Meier's Civilization VI", "CivilizationVI")
 
 
+def _window_modules():
+    try:
+        from . import _win32 as w32
+    except ImportError:  # 包外直接加载（测试/独立脚本）
+        import _win32 as w32  # type: ignore
+    return w32.win32gui, w32.window_process_name
+
+
+def _verified_game_window(win32gui, process_name, hwnd) -> bool:
+    """标题只作粗筛，进程身份才是点击依据；任何查询失败都 fail closed。"""
+    try:
+        if not win32gui.IsWindowVisible(hwnd):
+            return False
+        title = win32gui.GetWindowText(hwnd)
+        if not any(t.casefold() in title.casefold() for t in _WIN_TITLES):
+            return False
+        executable = str(process_name(hwnd)).replace("\\", "/").rsplit("/", 1)[-1].lower()
+        return executable.startswith("civilizationvi") and executable.endswith(".exe")
+    except Exception:
+        return False
+
+
 def _find_window_probe() -> bool:
     """只读探测：文明6 窗口当前是否存在（测试/状态检查用，不抛错、不操作）。"""
     if not sys.platform.startswith("win"):
         return False  # 非 Windows（CI/Linux）无 win32 窗口系统 → 视为无游戏窗口
     try:
-        from ._win32 import win32gui
-    except ImportError:  # 包外直接加载（测试/独立脚本）
-        import _win32 as _win32_mod  # type: ignore
+        win32gui, process_name = _window_modules()
+        found = []
 
-        win32gui = _win32_mod.win32gui
+        def _enum(hwnd, _):
+            if _verified_game_window(win32gui, process_name, hwnd):
+                found.append(hwnd)
+
+        win32gui.EnumWindows(_enum, None)
+        return bool(found)
     except Exception:
         return False
-    found = []
-
-    def _enum(hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
-            return
-        title = win32gui.GetWindowText(hwnd)
-        for t in _WIN_TITLES:
-            if t.casefold() in title.casefold():
-                found.append(hwnd)
-                return
-
-    win32gui.EnumWindows(_enum, None)
-    return bool(found)
 
 
 def _find_window():
-    """查找文明6 主窗口，返回 (hwnd, left, top, right, bottom)。未运行则抛 OpsError。"""
+    """查找进程身份确认的文明6 主窗口；标题相同但进程不符时不返回。"""
     if not sys.platform.startswith("win"):
         # 非 Windows（CI/Linux）无 win32 窗口系统：语义等价"找不到游戏窗口"，
         # 保持 GAME_NOT_RUNNING 稳定错误码（v0.6.4 教训：不能抛 WIN32_UNAVAILABLE）。
         raise OpsError("GAME_NOT_RUNNING", "当前平台无 win32 窗口系统（视为游戏未运行）")
     try:
-        from ._win32 import win32gui
-    except ImportError:  # 包外直接加载（测试/独立脚本）
-        import _win32 as _win32_mod  # type: ignore
-
-        win32gui = _win32_mod.win32gui
+        win32gui, process_name = _window_modules()
+    except Exception as exc:
+        raise OpsError("WIN32_UNAVAILABLE", f"窗口身份校验不可用：{exc}") from exc
     matches = []
 
     def _enum(hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
-            return
-        title = win32gui.GetWindowText(hwnd)
-        for t in _WIN_TITLES:
-            if t.casefold() in title.casefold():
-                matches.append(hwnd)
-                return
+        if _verified_game_window(win32gui, process_name, hwnd):
+            matches.append(hwnd)
 
     win32gui.EnumWindows(_enum, None)
     if not matches:
-        raise OpsError("GAME_NOT_RUNNING", "未找到文明6 窗口。请先启动游戏并进入一局游戏（不要停在主菜单）。")
+        raise OpsError("GAME_NOT_RUNNING", "未找到进程身份确认的文明6 窗口（不会仅凭标题点击）。")
     hwnd = matches[0]
     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
     if right - left < 200 or bottom - top < 200:
@@ -644,6 +648,8 @@ def run_one_turn_ops(
     _check_deadline(deadline, cancel_event)
     win = _find_window()
     win = _front_and_size(win)
+    if not win.get("fronted"):
+        raise OpsError("WINDOW_NOT_FOREGROUND", "文明6 窗口未能确认置于前台，未执行任何点击")
     log: list[str] = [f"窗口已定位并前置（执行通道：{_EXEC.channel}）"]
 
     # 1) 初始截图
@@ -662,11 +668,13 @@ def run_one_turn_ops(
             "log": log, "channel": _EXEC.channel,
         }
 
-    # 3) 开局/研究完成需选科技：左侧"选择研究"面板 → 自动选第一个科技
+    # 3) 亮度/暗色区域不能可靠识别研究面板。没有可验证模板时绝不按固定坐标盲点。
     if _research_panel_open(screen):
-        _pick_first_research(win, deadline, cancel_event)
-        log.append("检测到'选择研究'面板，已自动选择第一个科技（采矿业）")
-        screen = _shot(win)
+        return {
+            "ok": False, "handoff": True, "reason": "RESEARCH_PANEL_UNCERTAIN",
+            "output": "画面疑似研究面板，但仅凭明暗无法确认。请用 FireTuner 设置研究，或手动处理后再继续。",
+            "log": log, "channel": _EXEC.channel,
+        }
 
     # 3.5) 残留面板清扫：完全不用 ESC 键（v0.6.2 用户明确要求——文明6 按 ESC =
     # 打开暂停菜单，任何 ESC 操作都有误开菜单风险，宁可交还也不冒险）。
@@ -678,35 +686,25 @@ def run_one_turn_ops(
             "log": log, "channel": _EXEC.channel,
         }
 
-    # 4) 弹窗清扫（最多 3 次；不用 ESC）：浅色弹窗的确认按钮常与"下一回合"同位置，
-    #    直接点该按钮关闭弹窗；仍挡 → 交还（诚实报告，不盲目操作）。
-    for i in range(3):
-        if not _detect_popup_blocking(screen):
-            break
-        _check_deadline(deadline, cancel_event)
-        btn = cfg.get("buttons", {}).get("next_turn") or _DEFAULT_BUTTONS["next_turn"]
-        _click_rel(win, float(btn[0]), float(btn[1]), delay=0.4)
-        screen = _shot(win)
-        log.append(f"检测到弹窗，点击'下一回合'位置关闭（第 {i + 1} 次）")
-    else:
+    # 4) 大面积浅色也可能是普通面板或地图，不能据亮度连点确认/下一回合位置。
+    if _detect_popup_blocking(screen):
         return {
-            "ok": False, "handoff": True, "reason": "POPUP_UNRESOLVED",
-            "output": "连续弹窗无法清除：停止运营，请手动处理游戏内弹窗后再说'继续运营'。",
+            "ok": False, "handoff": True, "reason": "POPUP_UNCERTAIN",
+            "output": "画面存在无法可靠识别的浅色面板，未执行猜测点击。请手动确认后再继续。",
             "log": log, "channel": _EXEC.channel,
         }
 
-    # 4) 点"下一回合"（模板优先，兜底用默认相对坐标）
-    _check_deadline(deadline, cancel_event)
+    # 5) 只有模板实际匹配才点击；缺少模板或未命中均交还，不使用默认相对坐标盲点。
     clicked = _template_click_if_found(
         screen, win, "next_turn", deadline=deadline, cancel_event=cancel_event,
     )
     if not clicked:
-        _check_deadline(deadline, cancel_event)
-        btn = cfg.get("buttons", {}).get("next_turn") or _DEFAULT_BUTTONS["next_turn"]
-        _click_rel(win, float(btn[0]), float(btn[1]), delay=0.4)
-        log.append("下一回合：未匹配到模板，使用默认相对坐标点击")
-    else:
-        log.append("下一回合：模板匹配点击")
+        return {
+            "ok": False, "handoff": True, "reason": "NEXT_BUTTON_NOT_CONFIRMED",
+            "output": "未匹配到下一回合按钮模板，未点击。请检查分辨率/界面缩放或改用 FireTuner。",
+            "log": log, "channel": _EXEC.channel,
+        }
+    log.append("下一回合：模板匹配点击")
 
     # 5) 等待 AI 结算 + 像素战争复检（Tuner 复检由调用方在返回后执行）
     _sleep_with_deadline(2.5, deadline, cancel_event)
