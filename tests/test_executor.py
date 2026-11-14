@@ -8,7 +8,6 @@
 import platform
 
 import pytest
-
 from civ6_ops import OpsError, _Executor
 
 # CI（GitHub Actions）跑在 Ubuntu/Linux：ctypes.WinDLL 仅 Windows 存在，
