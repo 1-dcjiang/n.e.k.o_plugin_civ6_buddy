@@ -4,7 +4,8 @@
 敌对文明/城邦/MOD），基于局面给陪玩建议（文明特性 + 对手 + 早期策略模板）。
 运行依赖：本机 node（>=16）+ 插件内嵌 civ6_save_parser（已随插件打包）。
 
-只读操作：不修改存档、不写游戏文件。存档目录可在 config 覆盖。
+默认不修改存档或游戏文件；仅在用户明确执行 fix_tuner 时备份并修改 AppOptions.txt。
+存档目录可在 config 覆盖。
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ def _ops_lock_path() -> str:
         os.environ.get("LOCALAPPDATA", ""), "N.E.K.O", "config", "civ6_ops_active"
     )
 _OPS_LOCK_TTL = 300.0
+_OPS_STATUS_BUDGET = 25.0  # 工具超时 30 秒，保留 5 秒给序列化与宿主调度。
 
 
 def _ops_lock_set() -> None:
@@ -143,7 +145,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
     async def civ6_list_saves(self, **_):
         self._load_config()
         try:
-            saves = civ6_parser.list_saves(self._saves_dir)
+            saves = await asyncio.to_thread(civ6_parser.list_saves, self._saves_dir)
         except civ6_parser.Civ6Error as exc:
             return _wrap_err(exc)
         if not saves:
@@ -174,7 +176,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
         save = str(save or params.get("save") or "").strip()
         self._load_config()
         try:
-            sit = civ6_parser.parse_save(save, self._saves_dir)
+            sit = await asyncio.to_thread(civ6_parser.parse_save, save, self._saves_dir)
         except civ6_parser.Civ6Error as exc:
             return _wrap_err(exc)
         return {
@@ -214,7 +216,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
         except Exception:
             pass  # Tuner 不可用/异常 → 回退存档解析
         try:
-            sit = civ6_parser.parse_save("", self._saves_dir)
+            sit = await asyncio.to_thread(civ6_parser.parse_save, "", self._saves_dir)
         except civ6_parser.Civ6Error as exc:
             return _wrap_err(exc)
         return {
@@ -294,7 +296,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
         topic = str(topic or params.get("topic") or "").strip()
         self._load_config()
         try:
-            sit = civ6_parser.parse_save("", self._saves_dir)
+            sit = await asyncio.to_thread(civ6_parser.parse_save, "", self._saves_dir)
         except civ6_parser.Civ6Error as exc:
             return _wrap_err(exc)
         lines = [civ6_parser.format_situation(sit), "", "💡 陪玩建议："]
@@ -304,17 +306,19 @@ class Civ6BuddyPlugin(NekoPluginBase):
 
     @lifecycle(id="startup")
     async def on_startup(self, **_):
-        """启动钩子：仅做配置预加载与自检，不启动任何后台任务（纯只读插件）。"""
+        """启动钩子：自检放在工作线程，避免阻塞宿主事件循环。"""
         try:
             self._load_config()
-            civ6_parser.self_check(self._saves_dir)
+            await asyncio.to_thread(civ6_parser.self_check, self._saves_dir)
         except Exception as exc:  # 自检失败不影响宿主启动
             _logger.warning("civ6_buddy startup self-check failed: %s", exc)
         return {"status": "ready", "plugin": "civ6_buddy"}
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self, **_):
-        """关闭钩子：无后台资源需释放。"""
+        """关闭钩子：退出托管并清理跨插件运营锁。"""
+        self._ops_active = False
+        _ops_lock_clear()
         return {"status": "stopped", "plugin": "civ6_buddy"}
 
     # ══════════ 前置链路：SDK 自动安装与 Tuner 配置（v0.4.0） ══════════
@@ -345,19 +349,21 @@ class Civ6BuddyPlugin(NekoPluginBase):
         if action not in ("check", "install", "fix_tuner"):
             return {"output": "未知 action：可用 check / install / fix_tuner。", "is_error": True,
                     "error": "BAD_ACTION"}
-        status = civ6_sdk.sdk_status()
+        status = await asyncio.to_thread(civ6_sdk.sdk_status)
         sdk_ok = status["sdk_installed"]
         tuner_ok = status["tuner_enabled"]
         port_ok = status["port_4318_listening"]
 
         if action == "fix_tuner":
-            r = civ6_sdk.ensure_tuner_enabled()
+            r = await asyncio.to_thread(civ6_sdk.ensure_tuner_enabled)
+            achievement_warning = "注意：启用 Tuner 会禁用成就。"
             if not r["changed"]:
-                return {"output": f"Tuner 配置无需修改：{r['detail']}。", "is_error": False,
+                return {"output": f"Tuner 配置无需修改：{r['detail']}。{achievement_warning}", "is_error": False,
                         "channel": "sdk", "tuner": r}
             return {
                 "output": (f"已启用 Tuner：{r['detail']}。修改文件：{r['path']}。"
-                           "请重启游戏生效（同屏只能一个 Tuner 连接，先关掉 SDK 自带的 FireTuner.exe）。"),
+                           "请重启游戏生效（同屏只能一个 Tuner 连接，先关掉 SDK 自带的 FireTuner.exe）。"
+                           f"{achievement_warning}"),
                 "is_error": False, "channel": "sdk", "tuner": r,
             }
 
@@ -367,7 +373,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                                   f"Tuner 配置：{('已启用' if tuner_ok else '未启用')}；"
                                   f"端口 4318：{('监听中' if port_ok else '未监听（需重启游戏）')}。",
                         "is_error": False, "channel": "sdk", "status": status}
-            trig = civ6_sdk.trigger_steam_install()
+            trig = await asyncio.to_thread(civ6_sdk.trigger_steam_install)
             if not trig["ok"]:
                 return {"output": trig["detail"], "is_error": True, "error": "STEAM_TRIGGER_FAILED",
                         "channel": "sdk"}
@@ -410,15 +416,41 @@ class Civ6BuddyPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def civ6_ops_status(self, **_):
-        from . import civ6_tuner
-        sit = await civ6_tuner.read_situation(timeout=8.0)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _OPS_STATUS_BUDGET
+        failed_reads: list[str] = []
+        timed_out = False
+
+        async def read_step(label: str, function, timeout: float = 8.0) -> dict:
+            nonlocal timed_out
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                timed_out = True
+                failed_reads.append(label)
+                return {"ok": False, "error": "STATUS_TIMEOUT", "detail": "状态读取总预算已耗尽"}
+            try:
+                return await asyncio.wait_for(function(timeout=min(timeout, remaining)), timeout=remaining)
+            except asyncio.TimeoutError:
+                timed_out = True
+                failed_reads.append(label)
+                return {"ok": False, "error": "STATUS_TIMEOUT", "detail": f"{label}读取超时"}
+            except Exception as exc:
+                failed_reads.append(label)
+                return {"ok": False, "error": "STATUS_READ_FAILED", "detail": str(exc)}
+
+        sit = await read_step("局面", civ6_tuner.read_situation)
         if not sit.get("ok"):
             return {"output": f"FireTuner 读取失败：{sit.get('detail', sit.get('error', ''))}。"
                               "请先执行 civ6_ensure_sdk(action='check') 检查底层通道。",
-                    "is_error": True, "error": sit.get("error", "GAME_TUNER_OFF"), "channel": "firetuner"}
-        prod = await civ6_tuner.read_production(timeout=8.0)
-        blockers = await civ6_tuner.read_blockers(timeout=8.0)
-        units = await civ6_tuner.units_blocker_status(timeout=8.0)
+                    "is_error": True, "error": sit.get("error", "GAME_TUNER_OFF"),
+                    "channel": "firetuner", "partial": True}
+        prod = await read_step("生产", civ6_tuner.read_production)
+        blockers = await read_step("结束回合 blocker", civ6_tuner.read_blockers)
+        units = await read_step("单位", civ6_tuner.units_blocker_status)
+        failed_reads.extend(
+            label for label, result in (("生产", prod), ("结束回合 blocker", blockers), ("单位", units))
+            if not result.get("ok") and label not in failed_reads
+        )
         lines = [f"回合 {sit.get('turn', '?')}（FireTuner 实时）"]
         civ = str(sit.get("civ") or "")
         tech = str(sit.get("tech") or "")
@@ -426,15 +458,20 @@ class Civ6BuddyPlugin(NekoPluginBase):
             lines.append(f"文明：{civ}")
         if tech:
             lines.append(f"当前研究：{tech}")
-        if prod.get("ok") and prod.get("cities"):
-            for c in prod["cities"]:
-                sz = c.get("size", 0)
-                if sz > 0:
-                    lines.append(f"🏙️ 城市生产：{c.get('current_type') or '#' + str(c.get('hash'))} "
-                                 f"（队列 {sz} 项，剩 {c.get('turns_left')} 回合）")
-                else:
-                    lines.append("🏙️ 城市生产：未选择（需要设置生产才能结束回合）")
-        if blockers.get("ok") and blockers.get("blockers"):
+        if prod.get("ok"):
+            if prod.get("cities"):
+                for c in prod["cities"]:
+                    sz = c.get("size", 0)
+                    if sz > 0:
+                        lines.append(f"🏙️ 城市生产：{c.get('current_type') or '#' + str(c.get('hash'))} "
+                                     f"（队列 {sz} 项，剩 {c.get('turns_left')} 回合）")
+                    else:
+                        lines.append("🏙️ 城市生产：未选择（需要设置生产才能结束回合）")
+        else:
+            lines.append("⚠️ 生产状态读取失败：无法确认城市是否已选择生产")
+        if not blockers.get("ok"):
+            lines.append("⚠️ blocker 读取失败：结束回合条件无法确认，请先重试状态读取")
+        elif blockers.get("blockers"):
             lines.append("需要处理：")
             for blk in blockers["blockers"]:
                 lines.append(f"- {blk['type']}（{blk.get('message', '')}）")
@@ -446,7 +483,9 @@ class Civ6BuddyPlugin(NekoPluginBase):
                              f"（{'、'.join(units['units_with_moves'][:5])}）")
             else:
                 lines.append(f"单位状态：{units.get('total_units', 0)} 个，无待指挥单位")
-        eco = await civ6_tuner.read_economy(timeout=8.0)
+        else:
+            lines.append("⚠️ 单位状态读取失败：无法确认是否有单位待指挥")
+        eco = await read_step("经济", civ6_tuner.read_economy)
         if eco.get("ok"):
             gold = eco.get("gold", -1)
             faith = eco.get("faith", -1)
@@ -458,7 +497,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                          f"{eco.get('builders', 0)}建造者")
             if eco.get("pantheon", -1) < 0 and faith >= 25:
                 lines.append("💡 信仰已达 25：万神殿可选（YUI 会在回合管理中自动局面感知选择）")
-        dip = await civ6_tuner.read_diplomacy(timeout=8.0)
+        dip = await read_step("外交", civ6_tuner.read_diplomacy)
         if dip.get("ok"):
             rel = "、".join(f"{c['name']}({c['state']})" for c in dip.get("civs", [])) or "无"
             lines.append(f"外交：使节 {dip.get('tokens', 0)}｜关系 {rel}")
@@ -467,19 +506,27 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 cs_txt = "、".join(
                     f"{c['name']}(使节{c.get('envoys', 0)},距{c.get('dist', '?')})" for c in cs_list[:3])
                 lines.append(f"城邦：{cs_txt}")
-        cul = await civ6_tuner.read_culture(timeout=8.0)
+        cul = await read_step("文化", civ6_tuner.read_culture)
         if cul.get("ok"):
             lines.append(f"文化：产出 {cul.get('culture_yield', '?')}/回合｜旅游业绩 {cul.get('tourism', '?')}｜"
                          f"巨作 {cul.get('great_works', 0)} 件｜市政 {cul.get('civic', '?')}")
-        return {
+        partial = bool(failed_reads)
+        if partial:
+            lines.append("⚠️ 部分状态未读取：" + "、".join(failed_reads) + "；以上仅为已确认数据")
+        result = {
             "output": "\n".join(lines),
-            "is_error": False,
+            "is_error": timed_out,
             "channel": "firetuner",
             "situation": sit,
             "production": prod,
             "blockers": blockers.get("blockers", []),
+            "blockers_confirmed": bool(blockers.get("ok")),
             "units": units,
+            "partial": partial,
         }
+        if timed_out:
+            result["error"] = "STATUS_TIMEOUT"
+        return result
 
     @llm_tool(
         name="civ6_ops_set_production",
@@ -569,7 +616,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
     )
     async def civ6_ops_peek(self, **_):
         try:
-            r = civ6_ops.peek_window()
+            r = await asyncio.to_thread(civ6_ops.peek_window)
         except Exception as exc:
             return _wrap_err(exc)
         return r
@@ -599,13 +646,14 @@ class Civ6BuddyPlugin(NekoPluginBase):
     )
     async def civ6_ops_takeover(self, **_):
         self._load_config()
-        self._ops_active = True
-        _ops_lock_set()  # 运营锁：steam_manager 等插件见锁让位
         try:
-            sit = civ6_parser.parse_save("", self._saves_dir)
+            sit = await asyncio.to_thread(civ6_parser.parse_save, "", self._saves_dir)
         except civ6_parser.Civ6Error as exc:
             return _wrap_err(exc)
         turn = sit.get("game_turn", 0)
+        # 存档定位与解析成功后才宣告接管，失败路径不会残留运营锁。
+        self._ops_active = True
+        _ops_lock_set()  # 运营锁：steam_manager 等插件见锁让位
         # 接管即运营：内置推进第一回合（Tuner 官方链路优先，屏幕点击兜底）。
         # 历史教训：LLM 可能"先回复用户再调 tick"导致只接管不运营（13:13 复现），
         # 这里接管时直接真实推进一回合，运营必然启动，不依赖 LLM 自觉。
@@ -890,7 +938,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
             if attempt < 2:
                 if attempt == 1:
                     try:
-                        rc = civ6_tuner._right_click_game_window()
+                        rc = await asyncio.to_thread(civ6_tuner._right_click_game_window)
                         logs.append(f"自愈右键解除 modal：{rc}")
                     except Exception as exc:
                         logs.append(f"自愈右键失败：{exc}")
@@ -971,7 +1019,8 @@ class Civ6BuddyPlugin(NekoPluginBase):
             except Exception:
                 pass
             try:
-                return int(civ6_parser.parse_save("", self._saves_dir).get("game_turn", 0))
+                sit = await asyncio.to_thread(civ6_parser.parse_save, "", self._saves_dir)
+                return int(sit.get("game_turn", 0))
             except Exception:
                 return None
 

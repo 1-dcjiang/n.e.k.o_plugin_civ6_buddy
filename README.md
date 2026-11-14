@@ -13,9 +13,13 @@
 | `civ6_parse_save` | 按名字/关键字解析指定存档 → 完整局面 |
 | `civ6_civ_profile` | 查询文明/领袖特性（中英均可，如"刚果"/"Kongo"） |
 | `civ6_advise` | 基于局面给分主题建议（开局/科技/建城/战争/胜利/外交） |
-| `civ6_ops_takeover` | 进入运营托管：运营归 YUI（弹窗/下一回合/精细运营），打仗归你 |
-| `civ6_ops_tick` | 执行一回合运营：Tuner 战争检测（官方 API）→ 清弹窗 → 点下一回合 → 验证回合推进 |
-| `civ6_ops_handoff` | 交还运营控制权 |
+| `civ6_ops_status` | 读取实时回合、研究、生产、结束回合 blocker、单位、经济与外交状态；读取失败会明确标为部分结果 |
+| `civ6_ops_takeover` | 进入运营托管：运营归 YUI（生产/研究/弹窗/下一回合），打仗归你 |
+| `civ6_ops_tick` | 执行一回合或连续运营：处理 blocker → 结束回合 → 验证真实回合推进 |
+| `civ6_ops_set_production` | 通过 FireTuner 官方 API 设置并验证城市生产队列 |
+| `civ6_ops_set_research` | 通过 FireTuner 官方 API 设置科技或市政研究 |
+| `civ6_ops_peek` | 只读抓取游戏窗口画面，不点击、不切换前台窗口 |
+| `civ6_ops_handoff` | 交还运营控制权并清理运营锁 |
 | `civ6_ops_citizens` | 精细运营：读真实城市数据 → 按目标（balanced/growth/production）执行官方焦点分配 |
 | `civ6_ops_focus` | 直接给全城设产出焦点（FOOD/PRODUCTION/GOLD/SCIENCE/CULTURE/FAITH/DEFAULT） |
 | `civ6_tuner_status` | 探测 FireTuner 底层通道（4318）是否可用 |
@@ -38,27 +42,28 @@ FireTuner 是游戏调试端口（默认 4318），可读真实城市数据、�
 
 - `civ6_ensure_sdk(action='check')`：汇总链路状态与缺口；
 - `civ6_ensure_sdk(action='install')`：自动触发 Steam 下载 SDK（玩家在 Steam 弹窗点确认）；
-- `civ6_ensure_sdk(action='fix_tuner')`：自动写 `AppOptions.txt` 启用 Tuner（带备份）。
+- `civ6_ensure_sdk(action='fix_tuner')`：经用户明确要求后备份并修改 `AppOptions.txt` 启用 Tuner；
+  **启用 Tuner 会禁用成就**，修改后需重启游戏。
 
 ## 技术说明
 
 - 存档解析：插件内嵌 [pydt/civ6-save-parser](https://github.com/pydt/civ6-save-parser)（MIT），
   通过 `civ6_save_parser/wrapper.js` 以 JSON 输出，Python 侧整理为中文局面。
 - 依赖：本机 node >= 16（`node -v` 可查）；精细运营额外需要 numpy + Steam SDK。
-- 只读：不修改存档、不写任何游戏文件（Tuner 焦点分配为游戏官方 API 操作）。
+- 默认不修改存档或游戏文件；唯一例外是用户明确执行 `fix_tuner` 时，插件备份并修改
+  `AppOptions.txt`。生产、研究与焦点分配均通过游戏官方 API，不改存档。
 - 存档目录默认 `Documents\My Games\Sid Meier's Civilization VI\Saves`，
   可在运行配置 `[civ6_buddy] saves_dir` 覆盖。
 
 ## 版本
 
-- v0.1.0：首版。5 个工具，局面解析 + 规则化建议模板 + 文明知识库（40+ 文明/领袖中英映射、40 城邦）。
-- v0.2.0：屏幕自动化运营托管（处理弹窗/点下一回合/战争横幅检测交还），复用 steam_manager 键鼠。
+- v0.6.6：当前发布版，完善玩家视角说明与自动化能力。
+- 未发布修复：校验 Lua GameInfo 参数；完整清理 Tuner 残帧；输入注入失败不再误报成功；
+  解析超时终止并回收 Node 进程、清理临时文件；右键前验证游戏窗口已前台；
+  阻塞磁盘/子进程操作移出事件循环；修复托管锁生命周期与 blocker 失败误报；
+  `civ6_ops_status` 使用 25 秒总预算；补齐发布证明权限与工具文档。
+- v0.4.0–v0.6.5：逐步加入 SDK 自动配置、真实局面运营、生产/科研/blocker 处理、
+  FireTuner 回合管理与 Windows/Linux 测试兼容。
 - v0.3.0：FireTuner 底层通道（读城市数据/官方焦点分配），AppOptions EnableTuner 自动配置。
-- v0.4.0：civ6_ensure_sdk 自动装 SDK + 自动修 Tuner 配置 + 4318 探测；战争检测改 Tuner 官方 API；
-  精细运营真实执行（读数据→按目标设焦点）。
-- v0.4.1：复查修复——tick 内 await 替换 asyncio.run（修 N.E.K.O 事件循环崩溃）；SDK 配置写入去重、
-  [Debug] 节去重；战争 Lua 加 pcall 容错；测试补异常路径。
-- v0.4.2：SDK 目录名宽松匹配（实测下载为 "Sid Meier's Civilization VI SDK Assets" 变体）；
-  本机 Tuner 配置已实际写入（AppOptions EnableTuner 1）。
-- v0.4.3：建议逻辑重构为独立模块 civ6_advice（可测）；未知建议主题回退"综合"缺陷修复；
-  Tuner Lua 全部 pcall 加固（API 差异不挂死）；城市数据字段强类型化；新增真实存档集成测试（共 41 例）。
+- v0.2.0：屏幕自动化运营托管（处理弹窗/点下一回合/战争横幅检测交还），复用 steam_manager 键鼠。
+- v0.1.0：首版。5 个工具，局面解析 + 规则化建议模板 + 文明知识库（40+ 文明/领袖中英映射、40 城邦）。

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import struct
 
 _logger = logging.getLogger("N.E.K.O.Plugin_civ6_buddy.civ6_tuner")
@@ -129,15 +130,24 @@ async def _recv(reader: asyncio.StreamReader, timeout: float) -> tuple[int, str]
 
 
 async def _drain(reader: asyncio.StreamReader, timeout: float = 0.2) -> None:
-    """清空未请求消息（握手/命令后残余输出）。"""
+    """按完整帧清空残余输出，绝不能只丢包头而把包体留给下一次读取。"""
     while True:
         try:
-            await asyncio.wait_for(reader.readexactly(HEADER_SIZE), timeout=timeout)
+            header = await asyncio.wait_for(reader.readexactly(HEADER_SIZE), timeout=timeout)
         except asyncio.TimeoutError:
             return
         except (asyncio.IncompleteReadError, ConnectionResetError, ConnectionAbortedError, OSError):
-            # 服务端关闭连接/重置 = 没有更多数据，幂等返回
+            # 服务端关闭连接/重置 = 没有更多数据，幂等返回。
             return
+        length, _tag = struct.unpack(HEADER_FMT, header)
+        if length <= 0 or length > 10_000_000:
+            raise TunerError(f"清理残余输出时发现非法帧长度：{length}")
+        try:
+            await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise TunerError("清理残余输出时帧体超时，连接已不可安全复用") from None
+        except asyncio.IncompleteReadError as exc:
+            raise TunerError("清理残余输出时帧体不完整，连接已不可安全复用") from exc
 
 
 async def _connect(host: str, port: int, timeout: float) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
@@ -659,6 +669,8 @@ async def set_city_production(
     item_name = (item_name or "").strip()
     if not item_name:
         return {"ok": False, "error": "NO_ITEM", "detail": "缺少 item_name（如 UNIT_SCOUT）"}
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", item_name):
+        return {"ok": False, "error": "BAD_ITEM", "detail": "item_name 仅允许大写 GameInfo Type（A-Z、0-9、下划线）"}
 
     lua = f"""
 local me = Game.GetLocalPlayer()
@@ -856,6 +868,8 @@ async def set_research(
     item_name = (item_name or "").strip()
     if not item_name:
         return {"ok": False, "error": "NO_ITEM", "detail": "缺少 item_name（如 TECH_BRONZE_WORKING）"}
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", item_name):
+        return {"ok": False, "error": "BAD_ITEM", "detail": "item_name 仅允许大写 GameInfo Type（A-Z、0-9、下划线）"}
 
     if cat == "tech":
         gi_table, type_field, param, operation, blocking, ok_prefix, has_m, player_m = (
@@ -2860,13 +2874,11 @@ print("CLOSED=" .. tostring(closed) .. "&DISMISSED=" .. tostring(dismissed) .. "
         extra = ""
         # 自然奇观弹窗是 blocking popup：SetHide/LuaEvents 都无法解锁 popup manager，
         # 只有游戏原生右键路径（ScreenConsumer eRClick → OnClose → Close()）有效（实测铁证）。
-        # Lua 无法模拟输入，交 Python 侧用 pyautogui 右键游戏窗口中央。
+        # Lua 无法模拟输入，交 Python 侧用 ctypes 右键游戏窗口中央。
         if nw:
-            import asyncio as _asyncio
-
             try:
-                await _asyncio.sleep(0.5)
-                extra = _right_click_game_window()
+                await asyncio.sleep(0.5)
+                extra = await asyncio.to_thread(_right_click_game_window)
                 # 复查弹窗是否已关闭
                 check = """
 local c = ContextPtr:LookUpControl("/InGame/NaturalWonderPopup")
@@ -2920,63 +2932,59 @@ if c then print("MENU2=" .. tostring(not c:IsHidden())) else print("MENU2=false"
     return {"ok": False, "error": "NO_RESPONSE", "detail": "关闭弹窗无回执（Tuner 输出丢失），请重试"}
 
 
-def _right_click_game_window() -> str:
-    """在游戏窗口中央右键（关闭自然奇观等 blocking popup 的原生路径）。返回结果描述。
+def _right_click_game_window(win32_modules=None, sleep=None) -> str:
+    """确认游戏窗口已在前台后才右键中央；激活失败时绝不点击其他窗口。
 
-    安全铁律：必须先激活游戏窗口再点击——游戏在后台时直接 pyautogui 点击
-    会落到前台窗口（实测会点到 QQ 等无关窗口，可能造成误操作）。"""
+    ``win32_modules`` 与 ``sleep`` 仅供无头测试注入，生产路径始终使用 ctypes 兼容层。
+    """
     import time as _time
 
-    hwnd_rect = None
-    hwnd = None
-    try:
-        import win32gui as _wg
-
-        def _cb(h, _):
-            nonlocal hwnd, hwnd_rect
-            if hwnd is None and _wg.IsWindowVisible(h) and _wg.GetWindowText(h):
-                tl = _wg.GetWindowText(h).lower()
-                if "civilization" in tl or "sid meier" in tl or "文明" in tl:
-                    hwnd = h
-                    hwnd_rect = _wg.GetWindowRect(h)
-        _wg.EnumWindows(_cb, None)
-    except Exception:
-        pass
-    if hwnd_rect is None:
-        # 兜底：pyautogui 找窗口（标题匹配）
+    sleep = sleep or _time.sleep
+    if win32_modules is None:
         try:
-            import pyautogui as _pg
-            wins = _pg.getWindowsWithTitle("Civilization")
-            if not wins:
-                wins = _pg.getWindowsWithTitle("Sid Meier")
-            if not wins:
-                wins = _pg.getWindowsWithTitle("文明")
-            if wins:
-                w = wins[0]
-                hwnd_rect = (w.left, w.top, w.right, w.bottom)
-        except Exception:
-            pass
-    if hwnd_rect is None:
-        return "（未找到游戏窗口，无法右键）"
+            from . import _win32 as w32
+        except ImportError:  # 包外直接加载
+            import _win32 as w32  # type: ignore
+        gui, con, mouse = w32.win32gui, w32.win32con, w32
+    else:
+        gui, con, mouse = win32_modules
+
+    hwnd = None
+    hwnd_rect = None
+
+    def find_game_window(candidate, _param):
+        nonlocal hwnd, hwnd_rect
+        if hwnd is not None or not gui.IsWindowVisible(candidate):
+            return
+        title = gui.GetWindowText(candidate)
+        if title and any(word in title.lower() for word in ("civilization", "sid meier", "文明")):
+            hwnd = candidate
+            hwnd_rect = gui.GetWindowRect(candidate)
+
     try:
-        # 激活游戏窗口（前台锁定/最小化时尽力恢复）
-        if hwnd is not None:
-            try:
-                import win32con as _wc2
-                import win32gui as _wg2
-                _wg2.ShowWindow(hwnd, _wc2.SW_RESTORE)
-                _wg2.SetForegroundWindow(hwnd)
-                _time.sleep(0.6)
-            except Exception:
-                pass
+        gui.EnumWindows(find_game_window, None)
+    except Exception as exc:
+        return f"（枚举游戏窗口失败，未右键：{exc}）"
+    if hwnd is None or hwnd_rect is None:
+        return "（未找到游戏窗口，无法右键）"
+
+    try:
+        gui.ShowWindow(hwnd, con.SW_RESTORE)
+        if not gui.SetForegroundWindow(hwnd):
+            return "（游戏窗口激活失败，已取消右键）"
+        sleep(0.6)
+        if gui.GetForegroundWindow() != hwnd:
+            return "（游戏窗口激活失败，已取消右键）"
+    except Exception as exc:
+        return f"（游戏窗口激活失败，已取消右键：{exc}）"
+
+    try:
         x1, y1, x2, y2 = hwnd_rect
-        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-        import pyautogui as _pg2
-        _pg2.click(cx, cy, button="right")
-        _time.sleep(1.5)
+        mouse.mouse_right_click_abs((x1 + x2) // 2, (y1 + y2) // 2)
+        sleep(1.5)
         return "（已激活游戏窗口并右键中央）"
-    except Exception as e:
-        return f"（右键失败：{e}）"
+    except Exception as exc:
+        return f"（右键失败：{exc}）"
 
 
 async def auto_resolve_soft_blockers(timeout: float = 10.0) -> dict:

@@ -170,10 +170,14 @@ class _Executor:
     def click_abs(self, screen_x: int, screen_y: int):
         if self._sm is not None:
             try:
-                self._sm.mouse_click_abs(screen_x, screen_y)
-                return
+                result = self._sm.mouse_click_abs(screen_x, screen_y)
             except Exception:
-                pass
+                pass  # 通道异常才允许 fallback。
+            else:
+                # False 表示 steam_manager 已处理请求但注入失败；重复点击有副作用。
+                if result is False:
+                    raise OpsError("INPUT_FAILED", "steam_manager 未能注入点击事件，未执行点击")
+                return
         # ctypes 兜底（插件进程无 pyautogui）
         _win32_guard()
         try:
@@ -190,10 +194,16 @@ class _Executor:
             try:
                 vk = _VK_MAP.get(key)
                 if vk is not None:
-                    self._sm.press_key(vk)
-                    return
+                    result = self._sm.press_key(vk)
+                else:
+                    result = None
             except Exception:
-                pass
+                pass  # 通道异常才允许 fallback。
+            else:
+                if vk is not None:
+                    if result is False:
+                        raise OpsError("INPUT_FAILED", f"steam_manager 未能注入按键事件：{key}")
+                    return
         _win32_guard()
         try:
             from ._win32 import press_key as _press

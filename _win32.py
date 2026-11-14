@@ -72,6 +72,8 @@ _user32.keybd_event.restype = None
 
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
 KEYEVENTF_KEYUP = 0x0002
 
 
@@ -98,6 +100,14 @@ def mouse_click_abs(screen_x: int, screen_y: int) -> None:
     _user32.SetCursorPos(int(screen_x), int(screen_y))
     _user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, None)
     _user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, None)
+
+
+def mouse_right_click_abs(screen_x: int, screen_y: int) -> None:
+    """绝对坐标右键单击；调用方必须先确认目标窗口处于前台。"""
+    if not _user32.SetCursorPos(int(screen_x), int(screen_y)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    _user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, None)
+    _user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, None)
 
 
 def press_key(vk: int) -> None:
