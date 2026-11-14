@@ -225,7 +225,7 @@ def test_takeover_parse_failure_does_not_leave_ops_lock(monkeypatch):
     monkeypatch.setattr(_main, "_ops_lock_set", lambda: lock_calls.append("set"))
     monkeypatch.setattr(_main, "_ops_lock_clear", lambda: lock_calls.append("clear"))
 
-    def fail_parse(*_args):
+    def fail_parse(*_args, **_kwargs):
         raise _main.civ6_parser.Civ6Error("NO_SAVES", "test")
 
     monkeypatch.setattr(_main.civ6_parser, "parse_save", fail_parse)
@@ -320,3 +320,188 @@ def test_list_saves_disk_io_runs_off_event_loop(monkeypatch):
     result = asyncio.run(plugin.civ6_list_saves())
     assert result["saves"] == []
     assert worker_threads and worker_threads[0] != main_thread
+
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "implementation_name"),
+    [
+        ("civ6_ops_takeover", "_civ6_ops_takeover_impl"),
+        ("civ6_ops_tick", "_civ6_ops_tick_impl"),
+    ],
+)
+def test_tool_cancellation_clears_ops_state(monkeypatch, tool_name, implementation_name):
+    plugin = _bare_plugin()
+    plugin._ops_active = True
+    cleared = []
+    monkeypatch.setattr(_main, "_ops_lock_clear", lambda: cleared.append(True))
+
+    async def blocked(_self, **_kwargs):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(_main.Civ6BuddyPlugin, implementation_name, blocked, raising=False)
+
+    async def scenario():
+        task = asyncio.create_task(getattr(plugin, tool_name)())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert plugin._ops_active is False
+    assert cleared == [True]
+
+
+def test_tick_zero_budget_returns_before_any_game_call(monkeypatch):
+    plugin = _bare_plugin()
+    plugin._ops_active = True
+    monkeypatch.setattr(_main, "_OPS_TICK_BUDGET", 0.0, raising=False)
+    monkeypatch.setattr(_main, "_ops_lock_clear", lambda: None)
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("预算耗尽后不得读取或操作游戏")
+
+    monkeypatch.setattr(_main.civ6_tuner, "tuner_status", forbidden)
+    result = asyncio.run(plugin.civ6_ops_tick(loop_turns=50))
+    assert result["error"] == "OPS_TIMEOUT"
+    assert result["handoff"] is True
+    assert result["turns_done"] == 0
+    assert plugin._ops_active is False
+
+
+def test_screen_turn_expires_before_window_or_input():
+    import time
+
+    with pytest.raises(_ops.OpsError) as exc_info:
+        _ops.run_one_turn_ops({}, deadline=time.monotonic() - 1)
+    assert exc_info.value.code == "OPS_TIMEOUT"
+
+
+@pytest.mark.parametrize("bad_turns", ["not-a-number", None, [], {}])
+def test_tick_zero_budget_handles_invalid_turn_count(monkeypatch, bad_turns):
+    plugin = _bare_plugin()
+    plugin._ops_active = True
+    monkeypatch.setattr(_main, "_OPS_TICK_BUDGET", 0.0)
+    monkeypatch.setattr(_main, "_ops_lock_clear", lambda: None)
+    result = asyncio.run(plugin.civ6_ops_tick(loop_turns=bad_turns))
+    assert result["error"] == "OPS_TIMEOUT"
+    assert "已完成 0/1 回合" in result["output"]
+
+
+def test_screen_turn_stops_before_input_when_cancelled():
+    class Cancelled:
+        @staticmethod
+        def is_set():
+            return True
+
+    def forbidden_window():
+        raise AssertionError("取消后不得定位或操作游戏窗口")
+
+    original = _ops._find_window
+    _ops._find_window = forbidden_window
+    try:
+        with pytest.raises(_ops.OpsError) as exc_info:
+            _ops.run_one_turn_ops({}, cancel_event=Cancelled())
+    finally:
+        _ops._find_window = original
+    assert exc_info.value.code == "OPS_CANCELLED"
+
+
+def test_tick_cancellation_signals_screen_worker(monkeypatch):
+    plugin = _bare_plugin()
+    plugin._ops_active = True
+    monkeypatch.setattr(_main, "_ops_lock_clear", lambda: None)
+    monkeypatch.setattr(_main, "_ops_lock_set", lambda: None)
+
+    async def tuner_off():
+        return {"ok": False}
+
+    async def no_war():
+        return {"ok": False}
+
+    async def no_turn(**_kwargs):
+        return {"ok": False}
+
+    monkeypatch.setattr(_main.civ6_tuner, "tuner_status", tuner_off)
+    monkeypatch.setattr(_main.civ6_tuner, "at_war", no_war)
+    monkeypatch.setattr(_main.civ6_tuner, "read_situation", no_turn)
+    monkeypatch.setattr(_main.civ6_parser, "parse_save", lambda *_args, **_kwargs: {"game_turn": 1})
+    started = threading.Event()
+    stopped = threading.Event()
+
+    def screen_turn(*_args, cancel_event=None, **_kwargs):
+        import time
+
+        started.set()
+        assert cancel_event is not None
+        wait_deadline = time.monotonic() + 2
+        while not cancel_event.is_set() and time.monotonic() < wait_deadline:
+            time.sleep(0.01)
+        assert cancel_event.is_set(), "宿主取消必须通知屏幕工作线程"
+        stopped.set()
+        raise _ops.OpsError("OPS_CANCELLED", "cancelled")
+
+    monkeypatch.setattr(_main.civ6_ops, "run_one_turn_ops", screen_turn)
+
+    async def scenario():
+        task = asyncio.create_task(plugin.civ6_ops_tick())
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(stopped.wait, 1)
+
+    asyncio.run(scenario())
+    assert plugin._ops_active is False
+
+
+def test_parser_bundle_does_not_run_upstream_cli():
+    import os
+    import shutil
+
+    node = shutil.which("node.exe" if os.name == "nt" else "node")
+    if node is None:
+        pytest.skip("本机没有可直接执行的 node，跳过打包入口集成测试")
+    result = subprocess.run(
+        [node, str(_parser._WRAPPER)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert result.returncode == 2
+    assert result.stdout == "", "bundle 不得执行上游 util.inspect CLI 或污染 JSON 输出"
+    assert "usage: node wrapper.js" in result.stderr
+
+
+def test_handshake_cancellation_closes_writer(monkeypatch):
+    protocol = importlib.import_module("civ6_tuner_protocol")
+
+    class Writer:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    writer = Writer()
+
+    async def connected(*_args):
+        return object(), writer
+
+    async def blocked_drain(*_args, **_kwargs):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(protocol, "_connect", connected)
+    monkeypatch.setattr(protocol, "_drain", blocked_drain)
+
+    async def scenario():
+        task = asyncio.create_task(protocol.handshake())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert writer.closed is True

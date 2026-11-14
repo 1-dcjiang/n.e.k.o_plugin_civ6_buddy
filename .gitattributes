@@ -1,0 +1,2 @@
+# 生成文件保留 esbuild 输出与上游注释；其他源码仍检查行尾空白。
+civ6_save_parser/parser.bundle.js text eol=lf whitespace=-trailing-space

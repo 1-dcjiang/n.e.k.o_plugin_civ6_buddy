@@ -24,9 +24,9 @@ DEFAULT_SAVES_DIR = os.path.join(
     os.path.expanduser("~"), "Documents", "My Games", "Sid Meier's Civilization VI", "Saves"
 )
 
-# 插件内嵌解析器位置（相对本文件）
+# 插件内嵌解析器位置（相对本文件）。运行时只依赖 Node，不需要 node_modules。
 _PARSER_DIR = Path(__file__).resolve().parent / "civ6_save_parser"
-_WRAPPER = _PARSER_DIR / "wrapper.js"
+_WRAPPER = _PARSER_DIR / "parser.bundle.js"
 
 _PARSE_TIMEOUT = 60.0  # 解析单存档最长等待（秒）
 
@@ -93,10 +93,10 @@ def find_save(target: str = "", saves_dir: str = "") -> dict:
     raise Civ6Error("SAVE_NOT_FOUND", f"未找到匹配的存档「{t}」。可用存档：\n" + "\n".join(f"- {s['rel']}（{s['mtime_text']}）" for s in saves[:15]))
 
 
-def parse_save(target: str = "", saves_dir: str = "") -> dict:
-    """定位并解析存档，返回整理后的局面 dict。"""
+def parse_save(target: str = "", saves_dir: str = "", timeout: float | None = None) -> dict:
+    """定位并解析存档；``timeout`` 可覆盖单次 Node 解析预算。"""
     found = find_save(target, saves_dir)
-    raw = _run_parser(found["path"])
+    raw = _run_parser(found["path"], timeout=timeout)
     return _build_situation(raw, found)
 
 
@@ -112,7 +112,7 @@ def self_check(saves_dir: str = "") -> dict:
     return {"status": "ok", "saves_dir": _resolve_saves_dir(saves_dir)}
 
 
-def _run_parser(save_path: str) -> dict:
+def _run_parser(save_path: str, timeout: float | None = None) -> dict:
     """调用 node wrapper 解析存档 → 原始 JSON dict。
 
     实现说明（v0.4.8）：插件进程在打包环境（resources\\bin）下偶发 stdout=None，
@@ -123,6 +123,7 @@ def _run_parser(save_path: str) -> dict:
         raise Civ6Error("PARSER_MISSING", f"插件内嵌解析器缺失：{_WRAPPER}")
     import tempfile
 
+    parse_timeout = _PARSE_TIMEOUT if timeout is None else max(0.1, float(timeout))
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=".civ6parse.json", prefix="civ6_")
@@ -138,13 +139,13 @@ def _run_parser(save_path: str) -> dict:
             except FileNotFoundError:
                 raise Civ6Error("NODE_MISSING", "未找到 node。请先安装 Node.js（>=16）后重启插件。") from None
             try:
-                _, err_text = proc.communicate(timeout=_PARSE_TIMEOUT)
+                _, err_text = proc.communicate(timeout=parse_timeout)
             except subprocess.TimeoutExpired:
                 # 超时的子进程仍持有输出文件；先终止并回收，再统一清理临时文件。
                 proc.kill()
                 _, err_text = proc.communicate()
                 raise Civ6Error(
-                    "PARSE_TIMEOUT", f"解析存档超时（>{int(_PARSE_TIMEOUT)}s）：{save_path}"
+                    "PARSE_TIMEOUT", f"解析存档超时（>{parse_timeout:g}s）：{save_path}"
                 ) from None
         if proc.returncode != 0:
             err = (err_text or "").strip() or f"exit {proc.returncode}"

@@ -532,7 +532,9 @@ def _banner_war_present(screen) -> bool:
     return bool(red_mask.sum() > top.shape[0] * top.shape[1] * 0.01)
 
 
-def _template_click_if_found(screen, win: dict, name: str) -> bool:
+def _template_click_if_found(
+    screen, win: dict, name: str, deadline: float | None = None, cancel_event=None,
+) -> bool:
     """尝试用模板点击按钮。模板缺失/未匹配 → 返回 False（调用方兜底）。"""
     path = _template_path(name)
     if not path.is_file():
@@ -542,6 +544,8 @@ def _template_click_if_found(screen, win: dict, name: str) -> bool:
     hit = _match_template(screen, tpl)
     if hit is None:
         return False
+    # 模板匹配可能耗时；命中后也必须在真实点击前复查取消与预算。
+    _check_deadline(deadline, cancel_event)
     fx = hit[0] / max(win["right"] - win["left"], 1)
     fy = hit[1] / max(win["bottom"] - win["top"], 1)
     _click_rel(win, fx, fy)
@@ -594,31 +598,56 @@ def _research_panel_open(screen: np.ndarray) -> bool:
     return float((gray < 100).mean()) > 0.60
 
 
-def _pick_first_research(win: dict) -> None:
+def _check_deadline(deadline: float | None, cancel_event=None) -> None:
+    """在每次真实输入前检查取消和预算；停止后绝不继续点击。"""
+    if cancel_event is not None and cancel_event.is_set():
+        raise OpsError("OPS_CANCELLED", "屏幕运营已被用户取消，停止后续输入")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise OpsError("OPS_TIMEOUT", "屏幕运营时间预算已耗尽，停止后续输入")
+
+
+def _sleep_with_deadline(seconds: float, deadline: float | None, cancel_event=None) -> None:
+    if deadline is None:
+        time.sleep(seconds)
+        _check_deadline(deadline, cancel_event)
+        return
+    remaining = deadline - time.monotonic()
+    _check_deadline(deadline, cancel_event)
+    time.sleep(min(seconds, max(0.0, remaining)))
+    _check_deadline(deadline, cancel_event)
+
+
+def _pick_first_research(win: dict, deadline: float | None = None, cancel_event=None) -> None:
     """选择左侧科技面板第一个科技（采矿业位置）并点右下按钮开始研究。"""
+    _check_deadline(deadline, cancel_event)
     _click_rel(win, _RESEARCH_FIRST_ITEM[0], _RESEARCH_FIRST_ITEM[1], delay=0.5)
-    time.sleep(0.6)
+    _sleep_with_deadline(0.6, deadline, cancel_event)
     btn = _DEFAULT_BUTTONS["next_turn"]
+    _check_deadline(deadline, cancel_event)
     _click_rel(win, float(btn[0]), float(btn[1]), delay=0.5)
 
 
-def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
+def run_one_turn_ops(
+    cfg: dict, war_state: bool | None = None, deadline: float | None = None, cancel_event=None,
+) -> dict:
     """执行一回合推荐制运营。返回结构化结果（供上层如实汇报）。
 
     cfg: {"saves_dir": str, "buttons": {...}} 按钮可用 config 覆盖。
     war_state: 调用方（asyncio 上下文）先经 Tuner 官方 API 测得的战争状态：
       True=战争中（立即交还，不点下一回合）；None=未测得（回退像素横幅检测）；
       False=确认非战争。
-    流程：找窗口 → 前置 → 截图 → 战争判断 → 先选科技（趁面板在，ESC 会吞掉它）
-    → ESC 清扫残留/弹窗 → 点下一回合 → 验证结算。
+    deadline: ``time.monotonic()`` 总预算终点；每次真实输入前都检查。
+    流程：找窗口 → 前置 → 截图 → 战争判断 → 先选科技 → 清弹窗 → 下一回合 → 验证结算。
     生产/市政推荐按钮通过模板资产尝试（assets/*.png），缺失则跳过并如实标注。
     战争判断命中 → 停止并交还（不点下一回合）。结算后战争复检由调用方再做一次 Tuner 查询。
     """
+    _check_deadline(deadline, cancel_event)
     win = _find_window()
     win = _front_and_size(win)
     log: list[str] = [f"窗口已定位并前置（执行通道：{_EXEC.channel}）"]
 
     # 1) 初始截图
+    _check_deadline(deadline, cancel_event)
     screen = _shot(win)
 
     # 2) 战争判断（Tuner 结果优先；未测得时像素横幅兜底）→ 交还
@@ -635,7 +664,7 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
 
     # 3) 开局/研究完成需选科技：左侧"选择研究"面板 → 自动选第一个科技
     if _research_panel_open(screen):
-        _pick_first_research(win)
+        _pick_first_research(win, deadline, cancel_event)
         log.append("检测到'选择研究'面板，已自动选择第一个科技（采矿业）")
         screen = _shot(win)
 
@@ -654,6 +683,7 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
     for i in range(3):
         if not _detect_popup_blocking(screen):
             break
+        _check_deadline(deadline, cancel_event)
         btn = cfg.get("buttons", {}).get("next_turn") or _DEFAULT_BUTTONS["next_turn"]
         _click_rel(win, float(btn[0]), float(btn[1]), delay=0.4)
         screen = _shot(win)
@@ -666,8 +696,12 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
         }
 
     # 4) 点"下一回合"（模板优先，兜底用默认相对坐标）
-    clicked = _template_click_if_found(screen, win, "next_turn")
+    _check_deadline(deadline, cancel_event)
+    clicked = _template_click_if_found(
+        screen, win, "next_turn", deadline=deadline, cancel_event=cancel_event,
+    )
     if not clicked:
+        _check_deadline(deadline, cancel_event)
         btn = cfg.get("buttons", {}).get("next_turn") or _DEFAULT_BUTTONS["next_turn"]
         _click_rel(win, float(btn[0]), float(btn[1]), delay=0.4)
         log.append("下一回合：未匹配到模板，使用默认相对坐标点击")
@@ -675,7 +709,7 @@ def run_one_turn_ops(cfg: dict, war_state: bool | None = None) -> dict:
         log.append("下一回合：模板匹配点击")
 
     # 5) 等待 AI 结算 + 像素战争复检（Tuner 复检由调用方在返回后执行）
-    time.sleep(2.5)
+    _sleep_with_deadline(2.5, deadline, cancel_event)
     screen2 = _shot(win)
     if _banner_war_present(screen2):
         log.append("结算后像素横幅检测：疑似战争横幅")

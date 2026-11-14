@@ -288,7 +288,8 @@ module.exports.deleteChunk = (chunks, toDelete) => {
   _.pull(chunks, toDelete.chunk);
 };
 
-if (!module.parent) {
+// Use the Node entry-point check: !module.parent is also true inside bundled CommonJS wrappers.
+if (require.main === module) {
   const argv = require('minimist')(process.argv.slice(2));
 
   if (!argv._.length) {

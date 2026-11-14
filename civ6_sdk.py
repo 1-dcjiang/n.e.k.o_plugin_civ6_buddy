@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -46,14 +47,68 @@ def _user_docs() -> Path:
     return Path(os.path.expanduser("~")) / "Documents"
 
 
+def _vdf_unescape(value: str) -> str:
+    """解码 VDF 字符串常见转义；未知转义保持原样，不破坏普通路径。"""
+    escapes = {"\\": "\\", '"': '"', "n": "\n", "r": "\r", "t": "\t"}
+    return re.sub(r"\\(.)", lambda m: escapes.get(m.group(1), m.group(0)), value)
+
+
+def _libraryfolders_paths(vdf_path: Path) -> list[str]:
+    """读取现代 ``path`` 字段及旧版数字键库路径；单个坏文件不影响其他库。"""
+    try:
+        text = vdf_path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        _logger.warning("无法读取 Steam 库配置 %s：%s", vdf_path, exc)
+        return []
+    pair_pattern = re.compile(
+        r'"((?:\\.|[^"\\])*)"[ \t]*(?:\r?\n[ \t]*)?"((?:\\.|[^"\\])*)"'
+    )
+    paths: list[str] = []
+    for raw_key, raw_value in pair_pattern.findall(text):
+        value = _vdf_unescape(raw_value)
+        is_path = raw_key.lower() == "path"
+        is_legacy_path = raw_key.isdigit() and (
+            value.startswith(("/", "\\\\")) or ":\\" in value or ":/" in value
+        )
+        if (is_path or is_legacy_path) and value.strip():
+            paths.append(value.strip())
+    return paths
+
+
+def _steam_libraries_from_roots(roots: list[str]) -> list[str]:
+    """从 Steam 根目录及其 libraryfolders.vdf 收集、校验并去重库目录。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    pending = [str(root) for root in roots]
+    index = 0
+    while index < len(pending):
+        raw = pending[index]
+        index += 1
+        root = Path(raw).expanduser()
+        try:
+            if not root.is_dir() or not (root / "steamapps").is_dir():
+                continue
+            normalized = os.path.normpath(str(root))
+            key = os.path.normcase(normalized)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(normalized)
+            # 只展开注册表/固定候选根目录的配置，避免 VDF 循环引用造成递归。
+            if raw in [str(item) for item in roots]:
+                pending.extend(_libraryfolders_paths(root / "steamapps" / "libraryfolders.vdf"))
+        except OSError as exc:
+            _logger.warning("无法检查 Steam 库 %s：%s", root, exc)
+    return out
+
+
 def candidate_steam_libs() -> list[str]:
     """候选 Steam 库根目录（含 steamapps 的父目录）。
 
-    来源：① 注册表 SteamPath 安装目录；② 常用库盘符路径。
-    返回去重、存在的目录列表。
+    来源：注册表、常用库盘符，以及每个候选根目录的 ``libraryfolders.vdf``。
+    返回已存在且含 steamapps 的去重目录列表。
     """
-    libs: list[str] = []
-    # 1) 注册表：HKCU/HKLM Software\Valve\Steam SteamPath
+    roots: list[str] = []
     for hive in ("HKCU", "HKLM"):
         try:
             import winreg
@@ -62,24 +117,14 @@ def candidate_steam_libs() -> list[str]:
                                 r"Software\Valve\Steam") as key:
                 path, _ = winreg.QueryValueEx(key, "SteamPath")
                 if path:
-                    libs.append(str(path))
+                    roots.append(str(path))
         except Exception:
             continue
-    # 2) 常用位置（覆盖多库盘）
-    for root in ("D:\\SteamLibrary", "C:\\Program Files (x86)\\Steam",
-                 "E:\\SteamLibrary", "F:\\SteamLibrary", "G:\\SteamLibrary"):
-        p = Path(root)
-        if p.is_dir() and (p / "steamapps").is_dir():
-            libs.append(str(p))
-    seen: set[str] = set()
-    out: list[str] = []
-    for lib in libs:
-        key = lib.rstrip("\\/").lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(lib.rstrip("\\/"))
-    return out
+    roots.extend((
+        "D:\\SteamLibrary", "C:\\Program Files (x86)\\Steam",
+        "E:\\SteamLibrary", "F:\\SteamLibrary", "G:\\SteamLibrary",
+    ))
+    return _steam_libraries_from_roots(roots)
 
 
 def sdk_dir(steam_libs: list[str] | None = None) -> str | None:

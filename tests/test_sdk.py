@@ -107,3 +107,60 @@ def test_sdk_dir_skips_empty_dir(tmp_path):
     sdk = lib / "steamapps" / "common" / "Sid Meier's Civilization VI SDK"
     sdk.mkdir(parents=True)
     assert _sdk.sdk_dir(steam_libs=[str(lib)]) is None
+
+
+def _library(root, name):
+    library = root / name
+    (library / "steamapps" / "common").mkdir(parents=True)
+    return library
+
+
+def _vdf_path(path):
+    return str(path).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def test_libraryfolders_discovers_modern_and_legacy_libraries(tmp_path):
+    main = _library(tmp_path, "Steam")
+    extra = _library(tmp_path, "Additional Library")
+    legacy = _library(tmp_path, "Legacy Library")
+    vdf = main / "steamapps" / "libraryfolders.vdf"
+    vdf.write_text(
+        '"libraryfolders"\n{\n'
+        '  "0" { "path" "' + _vdf_path(main) + '" }\n'
+        '  "1" { "path" "' + _vdf_path(extra) + '" "apps" { "597260" "123" } }\n'
+        '  "2" "' + _vdf_path(legacy) + '"\n'
+        '  "3" { "path" "' + _vdf_path(extra) + '" }\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    libs = _sdk._steam_libraries_from_roots([str(main)])
+    assert libs == [str(main), str(extra), str(legacy)]
+
+
+def test_libraryfolders_ignores_bad_or_missing_files(tmp_path):
+    main = _library(tmp_path, "Steam")
+    missing = _sdk._steam_libraries_from_roots([str(main)])
+    assert missing == [str(main)]
+    vdf = main / "steamapps" / "libraryfolders.vdf"
+    vdf.write_bytes(b"\xff\xfe\xff")
+    assert _sdk._steam_libraries_from_roots([str(main)]) == [str(main)]
+    missing_root = tmp_path / "does-not-exist"
+    vdf.write_text('"libraryfolders" { "1" { "path" "' + _vdf_path(missing_root) + '" } }')
+    assert _sdk._steam_libraries_from_roots([str(main), str(main)]) == [str(main)]
+
+
+def test_game_and_sdk_are_found_in_additional_library(tmp_path):
+    main = _library(tmp_path, "Steam")
+    extra = _library(tmp_path, "Games")
+    sdk = extra / "steamapps" / "common" / "Sid Meier's Civilization VI SDK Assets"
+    sdk.mkdir()
+    (sdk / "FireTuner").mkdir()
+    game = extra / "steamapps" / "common" / "Sid Meier's Civilization VI"
+    game.mkdir()
+    (main / "steamapps" / "libraryfolders.vdf").write_text(
+        '"libraryfolders" { "1" { "path" "' + _vdf_path(extra) + '" } }',
+        encoding="utf-8",
+    )
+    libs = _sdk._steam_libraries_from_roots([str(main)])
+    assert _sdk.sdk_dir(libs) == str(sdk)
+    assert _sdk.game_dir(libs) == str(game)
