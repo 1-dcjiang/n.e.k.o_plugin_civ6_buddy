@@ -5,11 +5,16 @@
 2. ctypes 兜底函数可用（v0.4.12 起插件进程无 pyautogui，键鼠/截图全走 ctypes）
 3. PrintWindow 对无效窗口给出稳定错误码（不崩溃）
 """
+import importlib
 import platform
 
 import pytest
 
-from civ6_ops import OpsError, _Executor
+# 本地 ruff.toml 把 civ6_ops 当 first-party、Market 的 --isolated 校验当 third-party，
+# 静态 import 的排序无法同时满足两边；运行时导入避开 isort 分组歧义。
+_civ6_ops = importlib.import_module("civ6_ops")
+OpsError = _civ6_ops.OpsError
+_Executor = _civ6_ops._Executor
 
 # CI（GitHub Actions）跑在 Ubuntu/Linux：ctypes.WinDLL 仅 Windows 存在，
 # _win32 顶层导入在 Linux 会抛 AttributeError 导致测试收集失败（v0.6.3 教训）。

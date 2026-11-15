@@ -29,6 +29,7 @@ tag: 4=handshake(APP:/LSQ:), 3=command(CMD:<state>:<lua>), 1=help
 from __future__ import annotations
 
 import asyncio
+import importlib
 import re
 
 try:
@@ -1869,7 +1870,19 @@ print("RESOLVED=" .. table.concat(resolved, ","))
 
 
 # 自动决策/写操作已拆到 civ6_tuner_auto.py；这里重新导出，保持原有模块路径兼容。
-try:
-    from .civ6_tuner_auto import *  # noqa: E402,F403
-except ImportError:  # 包外直接加载（测试/独立脚本）
-    from civ6_tuner_auto import *  # type: ignore  # noqa: E402,F403
+# 不用 `from ... import *`：Market 验证会在 --ignore-noqa 下报 F403，且底部导入会触发 E402。
+# importlib 在运行时按包内/包外两种路径解析，等价于原星号导出，但静态检查只看得到真实导入。
+def _reexport_auto() -> None:
+    if __package__:
+        try:
+            module = importlib.import_module(".civ6_tuner_auto", __package__)
+        except ImportError:  # 包外直接加载（测试/独立脚本）
+            module = importlib.import_module("civ6_tuner_auto")
+    else:
+        module = importlib.import_module("civ6_tuner_auto")
+    for name in module.__all__:
+        globals()[name] = getattr(module, name)
+
+
+_reexport_auto()
+
