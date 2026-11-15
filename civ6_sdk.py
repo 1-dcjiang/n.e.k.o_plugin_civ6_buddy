@@ -222,9 +222,26 @@ def ensure_tuner_enabled(p: Path | None = None) -> dict:
         return {"changed": True, "backup": None, "path": str(ap),
                 "detail": "AppOptions.txt 不存在，已创建并启用 Tuner"}
 
-    text = raw.decode("utf-8-sig")
+    # AppOptions.txt 可能被旧版游戏/编辑器写成 ANSI/CP1252，不能只假定 UTF-8。
+    # 探测失败时按原编码往返，避免为了改一行 EnableTuner 把整份配置写成乱码。
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        little = raw.startswith(b"\xff\xfe")
+        bom = b"\xff\xfe" if little else b"\xfe\xff"
+        codec = "utf-16-le" if little else "utf-16-be"
+        text = raw[len(bom):].decode(codec)
+    else:
+        bom = b"\xef\xbb\xbf" if raw.startswith(b"\xef\xbb\xbf") else b""
+        try:
+            text = raw.decode("utf-8-sig")
+            codec = "utf-8"
+        except UnicodeDecodeError:
+            try:
+                text = raw.decode("cp1252")
+                codec = "cp1252"
+            except UnicodeDecodeError:
+                text = raw.decode("latin-1")
+                codec = "latin-1"
     newline = "\r\n" if "\r\n" in text else "\n"
-    bom = b"\xef\xbb\xbf" if raw.startswith(b"\xef\xbb\xbf") else b""
     lines = text.splitlines(keepends=True)
     section = ""
     debug_start = debug_end = -1
@@ -265,7 +282,9 @@ def ensure_tuner_enabled(p: Path | None = None) -> dict:
     ap.parent.mkdir(parents=True, exist_ok=True)
     backup = str(ap) + f".bak_{time.strftime('%Y%m%d_%H%M%S')}"
     Path(backup).write_bytes(raw)
-    _atomic_write_bytes(ap, bom + "".join(lines).encode("utf-8"))
+    _atomic_write_bytes(ap, bom + "".join(lines).encode(codec))
+    if codec != "utf-8":
+        detail += f"（检测到非 UTF-8 内容，按 {codec} 原编码写回）"
     return {"changed": True, "backup": backup, "path": str(ap), "detail": detail}
 
 

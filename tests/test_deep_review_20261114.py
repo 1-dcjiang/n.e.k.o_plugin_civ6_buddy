@@ -42,6 +42,8 @@ def _bare_plugin():
     plugin._ops_tick_lock = asyncio.Lock()
     plugin._ops_stop_event = asyncio.Event()
     plugin._ops_screen_cancel = None
+    plugin._ops_screen_thread = None
+    plugin._ops_cleanup_lock = asyncio.Lock()
 
     async def cleanup():
         return {"ok": True, "registered": False}
@@ -231,10 +233,22 @@ def test_production_wrong_hash_never_reports_success_and_never_rewrites(monkeypa
     assert len(calls) == 4
 
 
-def test_auto_production_stops_after_safe_quotas(monkeypatch):
+def test_auto_production_quota_scales_with_cities(monkeypatch):
     async def economy(timeout=0):
         return {"ok": True, "population": 8, "cities": 2, "scouts": 2,
                 "builders": 2, "warriors": 1, "districts": 0}
+
+    monkeypatch.setattr(_tuner, "read_economy", economy)
+    result = asyncio.run(_tuner.auto_decide_production())
+    assert result["ok"] is True
+    assert result["item"] == "UNIT_SCOUT"  # 2 城目标 3 侦察，不再按旧“各 2 就停”交还
+    assert "3" in result["reason"]
+
+
+def test_auto_production_stops_after_extended_quotas(monkeypatch):
+    async def economy(timeout=0):
+        return {"ok": True, "population": 8, "cities": 2, "scouts": 4,
+                "builders": 6, "warriors": 2, "districts": 0}
 
     monkeypatch.setattr(_tuner, "read_economy", economy)
     result = asyncio.run(_tuner.auto_decide_production())
@@ -264,16 +278,88 @@ def test_threat_logic_uses_unit_owner_war_and_combat_not_plot_owner(monkeypatch)
         assert "p:GetOwner()" not in lua
 
 
-def test_policy_uses_dense_picked_count(monkeypatch):
-    def respond(_code):
-        return ["FILLED=1&SLOTS=POLICY_URBAN_PLANNING"]
+def test_policy_uses_dense_picked_count_and_reads_back(monkeypatch):
+    def respond(code):
+        if "RequestPolicyChanges" in code:
+            return ["REQUESTED=1&SLOTS=POLICY_URBAN_PLANNING"]
+        return ["POLICY|done=1|failed=0"]
 
     calls, _writer = _fake_tuner_io(monkeypatch, respond)
     result = asyncio.run(_tuner.auto_fill_policy_slots())
     assert result["filled"] == 1
+    assert result["verified"] is True
     lua = calls[0]["code"]
     assert "if #picked > 0 then" in lua
     assert "if #addList > 0" not in lua
+    assert "GetSlotPolicy" in calls[-1]["code"]
+    assert "local want_count = 1" in calls[-1]["code"]
+
+
+def test_policy_reports_silent_failure_when_readback_does_not_match(monkeypatch):
+    def respond(code):
+        if "RequestPolicyChanges" in code:
+            return ["REQUESTED=1&SLOTS=POLICY_URBAN_PLANNING"]
+        return ["POLICY|done=0|failed=1"]
+
+    _calls, _writer = _fake_tuner_io(monkeypatch, respond)
+    monkeypatch.setattr(_tuner.asyncio, "sleep", _no_sleep)
+    result = asyncio.run(_tuner.auto_fill_policy_slots())
+    assert result["ok"] is False
+    assert result["error"] == "SILENT_FAILURE"
+
+
+def test_research_reads_back_before_reporting_success(monkeypatch):
+    def respond(code):
+        if "RequestPlayerOperation" in code:
+            return ["OK:RESEARCHING|TECH_POTTERY|idx=4|cleared=false"]
+        return ["VERIFY|current=4|want=4"]
+
+    calls, _writer = _fake_tuner_io(monkeypatch, respond)
+    result = asyncio.run(_tuner.set_research("tech", "TECH_POTTERY"))
+    assert result["ok"] is True, result
+    assert result["verified"] is True
+    assert "GetResearchingTech" in calls[-1]["code"]
+    assert calls[0]["code"].count("RequestPlayerOperation") == 1
+
+
+def test_research_silent_failure_does_not_pick_again(monkeypatch):
+    def respond(code):
+        if "RequestPlayerOperation" in code:
+            return ["OK:RESEARCHING|TECH_POTTERY|idx=4|cleared=false"]
+        return ["VERIFY|current=3|want=4"]
+
+    calls, _writer = _fake_tuner_io(monkeypatch, respond)
+    monkeypatch.setattr(_tuner.asyncio, "sleep", _no_sleep)
+    result = asyncio.run(_tuner.set_research("tech", "TECH_POTTERY", timeout=3.0))
+    assert result["ok"] is False
+    assert result["error"] == "SILENT_FAILURE"
+    assert all("RequestPlayerOperation" not in call["code"] for call in calls[1:])
+
+
+def test_governor_reads_back_appointment(monkeypatch):
+    def respond(code):
+        if "APPOINT_GOVERNOR" in code:
+            return ["RESULT|GOVERNOR_TYPE|测试总督|首都"]
+        return ["GOV|found=true"]
+
+    calls, _writer = _fake_tuner_io(monkeypatch, respond)
+    result = asyncio.run(_tuner.auto_appoint_governor())
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert "GetGovernorsAppointed" in calls[-1]["code"]
+
+
+def test_commemoration_reads_back_count_change(monkeypatch):
+    def respond(code):
+        if "COMMEMORATE" in code:
+            return ["RESULT|COMMEMORATION"]
+        return ["COMM|allowed=0|before=1|still=true"]
+
+    calls, _writer = _fake_tuner_io(monkeypatch, respond)
+    result = asyncio.run(_tuner.auto_choose_commemoration())
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert "GetPlayerNumAllowedCommemorations" in calls[-1]["code"]
 
 
 def test_close_popups_does_not_dismiss_notifications_or_right_click(monkeypatch):
@@ -476,6 +562,34 @@ def test_tuner_enabled_ignores_other_sections_and_repairs_debug(tmp_path):
     assert result["changed"] is True
     assert path.read_bytes() == b"[Other]\nEnableTuner 1\n[Debug]\nEnableTuner 1\n"
     assert _sdk.tuner_enabled(path) is True
+
+
+def test_app_options_non_utf8_is_preserved_on_write(tmp_path):
+    path = tmp_path / "AppOptions.txt"
+    raw = "[Debug]\r\nNote café\r\nEnableTuner 0\r\n".encode("cp1252")
+    path.write_bytes(raw)
+    result = _sdk.ensure_tuner_enabled(path)
+    assert result["changed"] is True
+    assert Path(result["backup"]).read_bytes() == raw
+    updated = path.read_bytes()
+    assert updated.decode("cp1252").startswith("[Debug]\r\nNote café")
+    assert "EnableTuner 1" in updated.decode("cp1252")
+    assert "cp1252" in result["detail"]
+
+
+def test_app_options_utf16_is_preserved_on_write(tmp_path):
+    path = tmp_path / "AppOptions.txt"
+    text = "[Debug]\r\nEnableTuner 0\r\n[Audio]\r\nVolume 5\r\n"
+    raw = b"\xff\xfe" + text.encode("utf-16-le")
+    path.write_bytes(raw)
+    result = _sdk.ensure_tuner_enabled(path)
+    assert result["changed"] is True
+    assert Path(result["backup"]).read_bytes() == raw
+    updated = path.read_bytes()
+    assert updated.startswith(b"\xff\xfe")
+    assert updated[2:].decode("utf-16-le") == text.replace(
+        "EnableTuner 0", "EnableTuner 1"
+    )
 
 
 def test_app_options_failed_replace_preserves_original(monkeypatch, tmp_path):

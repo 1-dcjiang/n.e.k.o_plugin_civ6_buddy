@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -144,6 +146,8 @@ class Civ6BuddyPlugin(NekoPluginBase):
         self._ops_tick_lock = asyncio.Lock()
         self._ops_stop_event = asyncio.Event()
         self._ops_screen_cancel: asyncio.Event | None = None
+        self._ops_screen_thread: threading.Thread | None = None
+        self._ops_cleanup_lock = asyncio.Lock()
 
     def _request_ops_stop(self) -> None:
         """同步发出停止信号：不等待任何游戏调用，正在运行的 tick 会取消当前 await。"""
@@ -153,12 +157,99 @@ class Civ6BuddyPlugin(NekoPluginBase):
             self._ops_screen_cancel.set()
         _ops_lock_clear()
 
-    async def _cleanup_managed_runtime(self) -> dict:
-        """交还后注销游戏内常驻事件；注销失败必须如实返回，不能假装已清理。"""
+    def _screen_worker_alive(self) -> bool:
+        """屏幕兜底线程是否仍在运行；线程可能比 tick 锁活得久，重接管前必须挡住。"""
+        thread = getattr(self, "_ops_screen_thread", None)
+        if thread is None:
+            return False
+        if thread.is_alive():
+            return True
+        self._ops_screen_thread = None
+        return False
+
+    async def _wait_ops_tick_idle(self, timeout: float = 5.0) -> bool:
+        """交还时等 tick 锁释放，避免注销与 tick 的第二路 Tuner 握手并发。"""
+        lock = getattr(self, "_ops_tick_lock", None)
+        if lock is None or not lock.locked():
+            return True
         try:
-            return await civ6_tuner.unregister_wc_voter(timeout=2.0)
-        except Exception as exc:
-            return {"ok": False, "error": "WC_UNREGISTER_FAILED", "detail": str(exc)}
+            await asyncio.wait_for(lock.acquire(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        lock.release()
+        return True
+
+    async def _join_screen_worker(self, timeout: float = 4.0) -> bool:
+        """取消后等屏幕线程真正退出（join 在线程池执行，不阻塞事件循环）。"""
+        thread = getattr(self, "_ops_screen_thread", None)
+        if thread is None:
+            return True
+        if thread.is_alive():
+            await asyncio.to_thread(thread.join, timeout)
+        if thread.is_alive():
+            return False
+        self._ops_screen_thread = None
+        return True
+
+    async def _run_screen_turn(
+        self, cfg: dict, war_state: bool | None, deadline: float, cancel_event: asyncio.Event,
+    ) -> dict:
+        """在可跟踪线程中执行屏幕回合；取消时等线程退出后才释放 tick 锁。"""
+        loop = asyncio.get_running_loop()
+        future: concurrent.futures.Future = concurrent.futures.Future()
+
+        def worker() -> None:
+            try:
+                future.set_result(
+                    civ6_ops.run_one_turn_ops(
+                        cfg, war_state=war_state, deadline=deadline, cancel_event=cancel_event,
+                    )
+                )
+            except BaseException as exc:  # 异常原样交回事件循环，不能吞成假成功
+                try:
+                    future.set_exception(exc)
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=worker, name="civ6-screen-turn", daemon=True)
+        self._ops_screen_thread = thread
+        thread.start()
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                cancel_event.set()
+                raise asyncio.TimeoutError
+            return await asyncio.wait_for(asyncio.wrap_future(future, loop=loop), timeout=remaining)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            cancel_event.set()
+            joined = await self._join_screen_worker()
+            if not joined:
+                _logger.warning("civ6 screen worker did not exit before lock release; "
+                                "next takeover is blocked until it exits")
+            raise
+        finally:
+            if not thread.is_alive():
+                self._ops_screen_thread = None
+
+    async def _cleanup_managed_runtime(self) -> dict:
+        """交还后注销游戏内常驻事件；清理串行化，Tuner 忙时重试一次。"""
+        lock = getattr(self, "_ops_cleanup_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ops_cleanup_lock = lock
+        async with lock:
+            result: dict = {}
+            for attempt in range(2):
+                try:
+                    result = await civ6_tuner.unregister_wc_voter(timeout=2.0)
+                except Exception as exc:
+                    result = {"ok": False, "error": "WC_UNREGISTER_FAILED", "detail": str(exc)}
+                if result.get("ok") or result.get("error") != "GAME_TUNER_OFF":
+                    return result
+                if attempt == 0:
+                    # 交还瞬间另一路握手可能仍占着唯一 Tuner 连接；退避后重试一次。
+                    await asyncio.sleep(0.35)
+            return result
 
     def _load_config(self) -> None:
         """读取运行配置 plugin.toml（civ6_buddy.saves_dir / ops_buttons），失败静默用默认。"""
@@ -372,8 +463,10 @@ class Civ6BuddyPlugin(NekoPluginBase):
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self, **_):
-        """关闭钩子：停止 tick、清理运营锁并注销游戏内常驻事件。"""
+        """关闭钩子：停止 tick、等待屏幕线程退出、清理运营锁并注销游戏内常驻事件。"""
         self._request_ops_stop()
+        await self._wait_ops_tick_idle()
+        await self._join_screen_worker()
         cleanup = await self._cleanup_managed_runtime()
         return {"status": "stopped", "plugin": "civ6_buddy", "runtime_cleanup": cleanup}
 
@@ -725,6 +818,9 @@ class Civ6BuddyPlugin(NekoPluginBase):
 
     async def _civ6_ops_takeover_impl(self, **_):
         self._load_config()
+        if self._screen_worker_alive():
+            return {"output": "上一轮屏幕点击线程仍未退出，暂不能接管；本次未操作游戏。",
+                    "is_error": True, "error": "OPS_SCREEN_BUSY", "active": False, "handoff": True}
         if self._ops_tick_lock.locked():
             return {"output": "上一个 tick 仍在停止/收尾，暂不能重新接管；本次未操作游戏。",
                     "is_error": True, "error": "OPS_TICK_BUSY", "active": False, "handoff": True}
@@ -1012,6 +1108,10 @@ class Civ6BuddyPlugin(NekoPluginBase):
         timeout=900.0,
     )
     async def civ6_ops_tick(self, **kw):
+        if self._screen_worker_alive():
+            return {"output": "上一轮屏幕点击线程仍未退出，本次未排队，也未操作游戏。",
+                    "is_error": True, "error": "OPS_SCREEN_BUSY", "active": self._ops_active,
+                    "handoff": False}
         if self._ops_tick_lock.locked():
             return {"output": "已有一个运营 tick 正在执行，本次未排队，也未操作游戏。",
                     "is_error": True, "error": "OPS_TICK_BUSY", "active": self._ops_active,
@@ -1053,8 +1153,11 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 cleanup = await self._cleanup_managed_runtime()
                 result["runtime_cleanup"] = cleanup
                 result["active"] = False
-                if not cleanup.get("ok") and cleanup.get("error") != "GAME_TUNER_OFF":
-                    result["output"] += "\n注意：世界议会处理器注销未确认，请检查游戏状态。"
+                if not cleanup.get("ok"):
+                    result["output"] += (
+                        "\n注意：世界议会处理器注销未确认"
+                        f"（{cleanup.get('error', 'UNKNOWN')}），请检查游戏状态或重试交还。"
+                    )
             return result
 
     async def _civ6_ops_tick_impl(self, cancel_event=None, **kw):
@@ -1221,15 +1324,14 @@ class Civ6BuddyPlugin(NekoPluginBase):
             else:
                 # Tuner 不可用：屏幕点击兜底（原逻辑）
                 try:
-                    # 同步点击段丢到线程执行：内部含阻塞 sleep/截图/点击，
-                    # 直接 await 会卡死事件循环（实测 sleep(1s) 被拖到 5.7s）→ 运营"半天不动"。
+                    # 同步点击段放在可跟踪线程里：取消后必须等线程退出再释放 tick 锁，
+                    # 避免重新接管时旧线程还在点、新 tick 又开始的窗口重叠。
                     result = await _call_with_deadline(
-                        asyncio.to_thread, deadline,
-                        civ6_ops.run_one_turn_ops,
+                        self._run_screen_turn, deadline,
                         {"saves_dir": self._saves_dir, "buttons": self._ops_buttons},
-                        war_state=war_flag if i == 0 else None,
-                        deadline=deadline,
-                        cancel_event=cancel_event,
+                        war_flag if i == 0 else None,
+                        deadline,
+                        cancel_event,
                     )
                 except asyncio.TimeoutError:
                     return timeout_result(False)
@@ -1506,15 +1608,25 @@ class Civ6BuddyPlugin(NekoPluginBase):
             "立即停止后续运营输入，并注销插件注册的世界议会自动投票处理器。"
         ),
         parameters={"type": "object", "properties": {}, "required": []},
-        timeout=15.0,
+        timeout=20.0,
     )
     async def civ6_ops_handoff(self, **_):
         self._request_ops_stop()
+        tick_idle = await self._wait_ops_tick_idle()
+        screen_idle = await self._join_screen_worker()
         cleanup = await self._cleanup_managed_runtime()
         output = "运营托管已结束，控制权交还给你。需要再托管时说'接管运营'。"
-        if not cleanup.get("ok") and cleanup.get("error") != "GAME_TUNER_OFF":
-            output += "\n注意：世界议会处理器注销未确认，请检查游戏状态。"
-        return {"output": output, "is_error": False, "active": False, "runtime_cleanup": cleanup}
+        if not tick_idle:
+            output += "\n注意：上一 tick 未在等待窗口内收尾，清理已重试；若游戏内仍有自动投票，请再说一次交还。"
+        if not screen_idle:
+            output += "\n注意：屏幕点击线程仍未退出；已阻止新的接管，待其退出后可重新接管。"
+        if not cleanup.get("ok"):
+            output += (
+                "\n注意：世界议会处理器注销未确认"
+                f"（{cleanup.get('error', 'UNKNOWN')}），请检查游戏状态或重试交还。"
+            )
+        return {"output": output, "is_error": False, "active": False,
+                "runtime_cleanup": cleanup, "tick_idle": tick_idle, "screen_idle": screen_idle}
 
 
 @plugin_entry()

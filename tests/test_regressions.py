@@ -231,6 +231,8 @@ def _bare_plugin():
     plugin._ops_tick_lock = asyncio.Lock()
     plugin._ops_stop_event = asyncio.Event()
     plugin._ops_screen_cancel = None
+    plugin._ops_screen_thread = None
+    plugin._ops_cleanup_lock = asyncio.Lock()
     return plugin
 
 
@@ -250,6 +252,21 @@ def test_takeover_parse_failure_does_not_leave_ops_lock(monkeypatch):
     assert lock_calls == []
 
 
+def test_handoff_warns_when_wc_unregister_is_unconfirmed(monkeypatch):
+    plugin = _bare_plugin()
+    monkeypatch.setattr(_main, "_ops_lock_clear", lambda: None)
+
+    async def cleanup():
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": "busy"}
+
+    plugin._cleanup_managed_runtime = cleanup
+    result = asyncio.run(plugin.civ6_ops_handoff())
+    assert "未确认" in result["output"]
+    assert result["runtime_cleanup"]["error"] == "GAME_TUNER_OFF"
+    assert result["tick_idle"] is True
+    assert result["screen_idle"] is True
+
+
 def test_shutdown_clears_ops_state_and_lock(monkeypatch):
     plugin = _bare_plugin()
     plugin._ops_active = True
@@ -259,6 +276,208 @@ def test_shutdown_clears_ops_state_and_lock(monkeypatch):
     assert result["status"] == "stopped"
     assert plugin._ops_active is False
     assert cleared == [True]
+
+
+def test_auto_war_response_reports_at_war_without_moving_units(monkeypatch):
+    async def war_state(timeout=0):
+        return {"ok": True, "at_war": True}
+
+    async def threats(timeout=0):
+        return {"ok": True, "units": [{"name": "敌方骑士"}]}
+
+    monkeypatch.setattr(_main.civ6_tuner, "at_war", war_state)
+    monkeypatch.setattr(_main.civ6_tuner, "read_threats", threats)
+    result = asyncio.run(_main.civ6_tuner.auto_war_response())
+    assert result["ok"] is True
+    assert result["at_war"] is True
+    assert result["threats"]
+
+
+def test_auto_war_response_reports_peace(monkeypatch):
+    async def war_state(timeout=0):
+        return {"ok": True, "at_war": False}
+
+    async def threats(timeout=0):
+        return {"ok": True, "units": []}
+
+    monkeypatch.setattr(_main.civ6_tuner, "at_war", war_state)
+    monkeypatch.setattr(_main.civ6_tuner, "read_threats", threats)
+    result = asyncio.run(_main.civ6_tuner.auto_war_response())
+    assert result["ok"] is True
+    assert result["at_war"] is False
+
+
+def test_cleanup_retries_once_when_tuner_off_then_succeeds(monkeypatch):
+    plugin = _bare_plugin()
+    attempts = []
+
+    async def unregister(timeout=0):
+        attempts.append(timeout)
+        if len(attempts) == 1:
+            return {"ok": False, "error": "GAME_TUNER_OFF", "detail": "busy"}
+        return {"ok": True, "registered": False}
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(_main.civ6_tuner, "unregister_wc_voter", unregister)
+    monkeypatch.setattr(_main.asyncio, "sleep", no_sleep)
+    result = asyncio.run(plugin._cleanup_managed_runtime())
+    assert result["ok"] is True
+    assert len(attempts) == 2
+
+
+def test_cleanup_does_not_hide_persistent_tuner_off(monkeypatch):
+    plugin = _bare_plugin()
+
+    async def unregister(timeout=0):
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": "still busy"}
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(_main.civ6_tuner, "unregister_wc_voter", unregister)
+    monkeypatch.setattr(_main.asyncio, "sleep", no_sleep)
+    result = asyncio.run(plugin._cleanup_managed_runtime())
+    assert result["ok"] is False
+    assert result["error"] == "GAME_TUNER_OFF"
+
+
+def test_takeover_success_sets_active_and_clears_stop(monkeypatch):
+    plugin = _bare_plugin()
+    plugin._ops_active = False
+    plugin._ops_stop_event.set()
+    lock_calls = []
+    monkeypatch.setattr(_main, "_ops_lock_set", lambda: lock_calls.append("set"))
+    monkeypatch.setattr(_main, "_ops_lock_clear", lambda: lock_calls.append("clear"))
+    monkeypatch.setattr(_main.civ6_parser, "parse_save",
+                        lambda *_a, **_k: {"game_turn": 12})
+
+    async def at_war(*_a, **_k):
+        return {"ok": True, "at_war": 0}
+
+    monkeypatch.setattr(_main.civ6_tuner, "at_war", at_war)
+    result = asyncio.run(plugin.civ6_ops_takeover())
+    assert result["active"] is True
+    assert result["handoff"] is False
+    assert plugin._ops_active is True
+    assert plugin._ops_stop_event.is_set() is False
+    assert lock_calls == ["set"]
+
+
+def test_takeover_war_precheck_hands_off_without_active(monkeypatch):
+    plugin = _bare_plugin()
+    monkeypatch.setattr(_main.civ6_parser, "parse_save",
+                        lambda *_a, **_k: {"game_turn": 12})
+
+    async def at_war(*_a, **_k):
+        return {"ok": True, "at_war": 1}
+
+    monkeypatch.setattr(_main.civ6_tuner, "at_war", at_war)
+    result = asyncio.run(plugin.civ6_ops_takeover())
+    assert result["reason"] == "WAR_TUNER"
+    assert result["active"] is False
+    assert result["handoff"] is True
+    assert plugin._ops_active is False
+
+
+def test_takeover_timeout_reports_ops_timeout(monkeypatch):
+    plugin = _bare_plugin()
+    monkeypatch.setattr(_main, "_OPS_TAKEOVER_BUDGET", 0)
+    result = asyncio.run(plugin._civ6_ops_takeover_impl())
+    assert result["error"] == "OPS_TIMEOUT"
+    assert result["active"] is False
+
+
+def test_takeover_rejects_when_tick_lock_held(monkeypatch):
+    plugin = _bare_plugin()
+
+    async def scenario():
+        async with plugin._ops_tick_lock:
+            return await plugin._civ6_ops_takeover_impl()
+
+    result = asyncio.run(scenario())
+    assert result["error"] == "OPS_TICK_BUSY"
+
+
+def test_takeover_rejects_when_screen_worker_still_alive(monkeypatch):
+    plugin = _bare_plugin()
+    release = threading.Event()
+    thread = threading.Thread(target=lambda: release.wait(1.0), daemon=True)
+    plugin._ops_screen_thread = thread
+    thread.start()
+    try:
+        result = asyncio.run(plugin.civ6_ops_takeover())
+        assert result["error"] == "OPS_SCREEN_BUSY"
+        assert result["active"] is False
+    finally:
+        release.set()
+        thread.join()
+
+
+def test_tick_main_loop_success_path(monkeypatch):
+    plugin = _bare_plugin()
+    plugin._ops_active = True
+    turns = []
+
+    async def tuner_status(*_a, **_k):
+        return {"ok": True}
+
+    async def at_war(*_a, **_k):
+        return {"ok": True, "at_war": 0}
+
+    async def situation(*_a, **_k):
+        return {"ok": True, "turn": 7}
+
+    async def unavailable(*_a, **_k):
+        return {"ok": False, "error": "TUNER_EXEC_FAILED"}
+
+    async def manage(turn_before, war_flag, prod_kind, prod_item, tech, civic):
+        turns.append(turn_before)
+        return {"ok": True, "turn_after": turn_before + 1, "log": ["one turn"]}
+
+    monkeypatch.setattr(_main.civ6_tuner, "tuner_status", tuner_status)
+    monkeypatch.setattr(_main.civ6_tuner, "at_war", at_war)
+    monkeypatch.setattr(_main.civ6_tuner, "read_situation", situation)
+    monkeypatch.setattr(_main.civ6_tuner, "read_production", unavailable)
+    monkeypatch.setattr(_main.civ6_tuner, "list_cities", unavailable)
+    plugin._tuner_manage_turn = manage
+    result = asyncio.run(plugin.civ6_ops_tick(loop_turns=1))
+    assert result["turns_done"] == 1
+    assert result["handoff"] is False
+    assert turns == [7]
+
+
+def test_tick_war_precheck_hands_off_before_turn(monkeypatch):
+    plugin = _bare_plugin()
+    plugin._ops_active = True
+
+    async def tuner_status(*_a, **_k):
+        return {"ok": True}
+
+    async def at_war(*_a, **_k):
+        return {"ok": True, "at_war": 1}
+
+    async def forbidden(*_a, **_k):
+        raise AssertionError("战争预检后不得执行回合")
+
+    monkeypatch.setattr(_main.civ6_tuner, "tuner_status", tuner_status)
+    monkeypatch.setattr(_main.civ6_tuner, "at_war", at_war)
+    plugin._tuner_manage_turn = forbidden
+    result = asyncio.run(plugin.civ6_ops_tick(loop_turns=1))
+    assert result["reason"] == "WAR_TUNER"
+    assert result["handoff"] is True
+    assert plugin._ops_active is False
+
+
+def test_tick_timeout_path_reports_budget(monkeypatch):
+    plugin = _bare_plugin()
+    plugin._ops_active = True
+    monkeypatch.setattr(_main, "_OPS_TICK_BUDGET", 0)
+    result = asyncio.run(plugin.civ6_ops_tick(loop_turns=1))
+    assert result["error"] == "OPS_TIMEOUT"
+    assert result["handoff"] is True
+    assert plugin._ops_active is False
 
 
 def test_status_blocker_read_failure_is_partial_not_safe(monkeypatch):

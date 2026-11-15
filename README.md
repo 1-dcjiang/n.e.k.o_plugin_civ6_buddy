@@ -68,9 +68,20 @@ FireTuner 是游戏调试端口（默认 4318），可读真实城市数据、�
 - 存档目录默认 `Documents\My Games\Sid Meier's Civilization VI\Saves`，
   可在运行配置 `[civ6_buddy] saves_dir` 覆盖。
 
+## 实机验证
+
+Lua API（`CanProduce`、`CanStartOperation`、`PARAM_*` 键名、`SetHide` 对弹窗的副作用）无法用单元测试替代。
+发布前按 [docs/lua-smoke-checklist.md](docs/lua-smoke-checklist.md) 在真实游戏中逐项记录；
+未打勾的项目不能声称已在实机验证。
+
 ## 版本
 
-- v0.6.8：当前发布版。修复 tick 并发与交还停止、协议异常分类、单位分支、敌我识别和稀疏政策槽；
+- v0.6.9：当前发布版。交还清理串行化并在 `GAME_TUNER_OFF` 时退避重试一次，
+  交还先等 tick 锁与屏幕线程退出；屏幕线程独立跟踪，未退出时拒绝重接管与新 tick。
+  自动生产配额随城市数扩展，研究/政策/总督/纪念写后读回，政策读回改为校验槽位内容。
+  自动决策/写操作拆到 `civ6_tuner_auto.py`，`civ6_tuner.py` 保留兼容门面；AppOptions
+  非 UTF-8 时按原编码写回。Lua 行为仍需按实机冒烟清单复核。
+- v0.6.8：修复 tick 并发与交还停止、协议异常分类、单位分支、敌我识别和稀疏政策槽；
   生产支持四类参数、多城与区域显式选址，只发一次写请求并按哈希读回；结束回合只发一次；
   注销世界议会常驻处理器，不批量吞噬通知，移除右键/亮度盲点自愈；AppOptions 在真正的 Debug 节原子写入，
   保留 CRLF/BOM；动态解析 InGame 索引，并补齐托管主链路回归测试。Lua 行为仍需在真实游戏中复核。

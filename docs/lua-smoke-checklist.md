@@ -1,0 +1,71 @@
+# 文明6 Lua API 实机冒烟清单
+
+本清单用于发布前在真实游戏中复核插件用到的 FireTuner Lua API。
+**当前状态：以下项目尚未在实机逐项签字，不能把单元测试当作实机验证。**
+
+## 准备
+
+1. 安装 Civilization VI Development Assets（Steam appid 597260），关闭 SDK 自带 FireTuner.exe。
+2. 在 `AppOptions.txt` 的 `[Debug]` 节写 `EnableTuner 1`，重启游戏，确认 4318 端口监听。
+3. 进入一局至少 50 回合的存档，记录回合号、当前科技/市政、城市数与生产队列。
+4. 插件侧先运行 `civ6_ops_status`，保存一份真实局面作为对照基线。
+
+## 1. 生产参数与 `CanProduce`
+
+| 检查项 | 操作 | 期望 | 实机结果 |
+|---|---|---|---|
+| `PlayerOperations.PARAM_PRODUCTION_TYPE` 能选中单位 | 对空队列城市调用 `set_city_production`，`kind=unit` | 队列真实出现该单位，读回哈希匹配 | 待验 |
+| `PARAM_PRODUCTION_TYPE` 能选中建筑 | 同上，`kind=building` | 不报空参数、队列出现建筑 | 待验 |
+| 区域必须带坐标 | `kind=district` 不带坐标 | 返回 `DISTRICT_LOCATION_REQUIRED`，不写入 | 待验 |
+| 区域带坐标 | `kind=district` 带合法 `city_id/plot_x/plot_y` | `CanStartOperation` 为真，队列出现区域 | 待验 |
+| 不可生产项 | 请求当前时代不可生产的单位/建筑 | `CanProduce` 为假时返回 `CANNOT_PRODUCE`，不静默成功 | 待验 |
+
+重点：确认 `CanProduce` 的调用对象是城市（`city:CanProduce(item)`）还是玩家/生产队列，
+不同游戏版本可能不同；若报 nil，改按真实 API 调整，不能在 Lua 里包 `pcall` 后当成功。
+
+## 2. 生产操作 `CanStartOperation`
+
+| 检查项 | 操作 | 期望 | 实机结果 |
+|---|---|---|---|
+| 空队列可开工 | 对空队列城市调用 `CityManager.RequestOperation` | `CanStartOperation` 为真，返回 `OK` | 待验 |
+| 队列已占用 | 对已有生产城市重复设置 | 返回 `OCCUPIED`，不覆盖原队列 | 待验 |
+| 非法参数 | 请求不存在的地块/区域 | 返回 `REJECTED`，不显示成功 | 待验 |
+| 多城批量 | 两座以上空队列城市同时设置 | 每城独立读回，不把一次请求数当成功数 | 待验 |
+
+## 3. `PARAM_*` 键名
+
+逐项在真实 `PlayerOperations` 表里打印键是否存在，并记录实际键名：
+
+- 生产：`PARAM_PRODUCTION_TYPE`、`PARAM_CITY_DEST`、`PARAM_PLOT_X`、`PARAM_PLOT_Y`
+- 科技/市政：`PARAM_TECH_TYPE`、`PARAM_CIVIC_TYPE`
+- 总督：`PARAM_GOVERNOR_TYPE`、`PARAM_CITY_DEST`、`PARAM_PLAYER_ONE`
+- 纪念：`PARAM_COMMEMORATION_TYPE`
+- 政策：确认 `RequestPolicyChanges(clearList, addList)` 的槽位索引从 0 开始，`addList` 是稀疏表
+
+检查方式：在 InGame 状态执行只读 Lua，输出 `PlayerOperations.PARAM_*` 的 `tostring` 结果；
+任何 nil 键都必须改成实机存在的键，不能靠 `pcall` 吞掉。
+
+## 4. `SetHide` 与弹窗上下文
+
+| 弹窗/上下文 | 操作 | 期望 | 实机结果 |
+|---|---|---|---|
+| 顾问提示 | `close_ui_popups` 后结束回合 | 弹窗消失，回合能推进 | 待验 |
+| 科技/市政完成 | 同上 | 不误关通知中心，不吞掉可操作通知 | 待验 |
+| 自然奇观/发现 | 同上 | 只关可安全关闭的上下文，无法确认时交还 | 待验 |
+| 世界议会 | 注册投票处理器后交还 | 处理器注销，后续议会不自动投票 | 待验 |
+| 政策/总督/纪念选择 | 自动处理后读回 | 选择真实生效，读回值与请求一致 | 待验 |
+
+重点：`SetHide` 对不同弹窗的副作用不同，不能批量 Dismiss 通知；任何无法确认的上下文都应交还，
+而不是盲点。
+
+## 5. 回合与战争
+
+- `Game.GetCurrentGameTurn()` 返回真实回合号；结束回合后轮询能观察到 +1。
+- `ACTION_ENDTURN` 只发一次；结算慢时不得右键或重复发命令“自愈”。
+- `IsAtWarWith` / `IsBarbarian` 对当前玩家与敌对单位返回预期布尔值。
+- 战争预检为真时 tick 不执行任何单位移动，直接交还。
+
+## 6. 记录
+
+每项通过后填写“实机结果”列，并记录游戏版本、DLC、存档回合号与截图路径。
+未通过项必须回到代码修，不能只改本文档。
