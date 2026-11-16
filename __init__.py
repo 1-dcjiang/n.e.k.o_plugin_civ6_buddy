@@ -594,19 +594,24 @@ class Civ6BuddyPlugin(NekoPluginBase):
         deadline = loop.time() + _OPS_STATUS_BUDGET
         failed_reads: list[str] = []
         timed_out = False
+        budget_exhausted = False
 
         async def read_step(label: str, function, timeout: float = 8.0) -> dict:
-            nonlocal timed_out
+            nonlocal timed_out, budget_exhausted
             remaining = deadline - loop.time()
-            if remaining <= 0:
+            if budget_exhausted or remaining <= 0:
                 timed_out = True
                 failed_reads.append(label)
                 return {"ok": False, "error": "STATUS_TIMEOUT", "detail": "状态读取总预算已耗尽"}
+            step_timeout = min(timeout, remaining)
             try:
-                return await asyncio.wait_for(function(timeout=min(timeout, remaining)), timeout=remaining)
+                return await asyncio.wait_for(function(timeout=step_timeout), timeout=remaining)
             except asyncio.TimeoutError:
                 timed_out = True
                 failed_reads.append(label)
+                # 本次等待已用完全部剩余预算时，后续步骤不能再发起读取。
+                if step_timeout >= remaining - 1e-9:
+                    budget_exhausted = True
                 return {"ok": False, "error": "STATUS_TIMEOUT", "detail": f"{label}读取超时"}
             except Exception as exc:
                 failed_reads.append(label)

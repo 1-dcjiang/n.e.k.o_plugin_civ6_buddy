@@ -9,7 +9,7 @@ local okList = pcall(function()
       if g then growth = tostring(g:GetTurnsUntilGrowth()) end
     end)
     if not okG then growth = "?" end
-    local yields = {{}}
+    local yields = {}
     for y = 0, 5 do
       local okY, v = pcall(function() return c:GetYield(y) end)
       yields[y + 1] = okY and tostring(v) or "?"

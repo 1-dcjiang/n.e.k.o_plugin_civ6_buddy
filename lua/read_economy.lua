@@ -2,8 +2,7 @@
 local me = Game.GetLocalPlayer()
 local gold, faith = -1, -1
 pcall(function() gold = Players[me]:GetTreasury():GetGoldBalance() end)
-pcall(function() faith = Players[me]:GetFaithBalance() end)
-if faith < 0 then pcall(function() faith = Players[me]:GetReligion():GetFaith() end) end
+pcall(function() faith = Players[me]:GetReligion():GetFaithBalance() end)
 local pop, cities = 0, 0
 pcall(function()
   for _, c in Players[me]:GetCities():Members() do cities = cities + 1; pop = pop + c:GetPopulation() end

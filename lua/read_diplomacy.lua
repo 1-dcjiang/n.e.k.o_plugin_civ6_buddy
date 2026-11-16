@@ -32,7 +32,7 @@ for i = 0, 63 do
         for _, c in Players[i]:GetCities():Members() do csx, csy = c:GetX(), c:GetY(); break end
       end)
       local dist = -1
-      pcall(function() dist = Map.GetPlotsDistance(capX, capY, csx, csy) end)
+      pcall(function() dist = Map.GetPlotDistance(capX, capY, csx, csy) end)
       local canGive = false
       pcall(function() canGive = Players[me]:GetInfluence():CanGiveTokensToPlayer(i) end)
       local envoys = 0

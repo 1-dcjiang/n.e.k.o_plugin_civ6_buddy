@@ -122,7 +122,7 @@ async def list_cities(timeout: float = 8.0) -> dict:
         cities.append({
             "name": parts[0],
             "population": _to_int(parts[1].replace("pop=", "")),
-            "yields": {k: _to_int(parts[2 + i]) for i, k in
+            "yields": {k: _to_int(parts[2 + i].split("=", 1)[-1]) for i, k in
                        enumerate(("food", "prod", "gold", "science", "culture", "faith"))
                        if 2 + i < len(parts)},
         })

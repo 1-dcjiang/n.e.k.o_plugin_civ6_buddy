@@ -20,11 +20,11 @@ pcall(function()
   end
 end)
 local civic = -1
-pcall(function() civic = Players[me]:GetCulture():GetCurrentCivic() or -1 end)
+pcall(function() civic = Players[me]:GetCulture():GetProgressingCivic() or -1 end)
 local civicName = "?"
 pcall(function()
   local ci = GameInfo.Civics[civic]
-  if ci then civicName = ci.CivicType end
+  if ci then civicName = Locale.Lookup(ci.Name) or ci.CivicType end
 end)
 print("CULTURE|yield=" .. tostring(cultYield) .. "|tourism=" .. tostring(tourism) ..
       "|gw=" .. tostring(gwCount) .. "|civic=" .. tostring(civicName))

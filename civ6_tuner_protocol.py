@@ -174,6 +174,7 @@ async def handshake(
         await _drain(reader)
         await _send(writer, TAG_HANDSHAKE, "APP:")
         _, app_id = await _recv(reader, remaining())
+        app_id = app_id.replace("\x00", " | ").strip()
         await _send(writer, TAG_HANDSHAKE, "LSQ:")
         _, raw = await _recv(reader, remaining())
         states = [s.strip() for s in raw.replace("\x00", "\n").split("\n") if s.strip()]
