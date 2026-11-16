@@ -275,6 +275,19 @@ class _FakeClock:
         return self.now
 
 
+class _FakeModuleTime:
+    """只替换插件模块里的 time 引用，不改 stdlib；避免污染宿主后台线程。"""
+
+    def __init__(self, clock):
+        self._clock = clock
+
+    def monotonic(self):
+        return self._clock.now
+
+    def time(self):
+        return self._clock.now
+
+
 def test_cleanup_two_rounds_share_fake_monotonic_budget(monkeypatch):
     plugin = _main.Civ6BuddyPlugin.__new__(_main.Civ6BuddyPlugin)
     plugin._ops_cleanup_lock = asyncio.Lock()
@@ -289,7 +302,7 @@ def test_cleanup_two_rounds_share_fake_monotonic_budget(monkeypatch):
     async def sleep(seconds):
         clock.now += seconds
 
-    monkeypatch.setattr(_main.time, "monotonic", clock.time)
+    monkeypatch.setattr(_main, "time", _FakeModuleTime(clock))
     monkeypatch.setattr(_main.asyncio, "sleep", sleep)
     monkeypatch.setattr(_main.civ6_tuner, "unregister_wc_voter", unregister)
     result = asyncio.run(plugin._cleanup_managed_runtime())
@@ -362,7 +375,7 @@ def test_full_handoff_budget_leaves_five_seconds_for_host_return(monkeypatch):
         observed["cleanup_remaining"] = deadline - clock.now
         return {"ok": False, "error": "HANDOFF_CLEANUP_TIMEOUT"}
 
-    monkeypatch.setattr(_main.time, "monotonic", clock.time)
+    monkeypatch.setattr(_main, "time", _FakeModuleTime(clock))
     monkeypatch.setattr(_main, "_ops_lock_clear", lambda: None)
     plugin._wait_ops_tick_idle = tick_wait
     plugin._join_screen_worker = screen_wait
