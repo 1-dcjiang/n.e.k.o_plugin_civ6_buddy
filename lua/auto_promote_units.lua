@@ -1,5 +1,7 @@
 
 local me = Game.GetLocalPlayer()
+-- 每次请求都重置目标列表；上一轮读回失败留下的旧单位 ID 不能继续参与本轮判定。
+__civ6_promo_targets = {}
 local prereqMap = {}
 for row in GameInfo.UnitPromotionPrereqs() do
   local pt = row.UnitPromotion

@@ -56,6 +56,7 @@ end
 UI.RequestPlayerOperation(me, PlayerOperations.UNLOCK_POLICIES, {})
 local clearList = {}
 local addList = {}
+local policyTargets = {}
 local picked = {}
 local taken = {}
 for s = 0, numSlots - 1 do
@@ -68,7 +69,8 @@ for s = 0, numSlots - 1 do
     end
     if best then
       taken[best.Index] = true
-      addList[s] = best.Hash
+      addList[s] = best.Hash       -- RequestPolicyChanges 要 Hash
+      policyTargets[s] = best.Index -- GetSlotPolicy 读回是索引，读回比对用索引
       clearList[#clearList+1] = s
       picked[#picked+1] = best.PolicyType
     end
@@ -78,5 +80,5 @@ if #picked > 0 then
   -- addList 以槽位 0 起始，是稀疏表；picked 才是可安全取长度的密集列表。
   pcall(function() pCulture:RequestPolicyChanges(clearList, addList) end)
 end
-__civ6_policy_targets = addList
+__civ6_policy_targets = policyTargets
 print("REQUESTED=" .. tostring(#picked) .. "&SLOTS=" .. table.concat(picked, "|"))

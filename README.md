@@ -70,10 +70,14 @@ FireTuner 是游戏调试端口（默认 4318），可读真实城市数据、�
 - 万神殿、使节、伟人、商队、宗教、购买建造者、单位升级七类操作均只发一次写请求，
   最多进行三次只读验证；读回失败、不匹配或 API 不支持时明确返回失败或不确定并提示人工核实，
   不盲目重写。
+- 单位晋升在 GameCore 侧直接调用 `exp:SetPromotion`，不是通过网络同步接口下发；托管按单机
+  场景设计，多人联机时不保证其他玩家客户端同步，联机局面请先退出托管。
 - 默认不修改存档或游戏文件；唯一例外是用户明确执行 `fix_tuner` 时，插件备份并修改
   `AppOptions.txt`。生产、研究与焦点分配均通过游戏官方 API，不改存档。
 - 存档目录默认 `Documents\My Games\Sid Meier's Civilization VI\Saves`，
   可在运行配置 `[civ6_buddy] saves_dir` 覆盖。
+- 运行配置 `[civ6_buddy] auto_irreversible = false` 可关闭花钱、创教、招伟人和派商队这四类
+  不可逆/消耗型自动操作；生产、研究、政策、侦察与战争响应仍保留。默认 `true`，与旧版行为一致。
 
 ## 实机验证
 
@@ -83,6 +87,13 @@ Lua API（`CanProduce`、`CanStartOperation`、`PARAM_*` 键名、`SetHide` 对�
 
 ## 版本
 
+- v0.6.12：A594 增量深审修复——创立宗教先检查 `HasReligiousFoundingUnit`，避免每回合向游戏发无效请求；
+  晋升目标每次请求重置，死亡单位按“未达成”处理而不是 `VERIFY_UNSUPPORTED`；政策写请求用 `Hash`、
+  读回比对改用槽位 `Policy.Index`；招募伟人先取名字再发请求；`RazeCity/ChooseArtifact/EventPopup/EspionagePopup`
+  不再被直接 `SetHide`，改为探测并交还；购买/宗教/伟人/商队读回不确定时在结束回合前交还；
+  `AppOptions` 读写异常改为结构化错误；`LOCALAPPDATA` 为空时锁文件回退到用户目录。
+  新增 Lua 块配平、模板占位符展开与上述业务回归测试，236 项测试通过，Ruff 通过。
+  Lua 写路径与七类写后读回仍按实机冒烟清单待验。
 - v0.6.11：真实 FireTuner 只读 smoke 修复——城市产出六项解析、文明/当前科技、当前市政、
   信仰余额、城邦距离全部改为实机存在且返回真实值的 API；状态读取在总预算耗尽后停止后续读取。
   本机实机只读验证通过（刚果，回合 415），166 项测试通过、6 项因无游戏/环境跳过，Ruff 通过。

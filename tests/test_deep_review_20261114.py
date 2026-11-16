@@ -613,10 +613,13 @@ def test_app_options_failed_replace_preserves_original(monkeypatch, tmp_path):
         raise OSError("simulated replace failure")
 
     monkeypatch.setattr(_sdk.os, "replace", failed_replace)
-    with pytest.raises(OSError, match="simulated"):
-        _sdk.ensure_tuner_enabled(path)
+    result = _sdk.ensure_tuner_enabled(path)
+    assert result["changed"] is False
+    assert result["error"] == "APP_OPTIONS_WRITE_FAILED"
+    assert "simulated" in result["detail"]
     assert path.read_bytes() == raw
     assert not list(tmp_path.glob("*.tmp"))
+    assert Path(result["backup"]).read_bytes() == raw
 
 
 def test_list_saves_stats_each_file_once_and_skips_vanished(monkeypatch, tmp_path):

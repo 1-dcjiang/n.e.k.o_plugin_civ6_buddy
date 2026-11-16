@@ -1025,12 +1025,15 @@ async def close_ui_popups(timeout: float = 10.0) -> dict:
         closed = _to_int(kv.get("CLOSED", "0"))
         nw = str(kv.get("NW", "false")).lower() == "true"
         menu = str(kv.get("MENU", "false")).lower() == "true"
+        decision = kv.get("DECISION", "").strip()
         result = {"app": app_id, "closed": closed, "dismissed": 0,
                   "nw_closed": not nw, "menu_closed": not menu, "via": "tuner"}
-        if nw or menu:
+        if nw or menu or decision:
             visible = "、".join(name for name, shown in (("自然奇观", nw), ("暂停菜单", menu)) if shown)
+            if decision:
+                visible = (visible + "、" if visible else "") + f"需要决策的弹窗（{decision}）"
             return {**result, "ok": False, "error": "POPUP_UNRESOLVED",
-                    "detail": f"{visible}仍可见；未右键或吞噬通知，请手动关闭"}
+                    "detail": f"{visible}仍可见；未右键或吞噬通知，请手动关闭/选择"}
         return {**result, "ok": True, "detail": f"已处理 {closed} 个已知弹窗控件；未清理普通通知"}
     return {"ok": False, "error": "NO_RESPONSE", "detail": "关闭弹窗无回执（Tuner 输出丢失），请重试"}
 

@@ -30,9 +30,10 @@ _logger = logging.getLogger("N.E.K.O.Plugin_civ6_buddy.civ6_buddy")
 # steam_manager 等插件见新鲜锁（<5 分钟）即让位，避免抢占 Neko 运营注意力。
 # 锁带时间戳：civ6_buddy 每回合刷新；崩溃/被杀导致残留锁在 5 分钟后自动失效，不误伤。
 def _ops_lock_path() -> str:
-    return os.path.join(
-        os.environ.get("LOCALAPPDATA", ""), "N.E.K.O", "config", "civ6_ops_active"
-    )
+    # LOCALAPPDATA 缺失时不能把锁文件落到当前工作目录的相对路径；
+    # 优先用用户目录下的 AppData\Local，避免不同启动目录写出多把锁。
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    return os.path.join(base, "N.E.K.O", "config", "civ6_ops_active")
 _OPS_LOCK_TTL = 300.0
 _OPS_STATUS_BUDGET = 25.0  # 工具超时 30 秒，保留 5 秒给序列化与宿主调度。
 _OPS_TAKEOVER_BUDGET = 25.0
@@ -144,6 +145,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
         super().__init__(ctx)
         self._saves_dir = ""
         self._ops_buttons: dict = {}
+        self._auto_irreversible = True
         self._cfg_loaded = False
         self._ops_active = False
         self._ops_tick_lock = asyncio.Lock()
@@ -290,6 +292,8 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 if isinstance(sec, dict):
                     if sec.get("saves_dir"):
                         self._saves_dir = str(sec["saves_dir"])
+                    if isinstance(sec.get("auto_irreversible"), bool):
+                        self._auto_irreversible = sec["auto_irreversible"]
                     buttons = sec.get("ops_buttons")
                     if isinstance(buttons, dict):
                         cleaned = {}
@@ -1067,14 +1071,34 @@ class Civ6BuddyPlugin(NekoPluginBase):
         # 世界议会投票处理器（防 WORLD_CONGRESS_SESSION 卡回合）、花钱、宗教、伟人、商队、间谍、战争响应
         wc = await civ6_tuner.register_wc_voter(timeout=10.0)
         logs.append(f"世界议会：{wc.get('detail', wc.get('error', ''))}")
-        mo = await civ6_tuner.auto_manage_money(timeout=12.0)
-        logs.append(f"经济自动：{mo.get('detail', mo.get('error', ''))}")
-        rg = await civ6_tuner.auto_found_religion(timeout=12.0)
-        logs.append(f"宗教：{rg.get('detail', rg.get('error', ''))}")
-        gp = await civ6_tuner.auto_recruit_great_person(timeout=12.0)
-        logs.append(f"伟人：{gp.get('detail', gp.get('error', ''))}")
-        tr = await civ6_tuner.auto_trade_route(timeout=12.0)
-        logs.append(f"商队：{tr.get('detail', tr.get('error', ''))}")
+        if getattr(self, "_auto_irreversible", True):
+            mo = await civ6_tuner.auto_manage_money(timeout=12.0)
+            logs.append(f"经济自动：{mo.get('detail', mo.get('error', ''))}")
+            rg = await civ6_tuner.auto_found_religion(timeout=12.0)
+            logs.append(f"宗教：{rg.get('detail', rg.get('error', ''))}")
+            gp = await civ6_tuner.auto_recruit_great_person(timeout=12.0)
+            logs.append(f"伟人：{gp.get('detail', gp.get('error', ''))}")
+            tr = await civ6_tuner.auto_trade_route(timeout=12.0)
+            logs.append(f"商队：{tr.get('detail', tr.get('error', ''))}")
+        else:
+            # 配置 auto_irreversible=false 时，不花金币、不创教、不招伟人、不派商队；
+            # 保留只读侦察/战争响应与生产研究等可回退操作。
+            skip = {"ok": True, "skipped": True, "detail": "auto_irreversible=false，已跳过不可逆自动操作"}
+            mo = rg = gp = tr = skip
+            logs.append("经济/宗教/伟人/商队：auto_irreversible=false，已跳过")
+        # 这四类是不可逆/消耗资源的写操作：读回不确定时不能只记日志后继续结束回合，
+        # 必须与 plugin.toml 的“识别不确定即交还”保持一致。
+        soft_writes = (("经济", mo), ("宗教", rg), ("伟人", gp), ("商队", tr))
+        uncertain = [
+            f"{label}（{item.get('error', '未确认')}）"
+            for label, item in soft_writes
+            if not item.get("ok")
+        ]
+        if uncertain:
+            return {"handoff": True, "ok": False, "reason": "WRITE_UNCERTAIN",
+                    "output": "以下写操作未读回确认，未发送结束回合，控制权交还："
+                              + "；".join(uncertain),
+                    "log": logs}
         sp = await civ6_tuner.auto_manage_spy(timeout=12.0)
         logs.append(f"间谍：{sp.get('detail', sp.get('error', ''))}")
         wr = await civ6_tuner.auto_war_response(timeout=12.0)

@@ -574,9 +574,10 @@ async def auto_appoint_governor(timeout: float = 12.0) -> dict:
                 return {"ok": True, "app": app_id, "governor": tag, "verified": True,
                         "detail": f"已读回验证总督任命：{detail}", "via": "tuner"}
         return {"ok": False, "error": "SILENT_FAILURE",
-                "detail": "任命总督后未读回任命列表，未宣称成功"}
+                "detail": f"任命总督后未读回任命列表，未宣称成功。{_VERIFY_MANUAL}"}
     except _t.TunerError as exc:
-        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "verified": False,
+                "detail": f"任命总督执行失败：{exc}。{_VERIFY_MANUAL}"}
     finally:
         try:
             writer.close()
@@ -622,13 +623,15 @@ async def auto_choose_commemoration(timeout: float = 12.0) -> dict:
             values = {part.split("=")[0]: part.split("=", 1)[1]
                       for part in line[len("COMM|"):].split("|") if "=" in part} if line else {}
             allowed, before = _t._to_int(values.get("allowed", "-1")), _t._to_int(values.get("before", "-1"))
-            if (before >= 0 and allowed < before) or values.get("still") == "false":
+            # before < 0 说明请求前的 Lua 全局状态已丢失；此时 still=false 不能当作成功。
+            if before >= 0 and (allowed < before or values.get("still") == "false"):
                 return {"ok": True, "app": app_id, "commemoration": tag, "verified": True,
                         "detail": f"已读回验证纪念选择：{tag}", "via": "tuner"}
         return {"ok": False, "error": "SILENT_FAILURE",
-                "detail": "选择纪念后未读回次数/可选列表变化，未宣称成功"}
+                "detail": "选择纪念后未读回次数/可选列表变化，未宣称成功。" + _VERIFY_MANUAL}
     except _t.TunerError as exc:
-        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "verified": False,
+                "detail": f"选择纪念执行失败：{exc}。{_VERIFY_MANUAL}"}
     finally:
         try:
             writer.close()
@@ -688,9 +691,11 @@ async def auto_fill_policy_slots(timeout: float = 12.0) -> dict:
                         "detail": f"已读回验证 {done} 个政策槽（{'、'.join(picked) or '无'}）",
                         "via": "tuner"}
             last_detail = f"第 {attempt + 1} 次读回未匹配：成功 {done}，失败 {failed}"
-        return {"ok": False, "error": "SILENT_FAILURE", "detail": last_detail + "；未宣称填写成功"}
+        return {"ok": False, "error": "SILENT_FAILURE",
+                "detail": last_detail + "；未宣称填写成功。" + _VERIFY_MANUAL}
     except _t.TunerError as exc:
-        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "verified": False,
+                "detail": f"填写政策槽执行失败：{exc}。{_VERIFY_MANUAL}"}
     finally:
         try:
             writer.close()

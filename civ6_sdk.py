@@ -237,7 +237,12 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
 def ensure_tuner_enabled(p: Path | None = None) -> dict:
     """在真正的 ``[Debug]`` 节内启用 Tuner，保留 CRLF 并原子替换文件。"""
     ap = p or app_options_path()
-    raw = ap.read_bytes() if ap.exists() else b""
+    try:
+        raw = ap.read_bytes() if ap.exists() else b""
+    except OSError as exc:
+        return {"changed": False, "backup": None, "path": str(ap),
+                "error": "APP_OPTIONS_READ_FAILED",
+                "detail": f"AppOptions.txt 读取失败，原文件未修改：{exc}"}
     if not raw:
         _atomic_write_bytes(ap, b"[Debug]\nEnableTuner 1\n")
         return {"changed": True, "backup": None, "path": str(ap),
@@ -289,8 +294,13 @@ def ensure_tuner_enabled(p: Path | None = None) -> dict:
 
     ap.parent.mkdir(parents=True, exist_ok=True)
     backup = str(ap) + f".bak_{time.strftime('%Y%m%d_%H%M%S')}"
-    Path(backup).write_bytes(raw)
-    _atomic_write_bytes(ap, bom + "".join(lines).encode(codec))
+    try:
+        Path(backup).write_bytes(raw)
+        _atomic_write_bytes(ap, bom + "".join(lines).encode(codec))
+    except OSError as exc:
+        return {"changed": False, "backup": backup if Path(backup).exists() else None,
+                "path": str(ap), "error": "APP_OPTIONS_WRITE_FAILED",
+                "detail": f"AppOptions.txt 写入失败，原文件未替换：{exc}"}
     if codec != "utf-8":
         detail += f"（检测到非 UTF-8 内容，按 {codec} 原编码写回）"
     return {"changed": True, "backup": backup, "path": str(ap), "detail": detail}

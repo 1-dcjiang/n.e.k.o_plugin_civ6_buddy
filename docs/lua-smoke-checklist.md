@@ -29,14 +29,30 @@
 
 只读接口已实测；下面的写操作、`CanProduce`/`SetHide`/`PARAM_*` 与交还流程仍未签字，不能因为本节通过就当作写路径已验证。
 
+## 0.5 写后读回（v0.6.10+ 统一框架）
+
+七类写操作走 `civ6_tuner_auto.py` 的 `_write_and_verify`：写请求只发一次，随后只读回最多 3 次，读回失败或不确定不重发写请求。
+
+| 操作 | 读回字段 | 单测覆盖 | 实机结果 |
+|---|---|---|---|
+| 万神殿 | 信仰索引 `GetPantheonBelief` | 成功/不匹配/不支持/协议失败 | 待验 |
+| 派遣使节 | 目标城邦使节数与令牌数 | 同上 | 待验 |
+| 招募伟人 | 未招募列表移除目标 | 同上 | 待验 |
+| 商队路线 | `GetNumOutgoingRoutes` 增量 | 同上 | 待验 |
+| 创立宗教 | 宗教类型 + 已选信条 | 同上 | 待验 |
+| 购买建造者 | 建造者数 +1、金币下降 | 同上 | 待验 |
+| 单位晋升 | 逐单位 `HasPromotion` + 剩余升级点 | 同上 | 待验 |
+
+注意：购买单位/商队路线是否立即反映在 API 上，报告标注为“可能未实机核实”；若游戏实际延迟到下一回合，读回会判为不确定并交还，而不是误报成功。该行为需要在实机用一局存档确认。
+
 ## 1. 生产参数与 `CanProduce`
 
 | 检查项 | 操作 | 期望 | 实机结果 |
 |---|---|---|---|
-| `PlayerOperations.PARAM_PRODUCTION_TYPE` 能选中单位 | 对空队列城市调用 `set_city_production`，`kind=unit` | 队列真实出现该单位，读回哈希匹配 | 待验 |
-| `PARAM_PRODUCTION_TYPE` 能选中建筑 | 同上，`kind=building` | 不报空参数、队列出现建筑 | 待验 |
+| `CityOperationTypes.PARAM_UNIT_TYPE` 能选中单位 | 对空队列城市调用 `set_city_production`，`kind=unit` | 队列真实出现该单位，读回哈希匹配 | 待验 |
+| `CityOperationTypes.PARAM_BUILDING_TYPE` 能选中建筑 | 同上，`kind=building` | 不报空参数、队列出现建筑 | 待验 |
 | 区域必须带坐标 | `kind=district` 不带坐标 | 返回 `DISTRICT_LOCATION_REQUIRED`，不写入 | 待验 |
-| 区域带坐标 | `kind=district` 带合法 `city_id/plot_x/plot_y` | `CanStartOperation` 为真，队列出现区域 | 待验 |
+| 区域带坐标 | `kind=district` 带合法 `city_id/plot_x/plot_y` | `CityManager.CanStartOperation` 为真，队列出现区域 | 待验 |
 | 不可生产项 | 请求当前时代不可生产的单位/建筑 | `CanProduce` 为假时返回 `CANNOT_PRODUCE`，不静默成功 | 待验 |
 
 重点：确认 `CanProduce` 的调用对象是城市（`city:CanProduce(item)`）还是玩家/生产队列，
@@ -55,11 +71,11 @@
 
 逐项在真实 `PlayerOperations` 表里打印键是否存在，并记录实际键名：
 
-- 生产：`PARAM_PRODUCTION_TYPE`、`PARAM_CITY_DEST`、`PARAM_PLOT_X`、`PARAM_PLOT_Y`
-- 科技/市政：`PARAM_TECH_TYPE`、`PARAM_CIVIC_TYPE`
-- 总督：`PARAM_GOVERNOR_TYPE`、`PARAM_CITY_DEST`、`PARAM_PLAYER_ONE`
-- 纪念：`PARAM_COMMEMORATION_TYPE`
-- 政策：确认 `RequestPolicyChanges(clearList, addList)` 的槽位索引从 0 开始，`addList` 是稀疏表
+- 生产：`CityOperationTypes.PARAM_UNIT_TYPE`、`PARAM_BUILDING_TYPE`、`PARAM_DISTRICT_TYPE`、`PARAM_PROJECT_TYPE`、`PARAM_X`、`PARAM_Y`、`PARAM_INSERT_MODE`
+- 科技/市政：`PlayerOperations.PARAM_TECH_TYPE`、`PARAM_CIVIC_TYPE`
+- 总督：`PlayerOperations.PARAM_GOVERNOR_TYPE`、`PARAM_CITY_DEST`、`PARAM_PLAYER_ONE`
+- 纪念：`PlayerOperations.PARAM_COMMEMORATION_TYPE`
+- 政策：确认 `RequestPolicyChanges(clearList, addList)` 的槽位索引从 0 开始，`addList` 是稀疏表且值为 `Policy.Hash`；`GetSlotPolicy(s)` 读回是 `Policy.Index`，不能拿 Hash 直接比较
 
 检查方式：在 InGame 状态执行只读 Lua，输出 `PlayerOperations.PARAM_*` 的 `tostring` 结果；
 任何 nil 键都必须改成实机存在的键，不能靠 `pcall` 吞掉。
