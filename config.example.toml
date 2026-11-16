@@ -5,8 +5,10 @@ enabled = true
 auto_start = true
 
 [civ6_buddy]
-# 文明6存档目录（默认 Windows 位置；游戏改过存档路径时在此覆盖）
-saves_dir = "C:/Users/jh/Documents/My Games/Sid Meier's Civilization VI/Saves"
+# 文明6存档目录；留空/不写时自动使用当前用户的标准位置：
+#   <用户目录>/Documents/My Games/Sid Meier's Civilization VI/Saves
+# 游戏改过存档路径时，取消下一行注释并改成自己的路径。
+# saves_dir = "D:/Games/Civ6/Saves"
 
 # ── 进阶版：屏幕自动化运营（civ6_ops）按钮坐标校准 ──
 # 文明6 主界面"下一回合"按钮的窗口内相对坐标（0-1，以窗口左上角为原点）。

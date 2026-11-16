@@ -29,8 +29,12 @@ tag: 4=handshake(APP:/LSQ:), 3=command(CMD:<state>:<lua>), 1=help
 from __future__ import annotations
 
 import asyncio
-import importlib
 import re
+
+try:
+    from .civ6_lua_resources import load_lua as _lua
+except ImportError:  # 包外直接加载（测试/独立脚本）
+    from civ6_lua_resources import load_lua as _lua  # type: ignore
 
 try:
     from . import civ6_tuner_protocol as _protocol
@@ -84,52 +88,9 @@ async def tuner_status() -> dict:
 # ── Lua 脚本（焦点式市民分配，游戏官方机制） ──
 # 主逻辑统一用 pcall 包裹：API 名在不同版本/资料片有差异，失败输出明确 ERR 而非挂死超时。
 
-LUA_SET_FOCUS = """
-local targetYield = "{yield_type}"
-local ok, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
-if not ok or pPlayer == nil then print("ERR:NO_PLAYER") return end
-local yRow = GameInfo.Yields[targetYield]
-if yRow == nil then print("ERR:YIELD_NOT_FOUND|" .. targetYield) return end
-local okApply = pcall(function()
-  -- 遍历该玩家全部城市（GetCities():Members()），设置焦点（DEFAULT 清空全部焦点）
-  for i, pCity in pPlayer:GetCities():Members() do
-    local citz = pCity:GetCitizens()
-    for yr in GameInfo.Yields() do
-      local okFav, fav = pcall(function() return citz:IsFavoredYield(yr.Index) end)
-      if okFav and fav then pcall(function() citz:SetYieldFocus(yr.Index, false) end) end
-    end
-    if targetYield ~= "YIELD_DEFAULT" then
-      local okSet = pcall(function() citz:SetYieldFocus(yRow.Index, true) end)
-      if not okSet then print("ERR:SETFOCUS_FAILED|" .. pCity:GetName()) end
-    end
-    print("OK|" .. pCity:GetName() .. "|focus=" .. targetYield)
-  end
-end)
-if not okApply then print("ERR:SETFOCUS_FAILED") end
-"""
+LUA_SET_FOCUS = _lua("set_focus")
 
-LUA_LIST_CITIES = """
-local ok, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
-if not ok or pPlayer == nil then print("ERR:NO_PLAYER") return end
-local okList = pcall(function()
-  for i, c in pPlayer:GetCities():Members() do
-    local pop, growth = c:GetPopulation(), nil
-    local okG = pcall(function()
-      local g = c:GetGrowth()
-      if g then growth = tostring(g:GetTurnsUntilGrowth()) end
-    end)
-    if not okG then growth = "?" end
-    local yields = {{}}
-    for y = 0, 5 do
-      local okY, v = pcall(function() return c:GetYield(y) end)
-      yields[y + 1] = okY and tostring(v) or "?"
-    end
-    print(string.format("%s|pop=%d|food=%s|prod=%s|gold=%s|sci=%s|cult=%s|faith=%s|growth=%s",
-      c:GetName(), pop, yields[1], yields[2], yields[3], yields[4], yields[5], yields[6], growth))
-  end
-end)
-if not okList then print("ERR:LISTCITIES_FAILED") end
-"""
+LUA_LIST_CITIES = _lua("list_cities")
 
 
 async def list_cities(timeout: float = 8.0) -> dict:
@@ -171,25 +132,7 @@ async def list_cities(timeout: float = 8.0) -> dict:
 # 战争状态（v0.4.0）：Tuner 真实读取——比像素横幅检测可靠得多，
 # 用于"分清打仗和运营"：战争中 YUI 拒绝运营、立即交还控制权。
 # pcall 容错：不同版本 API 名可能有差异，失败返回明确 ERR 而非挂死/超时。
-LUA_AT_WAR = """
-local ok, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
-if not ok or pPlayer == nil then print("ERR:NO_PLAYER") return end
-local ok2, pDiplo = pcall(function() return pPlayer:GetDiplomacy() end)
-if not ok2 or pDiplo == nil then print("ERR:NO_DIPLOMACY") return end
-local count = 0
--- 遍历全部玩家槽（硬编码 0..62：GetNumPlayers 在该环境不可靠），逐人查 IsAtWarWith
-for i = 0, 62 do
-  local p = Players[i]
-  if p ~= nil then
-    local okAlive, alive = pcall(function() return p:IsAlive() end)
-    if okAlive and alive then
-      local okWar, atWar = pcall(function() return pDiplo:IsAtWarWith(i) end)
-      if okWar and atWar then count = count + 1 end
-    end
-  end
-end
-print("OK|at_war=" .. tostring(count))
-"""
+LUA_AT_WAR = _lua("at_war")
 
 
 async def at_war(timeout: float = 8.0) -> dict:
@@ -225,43 +168,7 @@ async def at_war(timeout: float = 8.0) -> dict:
     return {"ok": False, "error": "NO_RESPONSE", "detail": "|".join(out)}
 
 
-LUA_SITUATION = """
-local turn = 0
-local p = -1
-local civName = ""
-local cities = 0
-local techName = ""
-local okP, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
-if okP and pPlayer ~= nil then
-  p = Game.GetLocalPlayer() or -1
-  pcall(function() turn = Game.GetCurrentGameTurn() or 0 end)
-  local okCiv, civType = pcall(function() return pPlayer:GetCivilizationType() end)
-  if okCiv and civType ~= nil then
-    pcall(function()
-      if GameInfo and GameInfo.Civilizations and GameInfo.Civilizations[civType] ~= nil then
-        civName = tostring(GameInfo.Civilizations[civType].Name or "")
-      end
-    end)
-  end
-  local okCities, cList = pcall(function() return pPlayer:GetCities() end)
-  if okCities and cList ~= nil then
-    local okCnt, cnt = pcall(function() return cList:GetCount() end)
-    if okCnt and cnt ~= nil then cities = cnt end
-  end
-  local okTechs, techs = pcall(function() return pPlayer:GetTechs() end)
-  if okTechs and techs ~= nil then
-    local okCur, cur = pcall(function() return techs:GetCurrentResearch() end)
-    if okCur and cur ~= nil then
-      pcall(function()
-        if GameInfo and GameInfo.Technologies and GameInfo.Technologies[cur] ~= nil then
-          techName = tostring(GameInfo.Technologies[cur].Name or "")
-        end
-      end)
-    end
-  end
-end
-print("OK|turn=" .. tostring(turn) .. "|p=" .. tostring(p) .. "|civ=" .. tostring(civName) .. "|cities=" .. tostring(cities) .. "|tech=" .. tostring(techName))
-"""
+LUA_SITUATION = _lua("situation")
 
 
 async def read_situation(timeout: float = 8.0) -> dict:
@@ -390,32 +297,7 @@ async def read_production(timeout: float = 8.0) -> dict:
     turns_left}], "via": "tuner"}。生产队列为空（size=0）说明城市没选生产，
     文明6 会拒绝结束回合——这是"挂机不动"的根因，调用方需先 set_city_production。
     """
-    lua = """
-local s = {}
-local okT, t = pcall(function() return Game.GetCurrentGameTurn() end)
-s[#s+1] = "TURN=" .. tostring(t or -1)
-local okP, pPlayer = pcall(function() return Players[Game.GetLocalPlayer() or 0] end)
-if not okP or pPlayer == nil then
-  s[#s+1] = "ERR=NO_PLAYER"
-  print(table.concat(s, "&"))
-  return
-end
-pcall(function()
-  local idx = 0
-  for i, c in pPlayer:GetCities():Members() do
-    idx = idx + 1
-    local q = c:GetBuildQueue()
-    local sz = 0
-    pcall(function() sz = q:GetSize() or 0 end)
-    local curH = 0
-    pcall(function() curH = q:GetCurrentProductionTypeHash() or 0 end)
-    local tl = -1
-    pcall(function() tl = q:GetTurnsLeft() or -1 end)
-    s[#s+1] = string.format("C%d|sz=%d|h=%d|tl=%d", idx, sz, curH, tl)
-  end
-end)
-print(table.concat(s, "&"))
-"""
+    lua = _lua("read_production")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -500,45 +382,7 @@ async def set_city_production(
     selected_city = -1 if city_id is None else city_id
     only_empty = "true" if city_id is None else "false"
     x, y = -1 if plot_x is None else plot_x, -1 if plot_y is None else plot_y
-    request_lua = f"""
-local me = Game.GetLocalPlayer()
-local item = GameInfo.{_ITEM_KIND_TO_TABLE[kind]}["{item_name}"]
-if item == nil then print("ERR:ITEM_NOT_FOUND|{item_name}") return end
-local targets = {{}}
-local rejected = {{}}
-local occupied = 0
-local function consider(pCity)
-  if pCity == nil then return end
-  local id = pCity:GetID()
-  local bq = pCity:GetBuildQueue()
-  local size = bq:GetSize() or 0
-  if {only_empty} and size > 0 then occupied = occupied + 1; return end
-  local params = {{}}
-  params[CityOperationTypes.{param}] = item.Hash
-  params[CityOperationTypes.PARAM_INSERT_MODE] = CityOperationTypes.VALUE_EXCLUSIVE
-  if "{kind}" == "district" then
-    params[CityOperationTypes.PARAM_X] = {x}
-    params[CityOperationTypes.PARAM_Y] = {y}
-    if Map.GetPlot({x}, {y}) == nil then rejected[#rejected+1] = id .. ":PLOT"; return end
-  end
-  local canProduce, canStart = false, false
-  pcall(function() canProduce = bq:CanProduce(item.Hash, true) end)
-  pcall(function() canStart = CityManager.CanStartOperation(pCity, CityOperationTypes.BUILD, params, true) end)
-  if not canProduce or not canStart then rejected[#rejected+1] = id .. ":UNAVAILABLE"; return end
-  CityManager.RequestOperation(pCity, CityOperationTypes.BUILD, params)
-  targets[#targets+1] = id
-end
-if {selected_city} >= 0 then
-  local pCity = CityManager.GetCity(me, {selected_city})
-  if pCity == nil then print("ERR:CITY_NOT_FOUND|{selected_city}") return end
-  consider(pCity)
-else
-  for pCity in Players[me]:GetCities():Members() do consider(pCity) end
-end
-__civ6_prod_targets = targets
-print("REQUESTED=" .. tostring(#targets) .. "|OCCUPIED=" .. tostring(occupied)
-      .. "|REJECTED=" .. table.concat(rejected, ","))
-"""
+    request_lua = _lua("set_city_production_request").format(p12=_ITEM_KIND_TO_TABLE[kind], p11=item_name, p10=item_name, p9=only_empty, p8=param, p7=kind, p6=x, p5=y, p4=x, p3=y, p2=selected_city, p1=selected_city, p0=selected_city)
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -572,28 +416,7 @@ print("REQUESTED=" .. tostring(#targets) .. "|OCCUPIED=" .. tostring(occupied)
                 return {"ok": False, "error": "TIMEOUT", "detail": "生产读回总预算已耗尽，未宣称成功"}
             await asyncio.sleep(min(0.35, remaining))
             cleanup = "true" if attempt == 2 else "false"
-            verify_lua = f"""
-local me = Game.GetLocalPlayer()
-local item = GameInfo.{_ITEM_KIND_TO_TABLE[kind]}["{item_name}"]
-local targets = __civ6_prod_targets or {{}}
-local done, failed, queueSize = 0, 0, 0
-local failedIds = {{}}
-for _, id in ipairs(targets) do
-  local city = CityManager.GetCity(me, id)
-  local queue = city and city:GetBuildQueue() or nil
-  local size, current = 0, 0
-  if queue then
-    pcall(function() size = queue:GetSize() or 0 end)
-    pcall(function() current = queue:GetCurrentProductionTypeHash() or 0 end)
-  end
-  queueSize = queueSize + size
-  if size >= 1 and current == item.Hash then done = done + 1
-  else failed = failed + 1; failedIds[#failedIds+1] = id end
-end
-if done == #targets or {cleanup} then __civ6_prod_targets = nil end
-print("SET|done=" .. tostring(done) .. "|failed=" .. tostring(failed)
-      .. "|size=" .. tostring(queueSize) .. "|ids=" .. table.concat(failedIds, ","))
-"""
+            verify_lua = _lua("set_city_production_verify").format(p2=_ITEM_KIND_TO_TABLE[kind], p1=item_name, p0=cleanup)
             verified = await execute_lua(
                 reader, writer, verify_lua, state_index=_ingame_state_index(states),
                 timeout=max(0.1, deadline - loop.time()),
@@ -654,33 +477,7 @@ async def read_blockers(timeout: float = 8.0) -> dict:
     PRODUCTION（未选生产）/RESEARCH（未选科技）/CIVIC（未选市政）/
     UNIT_PROMOTION（单位可升级）/GOVERNOR_IDLE（总督空闲）/WORLD_CONGRESS_*（世界议会）。
     """
-    lua = """
-local me = Game.GetLocalPlayer()
-local list = NotificationManager.GetList(me)
-local seen = {}
-local found = 0
-if list then
-    for _, nid in ipairs(list) do
-        local entry = NotificationManager.Find(me, nid)
-        if entry and not entry:IsDismissed() then
-            local bt = entry:GetEndTurnBlocking()
-            if bt and bt ~= 0 then
-                local typeName = "UNKNOWN"
-                for k, v in pairs(EndTurnBlockingTypes) do
-                    if v == bt then typeName = k; break end
-                end
-                if not seen[typeName] then
-                    seen[typeName] = true
-                    local msg = (entry:GetMessage() or ""):gsub("|", "/")
-                    print("BLOCKING|" .. typeName .. "|" .. msg)
-                    found = found + 1
-                end
-            end
-        end
-    end
-end
-if found == 0 then print("NONE") end
-"""
+    lua = _lua("read_blockers")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -739,38 +536,7 @@ async def set_research(
             "ENDTURN_BLOCKING_CIVIC", "OK:PROGRESSING", "HasCivic", "GetCulture",
         )
 
-    lua = f"""
-local id = Game.GetLocalPlayer()
-local idx = nil
-for row in GameInfo.{gi_table}() do
-    if row.{type_field} == "{item_name}" then idx = row.Index; break end
-end
-if idx == nil then print("ERR:NOT_FOUND|{item_name}") return end
-if Players[id]:{player_m}():{has_m}(idx) then
-    print("ERR:ALREADY_COMPLETED|{item_name}") return
-end
-local params = {{}}
-params[PlayerOperations.{param}] = idx
-UI.RequestPlayerOperation(id, PlayerOperations.{operation}, params)
-local cleared = 0
-pcall(function()
-  local list = NotificationManager.GetList(id)
-  if list then
-    for _, nid in ipairs(list) do
-      local e = NotificationManager.Find(id, nid)
-      if e and not e:IsDismissed() then
-        local bt = e:GetEndTurnBlocking()
-        if bt and bt == EndTurnBlockingTypes.{blocking} then
-          pcall(function() NotificationManager.SendActivated(id, nid) end)
-          pcall(function() NotificationManager.Dismiss(id, nid) end)
-          cleared = cleared + 1
-        end
-      end
-    end
-  end
-end)
-print("{ok_prefix}|{item_name}|idx=" .. tostring(idx) .. "|cleared=" .. tostring(cleared))
-"""
+    lua = _lua("set_research").format(p11=gi_table, p10=type_field, p9=item_name, p8=item_name, p7=player_m, p6=has_m, p5=item_name, p4=param, p3=operation, p2=blocking, p1=ok_prefix, p0=item_name)
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -795,12 +561,7 @@ print("{ok_prefix}|{item_name}|idx=" .. tostring(idx) .. "|cleared=" .. tostring
             return {"ok": False, "error": "NO_RESPONSE", "detail": "设置研究无回执（Tuner 输出丢失），请重试"}
 
         # 写请求只发一次；后续只读回当前研究项，避免重复 RequestOperation。
-        verify_lua = f"""
-local id = Game.GetLocalPlayer()
-local current = -1
-pcall(function() current = Players[id]:{player_m}():{ "GetResearchingTech" if cat == "tech" else "GetProgressingCivic" }() end)
-print("VERIFY|current=" .. tostring(current) .. "|want={wanted}")
-"""
+        verify_lua = _lua("set_research_verify").format(p2=player_m, p1="GetResearchingTech" if cat == "tech" else "GetProgressingCivic", p0=wanted)
         for attempt in range(3):
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -839,33 +600,7 @@ async def units_blocker_status(timeout: float = 8.0) -> dict:
     注意：有移动力的单位属于"打仗/探索归玩家"的范围，运营方不应擅自动作；
     若运营托管且用户授权自动跳过（侦察兵探路类），可调 skip_idle_units(force=True)。
     """
-    lua = """
-local me = Game.GetLocalPlayer()
-local busy = {}
-local idle = 0
-local total = 0
-pcall(function()
-  for _, u in Players[me]:GetUnits():Members() do
-    if u:GetX() ~= -9999 then
-      total = total + 1
-      local m = u:GetMovesRemaining() or 0
-      if m > 0 then
-        local nm = ""
-        pcall(function() nm = u:GetName() end)
-        busy[#busy+1] = tostring(nm) .. ":" .. tostring(m)
-      else
-        idle = idle + 1
-      end
-    end
-  end
-end)
-local parts = {}
-parts[#parts+1] = "TOTAL=" .. tostring(total)
-parts[#parts+1] = "IDLE=" .. tostring(idle)
-parts[#parts+1] = "BUSY=" .. tostring(#busy)
-parts[#parts+1] = "LIST=" .. table.concat(busy, ",")
-print(table.concat(parts, "&"))
-"""
+    lua = _lua("units_blocker_status")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -911,26 +646,7 @@ async def skip_idle_units(force: bool = False, timeout: float = 8.0) -> dict:
     注意：不要对战争单位使用 force=True（打仗归玩家，不能替玩家动兵）。
     返回 {"ok", "skipped", "left_with_moves"}。
     """
-    lua = """
-local me = Game.GetLocalPlayer()
-local skipped = 0
-local left = 0
-local forced = %s
-pcall(function()
-  for _, u in Players[me]:GetUnits():Members() do
-    if u:GetX() ~= -9999 then
-      local m = u:GetMovesRemaining() or 0
-      if forced or m <= 0 then
-        pcall(function() UnitManager.FinishMoves(u) end)
-        skipped = skipped + 1
-      else
-        left = left + 1
-      end
-    end
-  end
-end)
-print("SKIPPED=" .. tostring(skipped) .. "&LEFT=" .. tostring(left))
-""" % ("true" if force else "false")
+    lua = _lua("skip_idle_units").format(forced="true" if force else "false")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -976,21 +692,7 @@ async def auto_pick_research(category: str = "tech", timeout: float = 8.0) -> di
     else:
         gi_table, has_m, player_m = "Civics", "HasCivic", "GetCulture"
         type_field = "CivicType"
-    lua = f"""
-local id = Game.GetLocalPlayer()
-local pick = ""
-pcall(function()
-  for row in GameInfo.{gi_table}() do
-    local p = Players[id]:{player_m}()
-    if p and not p:{has_m}(row.Index) then
-      local ok = false
-      pcall(function() ok = p:CanResearch(row.Index) end)
-      if ok then pick = row.{type_field}; break end
-    end
-  end
-end)
-print("PICK=" .. pick)
-"""
+    lua = _lua("auto_pick_research").format(p3=gi_table, p2=player_m, p1=has_m, p0=type_field)
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -1027,56 +729,7 @@ async def move_explorers(timeout: float = 20.0) -> dict:
     Python 侧短等待后再由 skip_idle_units 结束剩余移动力（blocker 消除）。
     返回 {"ok", "moved": n, "targets": ["9,13->10,13", ...]}。
     """
-    lua = """
-local me = Game.GetLocalPlayer()
-local capX, capY = -1, -1
-pcall(function()
-  local cap = Players[me]:GetCities():GetCapitalCity()
-  if cap then capX, capY = cap:GetX(), cap:GetY() end
-end)
-if capX < 0 then
-  pcall(function()
-    for _, c in Players[me]:GetCities():Members() do capX, capY = c:GetX(), c:GetY(); break end
-  end)
-end
-local targets = {}
-local seen = {}
-for _, u in Players[me]:GetUnits():Members() do
-  if u:GetX() ~= -9999 and not seen[u:GetID()] then
-    seen[u:GetID()] = true
-    local info = GameInfo.Units[u:GetType()]
-    if info and info.UnitType == "UNIT_SCOUT" and (u:GetMovesRemaining() or 0) > 0 then
-      local x, y = u:GetX(), u:GetY()
-      local best, bestScore = nil, -999999
-      for dx = -1, 1 do for dy = -1, 1 do
-        if dx ~= 0 or dy ~= 0 then
-          local nx, ny = x + dx, y + dy
-          local p = Map.GetPlot(nx, ny)
-          if p and not p:IsWater() and not p:IsMountain() then
-            local occ = false
-            local us = Map.GetUnitsAt(nx, ny)
-            if us then
-              for o in us:Units() do if o:GetOwner() == me then occ = true; break end end
-            end
-            if not occ then
-              local score = (nx - capX) * dx + (ny - capY) * dy
-              if score > bestScore then bestScore = score; best = {nx, ny} end
-            end
-          end
-        end
-      end end
-      if best then
-        local params = {}
-        params[UnitOperationTypes.PARAM_X] = best[1]
-        params[UnitOperationTypes.PARAM_Y] = best[2]
-        pcall(function() UnitManager.RequestOperation(u, UnitOperationTypes.MOVE_TO, params) end)
-        targets[#targets+1] = tostring(x) .. "," .. tostring(y) .. "->" .. tostring(best[1]) .. "," .. tostring(best[2])
-      end
-    end
-  end
-end
-print("MOVED=" .. table.concat(targets, "|"))
-"""
+    lua = _lua("move_explorers")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -1110,60 +763,7 @@ async def read_threats(timeout: float = 10.0) -> dict:
     强大的敌人怎么办"：先看清敌我力量对比，再决定撤/守。
     返回 {"ok", "units": [{id, type, x, y, str, moves, threat_str, threat_count, threat_dist}]}。
     """
-    lua = """
-local me = Game.GetLocalPlayer()
-local function isHostile(owner)
-  if owner == nil or owner < 0 or owner == me then return false end
-  local other = Players[owner]
-  if other == nil then return false end
-  local barbarian = false
-  pcall(function() barbarian = other:IsBarbarian() end)
-  if barbarian then return true end
-  local atWar = false
-  pcall(function() atWar = Players[me]:GetDiplomacy():IsAtWarWith(owner) end)
-  return atWar
-end
-local rows = {}
-for _, u in Players[me]:GetUnits():Members() do
-  local x, y = u:GetX(), u:GetY()
-  if x ~= -9999 then
-    local info = GameInfo.Units[u:GetType()]
-    local ut = info and info.UnitType or "?"
-    local str = 0
-    if info and info.Combat then str = info.Combat end
-    local moves = 0
-    pcall(function() moves = u:GetMovesRemaining() or 0 end)
-    local tStr, tCount, tDist = -1, 0, 99
-    for dx = -2, 2 do for dy = -2, 2 do
-      if dx ~= 0 or dy ~= 0 then
-        local nx, ny = x + dx, y + dy
-        if Map.GetPlot(nx, ny) then
-          pcall(function()
-            local us = Map.GetUnitsAt(nx, ny)
-            if us then
-              for o in us:Units() do
-                -- 敌我由单位所有者和外交战争状态决定，与地块归属无关；平民不构成战斗威胁。
-                local ei = GameInfo.Units[o:GetType()]
-                local cs = ei and ei.Combat or 0
-                if isHostile(o:GetOwner()) and cs > 0 then
-                  tCount = tCount + 1
-                  if cs > tStr then
-                    tStr = cs
-                    tDist = math.max(math.abs(dx), math.abs(dy))
-                  end
-                end
-              end
-            end
-          end)
-        end
-      end
-    end end
-    rows[#rows+1] = string.format("%d|%s|%d,%d|%d|%d|%d|%d|%d",
-        u:GetID(), ut, x, y, str, moves, tStr, tCount, tDist)
-  end
-end
-print("THREATS|" .. table.concat(rows, ";;"))
-"""
+    lua = _lua("read_threats")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -1208,99 +808,7 @@ async def auto_evade_threats(timeout: float = 15.0) -> dict:
     侦察兵/勇士/建造者都适用（建造者遇到蛮族也会撤）。移动用 InGame MOVE_TO（异步生效），
     调用方短等待后再 skip。返回 {"ok", "evaded": ["WARRIOR:9,13->8,14 敌强撤"]}。
     """
-    lua = """
-local me = Game.GetLocalPlayer()
-local capX, capY = -1, -1
-pcall(function()
-  local cap = Players[me]:GetCities():GetCapitalCity()
-  if cap then capX, capY = cap:GetX(), cap:GetY() end
-end)
-local function isHostile(owner)
-  if owner == nil or owner < 0 or owner == me then return false end
-  local other = Players[owner]
-  if other == nil then return false end
-  local barbarian = false
-  pcall(function() barbarian = other:IsBarbarian() end)
-  if barbarian then return true end
-  local atWar = false
-  pcall(function() atWar = Players[me]:GetDiplomacy():IsAtWarWith(owner) end)
-  return atWar
-end
-local evaded = {}
--- 先收集威胁信息（同 read_threats），对受威胁且有移动力的单位找远离方向
-local danger = {}
-for _, u in Players[me]:GetUnits():Members() do
-  local x, y = u:GetX(), u:GetY()
-  if x ~= -9999 then
-    local uinfo = GameInfo.Units[u:GetType()]
-    local str = 0
-    if uinfo and uinfo.Combat then str = uinfo.Combat end
-    local tStr, tCount, tDX, tDY = -1, 0, 0, 0
-    for dx = -2, 2 do for dy = -2, 2 do
-      if dx ~= 0 or dy ~= 0 then
-        if Map.GetPlot(x + dx, y + dy) then
-          pcall(function()
-            local us = Map.GetUnitsAt(x + dx, y + dy)
-            if us then
-              for o in us:Units() do
-                local ei = GameInfo.Units[o:GetType()]
-                local cs = ei and ei.Combat or 0
-                if isHostile(o:GetOwner()) and cs > 0 then
-                  tCount = tCount + 1
-                  if cs > tStr then tStr = cs; tDX = dx; tDY = dy end
-                end
-              end
-            end
-          end)
-        end
-      end
-    end end
-    if tCount > 0 and tStr >= str * 1.2 then
-      danger[u:GetID()] = {x=x, y=y, str=str, tStr=tStr, tDX=tDX, tDY=tDY}
-    end
-  end
-end
--- 对受威胁单位：向远离威胁方向找相邻可行格移动
-for _, u in Players[me]:GetUnits():Members() do
-  local d = danger[u:GetID()]
-  if d and (u:GetMovesRemaining() or 0) > 0 then
-    local best, bestScore = nil, -999999
-    for dx = -1, 1 do for dy = -1, 1 do
-      if dx ~= 0 or dy ~= 0 then
-        local nx, ny = d.x + dx, d.y + dy
-        local p = Map.GetPlot(nx, ny)
-        if p and not p:IsWater() and not p:IsMountain() then
-          local occ = false
-          local us = Map.GetUnitsAt(nx, ny)
-          if us then
-            for o in us:Units() do if o:GetOwner() == me then occ = true break end end
-          end
-          if not occ then
-            -- 远离威胁方向分（沿威胁反向）+ 靠近首都分
-            local score = -((nx - d.x) * d.tDX + (ny - d.y) * d.tDY)
-            if capX >= 0 then
-              local towardCap = (d.x - capX) * (d.x - nx) + (d.y - capY) * (d.y - ny)
-              score = score + towardCap * 0.5
-            end
-            if score > bestScore then bestScore = score; best = {nx, ny} end
-          end
-        end
-      end
-    end end
-    if best then
-      local params = {}
-      params[UnitOperationTypes.PARAM_X] = best[1]
-      params[UnitOperationTypes.PARAM_Y] = best[2]
-      pcall(function() UnitManager.RequestOperation(u, UnitOperationTypes.MOVE_TO, params) end)
-      local info = GameInfo.Units[u:GetType()]
-      local ut = info and info.UnitType or "?"
-      evaded[#evaded+1] = string.format("%s:%d,%d->%d,%d 敌强(%d)撤",
-          ut, d.x, d.y, best[1], best[2], d.tStr)
-    end
-  end
-end
-print("EVADED=" .. table.concat(evaded, "|"))
-"""
+    lua = _lua("auto_evade_threats")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -1335,104 +843,7 @@ async def auto_use_builder(timeout: float = 20.0) -> dict:
     与 CanStartOperation 校验一致）。无可用相邻格则不动（不瞎跑）。
     返回 {"ok", "built": ["FARM@10,14"], "detail"}。
     """
-    lua = """
-local me = Game.GetLocalPlayer()
-local capX, capY = -1, -1
-pcall(function()
-  local cap = Players[me]:GetCities():GetCapitalCity()
-  if cap then capX, capY = cap:GetX(), cap:GetY() end
-end)
-local whitelist = {"IMPROVEMENT_FARM", "IMPROVEMENT_MINE", "IMPROVEMENT_PASTURE",
-                   "IMPROVEMENT_QUARRY", "IMPROVEMENT_PLANTATION", "IMPROVEMENT_CAMP",
-                   "IMPROVEMENT_LUMBER_MILL"}
-local built = {}
-local moved = {}
-local done = {}
-local function pick_improvement(u, nx, ny)
-  local p = Map.GetPlot(nx, ny)
-  if p == nil then return nil end
-  local owner = -1
-  pcall(function() owner = p:GetOwner() end)
-  if owner ~= me then return nil end
-  local hasImp = -1
-  pcall(function() hasImp = p:GetImprovementType() end)
-  if hasImp >= 0 then return nil end
-  local occ = false
-  local us = Map.GetUnitsAt(nx, ny)
-  if us then
-    for o in us:Units() do if o:GetOwner() == me then occ = true break end end
-  end
-  if occ then return nil end
-  local bestImp, impScore = nil, -999999
-  for _, impName in ipairs(whitelist) do
-    local imp = GameInfo.Improvements[impName]
-    if imp then
-      local params = {}
-      params[UnitOperationTypes.PARAM_X] = nx
-      params[UnitOperationTypes.PARAM_Y] = ny
-      params[UnitOperationTypes.PARAM_IMPROVEMENT_TYPE] = imp.Hash
-      local ok, can = pcall(function()
-        return UnitManager.CanStartOperation(u, UnitOperationTypes.BUILD_IMPROVEMENT, nil, params)
-      end)
-      if ok and can then
-        local sc = 0
-        local res = -1
-        pcall(function() res = p:GetResourceType() end)
-        if res >= 0 then sc = 100 end
-        if impName == "IMPROVEMENT_FARM" then sc = sc + 50 end
-        if impName == "IMPROVEMENT_MINE" then sc = sc + 40 end
-        if sc > impScore then impScore = sc; bestImp = impName end
-      end
-    end
-  end
-  if bestImp then
-    local sc = impScore
-    if capX >= 0 then
-      sc = sc - (math.abs(nx - capX) + math.abs(ny - capY))
-    end
-    return {nx, ny, bestImp, sc}
-  end
-  return nil
-end
-for _, u in Players[me]:GetUnits():Members() do
-  if not done[u:GetID()] then
-    done[u:GetID()] = true
-    local info = GameInfo.Units[u:GetType()]
-    if info and info.UnitType == "UNIT_BUILDER" and (u:GetMovesRemaining() or 0) > 0 then
-      local x, y = u:GetX(), u:GetY()
-      if x ~= -9999 then
-        -- 情况1：当前格可建 → 原地直接建（BUILD 要求单位在目标格）
-        local cur = pick_improvement(u, x, y)
-        if cur then
-          local params = {}
-          params[UnitOperationTypes.PARAM_X] = cur[1]
-          params[UnitOperationTypes.PARAM_Y] = cur[2]
-          params[UnitOperationTypes.PARAM_IMPROVEMENT_TYPE] = GameInfo.Improvements[cur[3]].Hash
-          pcall(function() UnitManager.RequestOperation(u, UnitOperationTypes.BUILD_IMPROVEMENT, params) end)
-          built[#built+1] = cur[3] .. "@" .. cur[1] .. "," .. cur[2]
-        else
-          -- 情况2：相邻最优可建格 → 先移动过去（下回合建）
-          local best, bestScore = nil, -999999
-          for dx = -1, 1 do for dy = -1, 1 do
-            if dx ~= 0 or dy ~= 0 then
-              local cand = pick_improvement(u, x + dx, y + dy)
-              if cand and cand[4] > bestScore then bestScore = cand[4]; best = cand end
-            end
-          end end
-          if best then
-            local params = {}
-            params[UnitOperationTypes.PARAM_X] = best[1]
-            params[UnitOperationTypes.PARAM_Y] = best[2]
-            pcall(function() UnitManager.RequestOperation(u, UnitOperationTypes.MOVE_TO, params) end)
-            moved[#moved+1] = x .. "," .. y .. "->" .. best[1] .. "," .. best[2] .. "(待建" .. best[3] .. ")"
-          end
-        end
-      end
-    end
-  end
-end
-print("BUILT=" .. table.concat(built, "|") .. "|MOVED=" .. table.concat(moved, "|"))
-"""
+    lua = _lua("auto_use_builder")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -1468,49 +879,7 @@ async def read_economy(timeout: float = 8.0) -> dict:
 
     供 civ6_ops_status 汇报与政策/万神殿局面感知决策。
     """
-    lua = """
-local me = Game.GetLocalPlayer()
-local gold, faith = -1, -1
-pcall(function() gold = Players[me]:GetTreasury():GetGoldBalance() end)
-pcall(function() faith = Players[me]:GetFaithBalance() end)
-if faith < 0 then pcall(function() faith = Players[me]:GetReligion():GetFaith() end) end
-local pop, cities = 0, 0
-pcall(function()
-  for _, c in Players[me]:GetCities():Members() do cities = cities + 1; pop = pop + c:GetPopulation() end
-end)
-local scouts, warriors, builders = 0, 0, 0
-local districts = 0
-pcall(function()
-  for _, u in Players[me]:GetUnits():Members() do
-    local info = GameInfo.Units[u:GetType()]
-    if info then
-      local ut = info.UnitType
-      if ut == "UNIT_SCOUT" then scouts = scouts + 1
-      elseif ut == "UNIT_WARRIOR" then warriors = warriors + 1
-      elseif ut == "UNIT_BUILDER" then builders = builders + 1 end
-    end
-  end
-end)
-pcall(function()
-  for _, c in Players[me]:GetCities():Members() do
-    for _, d in c:GetDistricts():Members() do
-      if not d:IsPillaged() then districts = districts + 1 end
-    end
-  end
-end)
-local capX, capY = -1, -1
-pcall(function()
-  local cap = Players[me]:GetCities():GetCapitalCity()
-  if cap then capX, capY = cap:GetX(), cap:GetY() end
-end)
-local pan = -1
-pcall(function() pan = Players[me]:GetReligion():GetPantheon() end)
-print("ECO|gold=" .. tostring(gold) .. "|faith=" .. tostring(faith) .. "|pop=" .. tostring(pop) ..
-      "|cities=" .. tostring(cities) .. "|scouts=" .. tostring(scouts) ..
-      "|warriors=" .. tostring(warriors) .. "|builders=" .. tostring(builders) ..
-      "|districts=" .. tostring(districts) ..
-      "|cap=" .. tostring(capX) .. "," .. tostring(capY) .. "|pantheon=" .. tostring(pan))
-"""
+    lua = _lua("read_economy")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -1552,54 +921,7 @@ async def read_diplomacy(timeout: float = 10.0) -> dict:
 
     供 civ6_ops_status 外交面板与 GIVE_INFLUENCE_TOKEN 自动决策。
     """
-    lua = """
-local me = Game.GetLocalPlayer()
-local rows = {}
--- 我方使节资源
-local tokens = 0
-pcall(function() tokens = Players[me]:GetInfluence():GetTokensToGive() end)
--- 我方首都（算距离用）
-local capX, capY = -1, -1
-pcall(function()
-  local cap = Players[me]:GetCities():GetCapitalCity()
-  if cap then capX, capY = cap:GetX(), cap:GetY() end
-end)
--- 我方对各文明的关系状态（对方AI视角）
-local rels = {}
-for i = 0, 63 do
-  if Players[i] and i ~= me and Players[i]:IsAlive() then
-    local cfg = PlayerConfigurations[i]
-    local civName = cfg and Locale.Lookup(cfg:GetCivilizationShortDescription()) or "?"
-    local stateIdx = -1
-    pcall(function() stateIdx = Players[i]:GetDiplomaticAI():GetDiplomaticStateIndex(me) end)
-    local stName = "?"
-    pcall(function()
-      local st = GameInfo.DiplomaticStates[stateIdx]
-      if st then stName = st.StateType or tostring(stateIdx) end
-    end)
-    local isMajor, isBarb = true, false
-    pcall(function() isMajor = Players[i]:IsMajor() end)
-    pcall(function() isBarb = Players[i]:IsBarbarian() end)
-    if not isMajor and not isBarb then
-      local csx, csy = -1, -1
-      pcall(function()
-        for _, c in Players[i]:GetCities():Members() do csx, csy = c:GetX(), c:GetY(); break end
-      end)
-      local dist = -1
-      pcall(function() dist = Map.GetPlotsDistance(capX, capY, csx, csy) end)
-      local canGive = false
-      pcall(function() canGive = Players[me]:GetInfluence():CanGiveTokensToPlayer(i) end)
-      local envoys = 0
-      pcall(function() envoys = Players[me]:GetInfluence():GetEnvoys(i) end)
-      rows[#rows+1] = "CS|" .. civName .. "|dist=" .. tostring(dist) ..
-                      "|envoys=" .. tostring(envoys) .. "|can=" .. tostring(canGive)
-    else
-      rows[#rows+1] = "CIV|" .. civName .. "|" .. stName
-    end
-  end
-end
-print("DIPLOMACY|tokens=" .. tostring(tokens) .. "&ROWS=" .. table.concat(rows, ";"))
-"""
+    lua = _lua("read_diplomacy")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -1646,37 +968,7 @@ async def read_culture(timeout: float = 10.0) -> dict:
 
     供 civ6_ops_status 文化面板——文化胜利要素可视化（读，不自动决策）。
     """
-    lua = """
-local me = Game.GetLocalPlayer()
-local cultYield, tourism, gwCount = -1, -1, 0
-pcall(function() cultYield = Players[me]:GetCulture():GetCultureYield() end)
-pcall(function() tourism = Players[me]:GetStats():GetTourism() end)
--- 巨作计数：遍历我方城市建筑槽
-pcall(function()
-  for _, c in Players[me]:GetCities():Members() do
-    local bldgs = c:GetBuildings()
-    for b in GameInfo.Buildings() do
-      local slots = -1
-      pcall(function() slots = bldgs:GetNumGreatWorkSlots(b.Index) end)
-      if slots > 0 then
-        for s = 0, slots - 1 do
-          local ok, gw = pcall(function() return bldgs:GetGreatWorkInSlot(b.Index, s) end)
-          if ok and gw >= 0 then gwCount = gwCount + 1 end
-        end
-      end
-    end
-  end
-end)
-local civic = -1
-pcall(function() civic = Players[me]:GetCulture():GetCurrentCivic() or -1 end)
-local civicName = "?"
-pcall(function()
-  local ci = GameInfo.Civics[civic]
-  if ci then civicName = ci.CivicType end
-end)
-print("CULTURE|yield=" .. tostring(cultYield) .. "|tourism=" .. tostring(tourism) ..
-      "|gw=" .. tostring(gwCount) .. "|civic=" .. tostring(civicName))
-"""
+    lua = _lua("read_culture")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -1712,53 +1004,7 @@ async def close_ui_popups(timeout: float = 10.0) -> dict:
 
     自然奇观或菜单在官方调用后仍可见时返回失败，由上层交还玩家处理。
     """
-    lua = """
-local paths = {"/InGame/AdvisorPopup/AdvisorBase", "/InGame/AdvisorPopup",
-               "/InGame/TechCivicCompletedPopup", "/InGame/NewTurnPanel",
-               "/InGame/EraCompletePopup", "/InGame/GreatPeoplePopup",
-               "/InGame/ChooseArtifact", "/InGame/UnitPromotionPopup",
-               "/InGame/RazeCity", "/InGame/EspionagePopup", "/InGame/EventPopup",
-               "/InGame/BoostUnlockedPopup"}
-local closed = 0
-for pass = 1, 3 do
-  for _, p in ipairs(paths) do
-    pcall(function()
-      local c = ContextPtr:LookUpControl(p)
-      if c then c:SetHide(true); closed = closed + 1 end
-    end)
-  end
-end
-pcall(function()
-  local c = ContextPtr:LookUpControl("/InGame/InGameTopOptionsMenu")
-  if c and not c:IsHidden() then
-    LuaEvents.InGameTopOptionsMenu_Close()
-    UIManager:DequeuePopup(c)
-    c:SetHide(true)
-    closed = closed + 1
-  end
-end)
-for _, p in ipairs({"/InGame/Options", "/InGame/LoadGameMenu", "/InGame/SaveGameMenu",
-                    "/InGame/InGameTopOptionsMenu/Options",
-                    "/InGame/InGameTopOptionsMenu/LoadGameMenu",
-                    "/InGame/InGameTopOptionsMenu/SaveGameMenu"}) do
-  pcall(function()
-    local c = ContextPtr:LookUpControl(p)
-    if c and not c:IsHidden() then c:SetHide(true); closed = closed + 1 end
-  end)
-end
-pcall(function() LuaEvents.NaturalWonderPopup_Closed() end)
-pcall(function() Events.HideLeaderScreen() end)
-local nwVisible, menuVisible = false, false
-pcall(function()
-  local c = ContextPtr:LookUpControl("/InGame/NaturalWonderPopup")
-  if c then nwVisible = not c:IsHidden() end
-end)
-pcall(function()
-  local c = ContextPtr:LookUpControl("/InGame/InGameTopOptionsMenu")
-  if c then menuVisible = not c:IsHidden() end
-end)
-print("CLOSED=" .. tostring(closed) .. "&NW=" .. tostring(nwVisible) .. "&MENU=" .. tostring(menuVisible))
-"""
+    lua = _lua("close_ui_popups")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -1798,53 +1044,7 @@ async def auto_resolve_soft_blockers(timeout: float = 10.0) -> dict:
     返回 {"ok", "resolved": [类型列表]}。
     生产/科技/市政/单位/议会投票/间谍逃跑路线等策略性 blocker 不在此处理，交玩家决策。
     """
-    lua = """
-local me = Game.GetLocalPlayer()
-local resolved = {}
-local mark = function(name)
-  local dup = false
-  for _, v in ipairs(resolved) do if v == name then dup = true break end end
-  if not dup then resolved[#resolved+1] = name end
-end
--- 遍历通知，仅处理明确支持的软 blocker；宣战与间谍等普通/策略通知保持原样。
-pcall(function()
-  local list = NotificationManager.GetList(me)
-  if list then
-    for _, nid in ipairs(list) do
-      local e = NotificationManager.Find(me, nid)
-      if e and not e:IsDismissed() then
-        local bt = e:GetEndTurnBlocking()
-        if bt then
-          if bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_GOVERNOR_IDLE then
-            pcall(function() NotificationManager.SendActivated(me, nid) end)
-            pcall(function() NotificationManager.Dismiss(me, nid) end)
-            mark("GOVERNOR_IDLE")
-          elseif bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_WORLD_CONGRESS_LOOK then
-            pcall(function() NotificationManager.Dismiss(me, nid) end)
-            mark("WORLD_CONGRESS_LOOK")
-          elseif bt == EndTurnBlockingTypes.ENDTURN_BLOCKING_WORLD_CONGRESS_SPECIAL_SESSION then
-            pcall(function() NotificationManager.Dismiss(me, nid) end)
-            mark("WORLD_CONGRESS_SPECIAL_SESSION")
-          end
-        end
-      end
-    end
-  end
-end)
--- 考虑更换政体（不依赖通知）
-pcall(function()
-  local p = Players[me]
-  if p and p:GetCulture() and p:GetCulture():GetGovernmentChangeConsidered() == false then
-    p:GetCulture():SetGovernmentChangeConsidered(true)
-    mark("GOVERNMENT_CHANGE")
-  end
-end)
--- 世界议会"已查看"标记
-pcall(function()
-  UI.RequestPlayerOperation(me, PlayerOperations.WORLD_CONGRESS_LOOKED_AT_AVAILABLE, {})
-end)
-print("RESOLVED=" .. table.concat(resolved, ","))
-"""
+    lua = _lua("auto_resolve_soft_blockers")
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -1869,20 +1069,56 @@ print("RESOLVED=" .. table.concat(resolved, ","))
     return {"ok": False, "error": "NO_RESPONSE", "detail": "软 blocker 处理无回执（Tuner 输出丢失），请重试"}
 
 
-# 自动决策/写操作已拆到 civ6_tuner_auto.py；这里重新导出，保持原有模块路径兼容。
-# 不用 `from ... import *`：Market 验证会在 --ignore-noqa 下报 F403，且底部导入会触发 E402。
-# importlib 在运行时按包内/包外两种路径解析，等价于原星号导出，但静态检查只看得到真实导入。
-def _reexport_auto() -> None:
-    if __package__:
-        try:
-            module = importlib.import_module(".civ6_tuner_auto", __package__)
-        except ImportError:  # 包外直接加载（测试/独立脚本）
-            module = importlib.import_module("civ6_tuner_auto")
-    else:
-        module = importlib.import_module("civ6_tuner_auto")
-    for name in module.__all__:
-        globals()[name] = getattr(module, name)
+# 自动决策/写操作保持原模块路径兼容。显式导入与字面量 __all__ 可供 IDE、
+# Ruff 和 N.E.K.O Market 静态检查识别；auto 侧的延迟门面负责打断初始化环。
+__all__ = [
+    "HEADER_FMT", "HEADER_SIZE", "TAG_HANDSHAKE", "TAG_COMMAND", "DEFAULT_HOST", "DEFAULT_PORT",
+    "TunerError", "handshake", "execute_lua", "LUA_SET_FOCUS", "LUA_LIST_CITIES", "LUA_AT_WAR",
+    "LUA_SITUATION", "tuner_status", "list_cities", "at_war", "read_situation", "set_focus",
+    "read_production", "set_city_production", "end_turn", "read_blockers", "set_research",
+    "units_blocker_status", "skip_idle_units", "auto_pick_research", "move_explorers", "read_threats",
+    "auto_evade_threats", "auto_use_builder", "read_economy", "read_diplomacy", "read_culture",
+    "close_ui_popups", "auto_resolve_soft_blockers", "auto_decide_production", "register_wc_voter",
+    "unregister_wc_voter", "auto_manage_money", "auto_found_religion", "auto_recruit_great_person",
+    "auto_trade_route", "auto_manage_spy", "auto_war_response", "auto_choose_pantheon",
+    "auto_send_envoy", "auto_promote_units", "auto_appoint_governor", "auto_choose_commemoration",
+    "auto_fill_policy_slots",
+]
 
-
-_reexport_auto()
+try:
+    from .civ6_tuner_auto import (  # noqa: E402
+        auto_appoint_governor,
+        auto_choose_commemoration,
+        auto_choose_pantheon,
+        auto_decide_production,
+        auto_fill_policy_slots,
+        auto_found_religion,
+        auto_manage_money,
+        auto_manage_spy,
+        auto_promote_units,
+        auto_recruit_great_person,
+        auto_send_envoy,
+        auto_trade_route,
+        auto_war_response,
+        register_wc_voter,
+        unregister_wc_voter,
+    )
+except ImportError:  # 包外直接加载（测试/独立脚本）
+    from civ6_tuner_auto import (  # type: ignore  # noqa: E402
+        auto_appoint_governor,
+        auto_choose_commemoration,
+        auto_choose_pantheon,
+        auto_decide_production,
+        auto_fill_policy_slots,
+        auto_found_religion,
+        auto_manage_money,
+        auto_manage_spy,
+        auto_promote_units,
+        auto_recruit_great_person,
+        auto_send_envoy,
+        auto_trade_route,
+        auto_war_response,
+        register_wc_voter,
+        unregister_wc_voter,
+    )
 

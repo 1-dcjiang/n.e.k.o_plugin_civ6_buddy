@@ -162,14 +162,20 @@ async def _connect(host: str, port: int, timeout: float) -> tuple[asyncio.Stream
 async def handshake(
     host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: float = 5.0,
 ) -> tuple[str, list[str], asyncio.StreamReader, asyncio.StreamWriter]:
-    """连接 + 握手。返回 (app_identity, lua_states, reader, writer)。"""
-    reader, writer = await _connect(host, port, timeout)
+    """连接 + 握手；连接、APP、LSQ 共享一个总预算。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.001, timeout)
+
+    def remaining() -> float:
+        return max(0.001, deadline - loop.time())
+
+    reader, writer = await _connect(host, port, remaining())
     try:
         await _drain(reader)
         await _send(writer, TAG_HANDSHAKE, "APP:")
-        _, app_id = await _recv(reader, timeout)
+        _, app_id = await _recv(reader, remaining())
         await _send(writer, TAG_HANDSHAKE, "LSQ:")
-        _, raw = await _recv(reader, timeout)
+        _, raw = await _recv(reader, remaining())
         states = [s.strip() for s in raw.replace("\x00", "\n").split("\n") if s.strip()]
         return app_id, states, reader, writer
     except asyncio.CancelledError:
@@ -237,15 +243,25 @@ async def execute_lua(
     return lines
 
 
-async def _handshake_retry(retries: int = 2, delay: float = 0.5):
-    """握手带重试：游戏 Tuner 单连接限制下，紧接的连接可能被 RST（前连接未释放），
-    短暂等待后重试即可成功。"""
+async def _handshake_retry(retries: int = 2, delay: float = 0.5, timeout: float | None = None):
+    """握手带重试；传入 timeout 时全部握手与退避共享 monotonic deadline。"""
     last: Exception | None = None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.001, timeout) if timeout is not None else None
     for attempt in range(retries + 1):
+        remaining = deadline - loop.time() if deadline is not None else 5.0
+        if remaining <= 0:
+            break
         try:
-            return await handshake()
+            return await handshake(timeout=max(0.001, remaining))
         except TunerError as exc:
             last = exc
             if attempt < retries:
-                await asyncio.sleep(delay)
-    raise last if last else TunerError("握手失败")
+                if deadline is not None:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(delay, remaining))
+                else:
+                    await asyncio.sleep(delay)
+    raise last if last else TunerError("握手总预算已耗尽")

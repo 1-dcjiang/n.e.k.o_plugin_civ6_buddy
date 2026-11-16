@@ -45,7 +45,7 @@ def _bare_plugin():
     plugin._ops_screen_thread = None
     plugin._ops_cleanup_lock = asyncio.Lock()
 
-    async def cleanup():
+    async def cleanup(deadline=None):
         return {"ok": True, "registered": False}
 
     plugin._cleanup_managed_runtime = cleanup
@@ -416,19 +416,31 @@ def test_units_with_moves_execute_evade_builder_and_explorer(monkeypatch):
 
 
 def test_war_hands_off_before_any_unit_movement(monkeypatch):
+    """从完整 tick 入口侦测战争，不向回合管理器注入 war_flag。"""
+    plugin = _bare_plugin()
+    plugin._ops_active = True
+
+    async def tuner_status(*_args, **_kwargs):
+        return {"ok": True}
+
+    async def at_war(*_args, **_kwargs):
+        return {"ok": True, "at_war": 1}
+
     async def forbidden(*_args, **_kwargs):
-        raise AssertionError("战争时不得自动避险、改良、探路或结束回合")
+        raise AssertionError("战争时不得读单位、避险、改良、探路、跳过或结束回合")
 
-    blockers = [{"type": "ENDTURN_BLOCKING_UNITS"}]
-
-    async def status(timeout=0):
-        return {"ok": True, "units_with_moves": ["WARRIOR:2"], "skip_idle_ok": False}
-
-    _manage_stubs(monkeypatch, blockers, units_blocker_status=status)
-    for name in ("auto_evade_threats", "auto_use_builder", "move_explorers", "skip_idle_units", "end_turn"):
+    monkeypatch.setattr(_main.civ6_tuner, "tuner_status", tuner_status)
+    monkeypatch.setattr(_main.civ6_tuner, "at_war", at_war)
+    monkeypatch.setattr(_main, "_ops_lock_clear", lambda: None)
+    for name in (
+        "units_blocker_status", "auto_evade_threats", "auto_use_builder", "move_explorers",
+        "skip_idle_units", "end_turn",
+    ):
         monkeypatch.setattr(_main.civ6_tuner, name, forbidden)
-    result = asyncio.run(_bare_plugin()._tuner_manage_turn(9, True, "unit", "UNIT_SCOUT", "TECH", "CIVIC"))
+    result = asyncio.run(plugin.civ6_ops_tick(loop_turns=1))
     assert result["handoff"] is True
+    assert result["reason"] == "WAR_TUNER"
+    assert result["active"] is False
     assert "战争" in result["output"]
 
 

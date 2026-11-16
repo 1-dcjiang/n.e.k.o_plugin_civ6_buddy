@@ -164,12 +164,33 @@ def app_options_path(docs: Path | None = None) -> Path:
     return base / "My Games" / GAME_DIR_NAME / "AppOptions.txt"
 
 
+def _decode_app_options(raw: bytes) -> tuple[str, str, bytes]:
+    """按原编码解码 AppOptions，返回正文、codec 与应保留的 BOM。
+
+    UTF-16 有明确 BOM，损坏时不能用单字节编码伪装成功；UTF-8 失败则沿用
+    CP1252 → Latin-1 的历史兼容路径。调用写入口必须捕获 UnicodeError 并保护原文件。
+    """
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        little = raw.startswith(b"\xff\xfe")
+        bom = b"\xff\xfe" if little else b"\xfe\xff"
+        codec = "utf-16-le" if little else "utf-16-be"
+        return raw[len(bom):].decode(codec), codec, bom
+    bom = b"\xef\xbb\xbf" if raw.startswith(b"\xef\xbb\xbf") else b""
+    payload = raw[len(bom):]
+    try:
+        return payload.decode("utf-8"), "utf-8", bom
+    except UnicodeDecodeError:
+        try:
+            return payload.decode("cp1252"), "cp1252", bom
+        except UnicodeDecodeError:
+            return payload.decode("latin-1"), "latin-1", bom
+
+
 def _read_app_options(p: Path) -> str:
     try:
-        return p.read_text(encoding="utf-8-sig", errors="replace")
-    except FileNotFoundError:
-        return ""
-    except OSError:
+        text, _codec, _bom = _decode_app_options(p.read_bytes())
+        return text
+    except (FileNotFoundError, OSError, UnicodeError):
         return ""
 
 
@@ -222,25 +243,12 @@ def ensure_tuner_enabled(p: Path | None = None) -> dict:
         return {"changed": True, "backup": None, "path": str(ap),
                 "detail": "AppOptions.txt 不存在，已创建并启用 Tuner"}
 
-    # AppOptions.txt 可能被旧版游戏/编辑器写成 ANSI/CP1252，不能只假定 UTF-8。
-    # 探测失败时按原编码往返，避免为了改一行 EnableTuner 把整份配置写成乱码。
-    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
-        little = raw.startswith(b"\xff\xfe")
-        bom = b"\xff\xfe" if little else b"\xfe\xff"
-        codec = "utf-16-le" if little else "utf-16-be"
-        text = raw[len(bom):].decode(codec)
-    else:
-        bom = b"\xef\xbb\xbf" if raw.startswith(b"\xef\xbb\xbf") else b""
-        try:
-            text = raw.decode("utf-8-sig")
-            codec = "utf-8"
-        except UnicodeDecodeError:
-            try:
-                text = raw.decode("cp1252")
-                codec = "cp1252"
-            except UnicodeDecodeError:
-                text = raw.decode("latin-1")
-                codec = "latin-1"
+    # 非 UTF-8 内容按原编码往返；解码失败时不得备份/替换，更不得抛出未捕获异常。
+    try:
+        text, codec, bom = _decode_app_options(raw)
+    except UnicodeError as exc:
+        return {"changed": False, "backup": None, "path": str(ap),
+                "error": "APP_OPTIONS_DECODE_FAILED", "detail": f"AppOptions.txt 无法解码，原文件未修改：{exc}"}
     newline = "\r\n" if "\r\n" in text else "\n"
     lines = text.splitlines(keepends=True)
     section = ""

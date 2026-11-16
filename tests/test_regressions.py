@@ -256,7 +256,7 @@ def test_handoff_warns_when_wc_unregister_is_unconfirmed(monkeypatch):
     plugin = _bare_plugin()
     monkeypatch.setattr(_main, "_ops_lock_clear", lambda: None)
 
-    async def cleanup():
+    async def cleanup(deadline=None):
         return {"ok": False, "error": "GAME_TUNER_OFF", "detail": "busy"}
 
     plugin._cleanup_managed_runtime = cleanup

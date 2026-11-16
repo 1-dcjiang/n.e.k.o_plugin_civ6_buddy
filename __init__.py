@@ -37,6 +37,9 @@ _OPS_LOCK_TTL = 300.0
 _OPS_STATUS_BUDGET = 25.0  # 工具超时 30 秒，保留 5 秒给序列化与宿主调度。
 _OPS_TAKEOVER_BUDGET = 25.0
 _OPS_TICK_BUDGET = 870.0  # 工具超时 900 秒，连续回合共享同一总预算。
+_OPS_CLEANUP_BUDGET = 10.0  # 独立清理：两轮注销共享 10 秒。
+_OPS_HANDOFF_BUDGET = 15.0  # 交还工具超时 20 秒，预留 5 秒给取消收尾与返回。
+_OPS_HANDOFF_STEP_BUDGET = 3.0
 
 
 async def _call_with_deadline(function, budget_deadline: float, /, *args, **kwargs):
@@ -231,25 +234,47 @@ class Civ6BuddyPlugin(NekoPluginBase):
             if not thread.is_alive():
                 self._ops_screen_thread = None
 
-    async def _cleanup_managed_runtime(self) -> dict:
-        """交还后注销游戏内常驻事件；清理串行化，Tuner 忙时重试一次。"""
+    async def _cleanup_managed_runtime(self, deadline: float | None = None) -> dict:
+        """最多两轮注销；每轮两次握手及退避共享同一个 monotonic deadline。"""
         lock = getattr(self, "_ops_cleanup_lock", None)
         if lock is None:
             lock = asyncio.Lock()
             self._ops_cleanup_lock = lock
-        async with lock:
-            result: dict = {}
+        if deadline is None:
+            deadline = time.monotonic() + _OPS_CLEANUP_BUDGET
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"ok": False, "error": "HANDOFF_CLEANUP_TIMEOUT", "detail": "清理总预算已耗尽"}
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "HANDOFF_CLEANUP_TIMEOUT", "detail": "等待前一次清理退出超过总预算"}
+        try:
+            result: dict = {"ok": False, "error": "HANDOFF_CLEANUP_TIMEOUT", "detail": "清理总预算已耗尽"}
             for attempt in range(2):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return result
                 try:
-                    result = await civ6_tuner.unregister_wc_voter(timeout=2.0)
+                    # wait_for 是最后防线：即使协议栈或替代实现挂住，也不能越过交还总预算。
+                    result = await asyncio.wait_for(
+                        civ6_tuner.unregister_wc_voter(timeout=remaining), timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    return {"ok": False, "error": "HANDOFF_CLEANUP_TIMEOUT",
+                            "detail": "世界议会注销超过共享总预算；未继续发起清理，请人工检查"}
                 except Exception as exc:
                     result = {"ok": False, "error": "WC_UNREGISTER_FAILED", "detail": str(exc)}
                 if result.get("ok") or result.get("error") != "GAME_TUNER_OFF":
                     return result
                 if attempt == 0:
-                    # 交还瞬间另一路握手可能仍占着唯一 Tuner 连接；退避后重试一次。
-                    await asyncio.sleep(0.35)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(0.35, remaining))
             return result
+        finally:
+            lock.release()
 
     def _load_config(self) -> None:
         """读取运行配置 plugin.toml（civ6_buddy.saves_dir / ops_buttons），失败静默用默认。"""
@@ -1612,9 +1637,14 @@ class Civ6BuddyPlugin(NekoPluginBase):
     )
     async def civ6_ops_handoff(self, **_):
         self._request_ops_stop()
-        tick_idle = await self._wait_ops_tick_idle()
-        screen_idle = await self._join_screen_worker()
-        cleanup = await self._cleanup_managed_runtime()
+        deadline = time.monotonic() + _OPS_HANDOFF_BUDGET
+        tick_idle = await self._wait_ops_tick_idle(
+            timeout=min(_OPS_HANDOFF_STEP_BUDGET, max(0.0, deadline - time.monotonic())),
+        )
+        screen_idle = await self._join_screen_worker(
+            timeout=min(_OPS_HANDOFF_STEP_BUDGET, max(0.0, deadline - time.monotonic())),
+        )
+        cleanup = await self._cleanup_managed_runtime(deadline=deadline)
         output = "运营托管已结束，控制权交还给你。需要再托管时说'接管运营'。"
         if not tick_idle:
             output += "\n注意：上一 tick 未在等待窗口内收尾，清理已重试；若游戏内仍有自动投票，请再说一次交还。"
