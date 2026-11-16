@@ -14,7 +14,8 @@ end)
 -- 扫描首都 3 圈地形计数
 local terrain = {desert=0, forest=0, tundra=0, river=0, coast=0, marsh=0}
 pcall(function()
-  for dx = -3, 3 do for dy = -3, 3 do
+  for dx = -3, 3 do
+    for dy = -3, 3 do
     if dx*dx + dy*dy <= 9 then
       local p = Map.GetPlot(capX + dx, capY + dy)
       if p then
@@ -31,6 +32,7 @@ pcall(function()
         if ft:find("FOREST") or ft:find("RAINFOREST") then terrain.forest = terrain.forest + 1 end
         if p:IsRiver() then terrain.river = terrain.river + 1 end
       end
+    end
     end
   end
 end)
