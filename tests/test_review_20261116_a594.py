@@ -107,6 +107,12 @@ def test_close_ui_popups_handoff_on_decision_popup(monkeypatch):
 
 
 def test_manage_turn_soft_write_failure_hands_off_before_end_turn(monkeypatch):
+    """明确失败（读不出金币/建造者、根本没发请求）必须交还并停下。
+
+    注意这里刻意不用 `VERIFY_UNCERTAIN`：A697 的 N2 把「经济/商队 + 读回不确定」
+    降级为只记日志（购买建造者要等新单位下回合出现，读回滞后属正常），那条链由
+    `test_review_20261117_a697.py` 覆盖；本条守的是另一档——明确失败仍要交还。
+    """
     plugin = _main.Civ6BuddyPlugin.__new__(_main.Civ6BuddyPlugin)
     plugin._ops_stop_event = asyncio.Event()
     calls = []
@@ -124,7 +130,8 @@ def test_manage_turn_soft_write_failure_hands_off_before_end_turn(monkeypatch):
         "set_research": {"ok": True, "detail": "research verified"},
         "register_wc_voter": {"ok": True, "detail": "wc ready"},
         "auto_choose_pantheon": {"ok": True, "verified": True, "detail": "pantheon verified"},
-        "auto_manage_money": {"ok": False, "error": "VERIFY_UNCERTAIN", "detail": "购买读回不确定"},
+        "auto_manage_money": {"ok": False, "error": "VERIFY_UNSUPPORTED",
+                              "detail": "购买前无法读取金币或建造者数，未发送购买请求"},
         "auto_found_religion": {"ok": True, "founded": False, "detail": "none"},
         "auto_recruit_great_person": {"ok": True, "recruited": False, "detail": "none"},
         "auto_trade_route": {"ok": True, "routes": [], "detail": "none"},

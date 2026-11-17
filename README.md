@@ -87,6 +87,13 @@ Lua API（`CanProduce`、`CanStartOperation`、`PARAM_*` 键名、`SetHide` 对�
 
 ## 版本
 
+- v0.6.14：收 0.6.13 的一个真 bug。A697 的 N2 把「购买/商队的读回滞后」降级为只记日志，但分级用的错误码集合
+  写成了 `WRITE_UNCERTAIN / VERIFY_MISMATCH / TIMEOUT / VERIFY_TIMEOUT`，而 `_write_and_verify` 在读回不匹配或
+  超预算时实际返回的是 `VERIFY_UNCERTAIN`（`VERIFY_MISMATCH` 由 `_verify_mismatch()` 产生、基本没被调用）。
+  结果是 0.6.13 的放宽对购买与商队根本没生效，等于白改。本版把 `VERIFY_UNCERTAIN` 补进集合，并按真实链路的
+  四个码做参数化回归；同时把一条 0.6.12 时期的老测试（原本用 `VERIFY_UNCERTAIN` 断言「经济失败要交还」）
+  改用 `VERIFY_UNSUPPORTED`，让它守「明确失败仍交还」这一档，不再与 N2 的放宽冲突。
+  252 项测试通过，Ruff 通过。
 - v0.6.13：A697 增量深审修复——创立宗教时 `HasReligiousFoundingUnit` 的 `pcall` 返回值现在会被检查，
   调用失败（API 缺失或改名）报 `RELIGION_UNSUPPORTED` 而不是混成“没有创教单位”，不再把读不出来当成
   这局不用创教；购买建造者与商队的读回滞后（新单位/路线要等下一回合结算才出现）只记日志、不再交还，

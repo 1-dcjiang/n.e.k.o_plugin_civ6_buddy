@@ -1,6 +1,6 @@
 [project]
 name = "civ6_buddy"
-version = "0.6.13"
+version = "0.6.14"
 description = "文明6陪玩：存档局面分析 + FireTuner 官方数据运营托管"
 dependencies = []
 

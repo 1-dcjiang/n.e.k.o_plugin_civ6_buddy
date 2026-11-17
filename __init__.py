@@ -1100,7 +1100,10 @@ class Civ6BuddyPlugin(NekoPluginBase):
         # 仍然交还。
         soft_writes = (("经济", mo), ("宗教", rg), ("伟人", gp), ("商队", tr))
         lagging_labels = {"经济", "商队"}
-        readback_uncertain = {"WRITE_UNCERTAIN", "VERIFY_MISMATCH", "TIMEOUT", "VERIFY_TIMEOUT"}
+        # VERIFY_UNCERTAIN 是 _write_and_verify 在读回不匹配/超预算时的实际返回码，
+        # 购买建造者要等新单位下回合出现、商队要等商队走到目标城，这两处每次都会命中它。
+        readback_uncertain = {"WRITE_UNCERTAIN", "VERIFY_UNCERTAIN", "VERIFY_MISMATCH",
+                              "TIMEOUT", "VERIFY_TIMEOUT"}
         uncertain = []
         deferred = []
         for label, item in soft_writes:

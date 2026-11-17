@@ -13,6 +13,8 @@ import asyncio
 import importlib
 from pathlib import Path
 
+import pytest
+
 _main = importlib.import_module("plugin.plugins.civ6_buddy")
 _resources = importlib.import_module("civ6_lua_resources")
 _auto = importlib.import_module("civ6_tuner_auto")
@@ -129,11 +131,19 @@ def _manage_turn(plugin):
     )
 
 
-def test_money_readback_uncertain_is_logged_not_handed_off(monkeypatch):
-    plugin, calls = _plugin_with_stubs(
-        monkeypatch,
-        {"auto_manage_money": {"ok": False, "error": "WRITE_UNCERTAIN", "detail": "购买建造者无回执"}},
-    )
+_READBACK_UNCERTAIN = [
+    {"ok": False, "error": "VERIFY_UNCERTAIN", "detail": "读回后状态仍不匹配"},
+    {"ok": False, "error": "WRITE_UNCERTAIN", "detail": "无请求回执"},
+    {"ok": False, "error": "VERIFY_MISMATCH", "detail": "读回不匹配"},
+    {"ok": False, "error": "VERIFY_TIMEOUT", "detail": "读回超时"},
+]
+
+
+@pytest.mark.parametrize("payload", _READBACK_UNCERTAIN, ids=lambda p: p["error"])
+def test_money_readback_uncertain_is_logged_not_handed_off(monkeypatch, payload):
+    """购买建造者的读回要等新单位下回合出现；_write_and_verify 返回的
+    VERIFY_UNCERTAIN 是这条链路的实际码，必须落在"只记日志"这一档。"""
+    plugin, calls = _plugin_with_stubs(monkeypatch, {"auto_manage_money": payload})
     result = _manage_turn(plugin)
     assert result["handoff"] is False
     assert result["ok"] is True
@@ -141,11 +151,9 @@ def test_money_readback_uncertain_is_logged_not_handed_off(monkeypatch):
     assert any("读回滞后" in line and "经济" in line for line in result["log"])
 
 
-def test_trade_route_readback_uncertain_is_logged_not_handed_off(monkeypatch):
-    plugin, calls = _plugin_with_stubs(
-        monkeypatch,
-        {"auto_trade_route": {"ok": False, "error": "WRITE_UNCERTAIN", "detail": "商队路线无请求回执"}},
-    )
+@pytest.mark.parametrize("payload", _READBACK_UNCERTAIN, ids=lambda p: p["error"])
+def test_trade_route_readback_uncertain_is_logged_not_handed_off(monkeypatch, payload):
+    plugin, calls = _plugin_with_stubs(monkeypatch, {"auto_trade_route": payload})
     result = _manage_turn(plugin)
     assert result["handoff"] is False
     assert "end_turn" in calls
