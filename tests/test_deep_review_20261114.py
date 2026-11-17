@@ -187,7 +187,7 @@ def test_production_uses_correct_parameters_and_dynamic_ingame(
         return [f"SET|done={expected}|failed=0|size={expected}|ids="]
 
     calls, writer = _fake_tuner_io(monkeypatch, respond)
-    monkeypatch.setattr(_tuner.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_tuner, "_sleep", _no_sleep)
     result = asyncio.run(_tuner.set_city_production(kind, item, timeout=3.0, **extra))
     assert result["ok"] is True
     assert result["changed"] == expected
@@ -225,7 +225,7 @@ def test_production_wrong_hash_never_reports_success_and_never_rewrites(monkeypa
         return ["SET|done=0|failed=2|size=1|ids=1,2"]
 
     calls, _writer = _fake_tuner_io(monkeypatch, respond)
-    monkeypatch.setattr(_tuner.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_tuner, "_sleep", _no_sleep)
     result = asyncio.run(_tuner.set_city_production("unit", "UNIT_SCOUT", timeout=3.0))
     assert result["ok"] is False
     assert result["error"] == "SILENT_FAILURE"
@@ -302,7 +302,7 @@ def test_policy_reports_silent_failure_when_readback_does_not_match(monkeypatch)
         return ["POLICY|done=0|failed=1"]
 
     _calls, _writer = _fake_tuner_io(monkeypatch, respond)
-    monkeypatch.setattr(_tuner.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_tuner, "_sleep", _no_sleep)
     result = asyncio.run(_tuner.auto_fill_policy_slots())
     assert result["ok"] is False
     assert result["error"] == "SILENT_FAILURE"
@@ -329,7 +329,7 @@ def test_research_silent_failure_does_not_pick_again(monkeypatch):
         return ["VERIFY|current=3|want=4"]
 
     calls, _writer = _fake_tuner_io(monkeypatch, respond)
-    monkeypatch.setattr(_tuner.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_tuner, "_sleep", _no_sleep)
     result = asyncio.run(_tuner.set_research("tech", "TECH_POTTERY", timeout=3.0))
     assert result["ok"] is False
     assert result["error"] == "SILENT_FAILURE"
@@ -409,7 +409,7 @@ def test_units_with_moves_execute_evade_builder_and_explorer(monkeypatch):
         move_explorers=record("explorer"),
         skip_idle_units=record("skip", {"ok": False, "detail": "stop after unit test"}),
     )
-    monkeypatch.setattr(_main.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_main, "_sleep", _no_sleep)
     result = asyncio.run(_bare_plugin()._tuner_manage_turn(9, False, "unit", "UNIT_SCOUT", "TECH", "CIVIC"))
     assert result["handoff"] is True
     assert executed == ["status", "evade", "builder", "explorer", "skip"]
@@ -451,7 +451,7 @@ def test_end_turn_is_sent_once_without_right_click_self_healing(monkeypatch):
         raise AssertionError("未推进也不得右键")
 
     monkeypatch.setattr(_main.civ6_tuner, "_right_click_game_window", forbidden_click)
-    monkeypatch.setattr(_main.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_main, "_sleep", _no_sleep)
     result = asyncio.run(_bare_plugin()._tuner_manage_turn(9, False, "unit", "UNIT_SCOUT", "TECH", "CIVIC"))
     assert result["reason"] == "TURN_NOT_ADVANCED"
     assert calls.count("end_turn") == 1

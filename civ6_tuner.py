@@ -43,6 +43,11 @@ except ImportError:  # 包外直接加载（测试/独立脚本）
     import civ6_tuner_protocol as _protocol  # type: ignore
     import civ6_window as _civ6_window  # type: ignore
 
+
+async def _sleep(seconds: float) -> None:
+    """唯一的延时入口；测试替换这里，不去改全局 ``asyncio.sleep``。"""
+    await asyncio.sleep(seconds)
+
 # 协议与窗口接口保持原模块路径兼容；运营决策仍由本模块负责。
 HEADER_FMT = _protocol.HEADER_FMT
 HEADER_SIZE = _protocol.HEADER_SIZE
@@ -417,7 +422,7 @@ async def set_city_production(
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return {"ok": False, "error": "TIMEOUT", "detail": "生产读回总预算已耗尽，未宣称成功"}
-            await asyncio.sleep(min(0.35, remaining))
+            await _sleep(min(0.35, remaining))
             cleanup = "true" if attempt == 2 else "false"
             verify_lua = _lua("set_city_production_verify").format(
                 item_table=_ITEM_KIND_TO_TABLE[kind], item_name=item_name, cleanup=cleanup,
@@ -570,12 +575,16 @@ async def set_research(
             return {"ok": False, "error": "NO_RESPONSE", "detail": "设置研究无回执（Tuner 输出丢失），请重试"}
 
         # 写请求只发一次；后续只读回当前研究项，避免重复 RequestOperation。
-        verify_lua = _lua("set_research_verify").format(p2=player_m, p1="GetResearchingTech" if cat == "tech" else "GetProgressingCivic", p0=wanted)
+        verify_lua = _lua("set_research_verify").format(
+            player_method=player_m,
+            getter="GetResearchingTech" if cat == "tech" else "GetProgressingCivic",
+            wanted=wanted,
+        )
         for attempt in range(3):
             remaining = deadline - loop.time()
             if remaining <= 0:
                 break
-            await asyncio.sleep(min(0.4, remaining))
+            await _sleep(min(0.4, remaining))
             verified = await execute_lua(
                 reader, writer, verify_lua, state_index=_ingame_state_index(states),
                 timeout=max(0.1, deadline - loop.time()),
@@ -701,7 +710,9 @@ async def auto_pick_research(category: str = "tech", timeout: float = 8.0) -> di
     else:
         gi_table, has_m, player_m = "Civics", "HasCivic", "GetCulture"
         type_field = "CivicType"
-    lua = _lua("auto_pick_research").format(p3=gi_table, p2=player_m, p1=has_m, p0=type_field)
+    lua = _lua("auto_pick_research").format(
+        gi_table=gi_table, type_field=type_field, player_method=player_m, has_method=has_m,
+    )
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -1094,7 +1105,7 @@ __all__ = [
     "unregister_wc_voter", "auto_manage_money", "auto_found_religion", "auto_recruit_great_person",
     "auto_trade_route", "auto_manage_spy", "auto_war_response", "auto_choose_pantheon",
     "auto_send_envoy", "auto_promote_units", "auto_appoint_governor", "auto_choose_commemoration",
-    "auto_fill_policy_slots",
+    "auto_fill_policy_slots", "confirm_money_settlement", "confirm_trade_settlement",
 ]
 
 try:
@@ -1112,6 +1123,8 @@ try:
         auto_send_envoy,
         auto_trade_route,
         auto_war_response,
+        confirm_money_settlement,
+        confirm_trade_settlement,
         register_wc_voter,
         unregister_wc_voter,
     )
@@ -1130,6 +1143,8 @@ except ImportError:  # 包外直接加载（测试/独立脚本）
         auto_send_envoy,
         auto_trade_route,
         auto_war_response,
+        confirm_money_settlement,
+        confirm_trade_settlement,
         register_wc_voter,
         unregister_wc_voter,
     )

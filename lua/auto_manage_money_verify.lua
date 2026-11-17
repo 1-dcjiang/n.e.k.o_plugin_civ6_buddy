@@ -11,10 +11,13 @@ end)
 local beforeGold = __civ6_money_before_gold or -1
 local beforeBuilders = __civ6_money_before_builders or -1
 local supported = okGold and okBuilders and beforeGold >= 0 and beforeBuilders >= 0
-local matched = supported and builders == beforeBuilders + 1 and gold < beforeGold
+-- 建造者数用 >= 而不是 ==：同一回合别的城市也可能完成一个建造者，
+-- 严格加一只会把"确实买到了"误判成不匹配。金币没下降才是"请求被静默拒绝"。
+local matched = supported and gold < beforeGold and builders >= beforeBuilders + 1
 if matched then
   __civ6_money_before_gold = nil
   __civ6_money_before_builders = nil
 end
 print("MONEY_VERIFY|supported=" .. tostring(supported) .. "|matched=" .. tostring(matched)
-      .. "|gold=" .. tostring(gold) .. "|builders=" .. tostring(builders))
+      .. "|gold=" .. tostring(gold) .. "|builders=" .. tostring(builders)
+      .. "|before_gold=" .. tostring(beforeGold) .. "|before_builders=" .. tostring(beforeBuilders))

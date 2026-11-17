@@ -36,6 +36,15 @@ class _TunerFacade:
 _t = _TunerFacade()
 
 
+async def _sleep(seconds: float) -> None:
+    """唯一的延时入口；测试替换这里，不去改全局 ``asyncio.sleep``。
+
+    直接 `monkeypatch.setattr(asyncio, "sleep", ...)` 替换的是进程级模块属性，
+    同进程里其它插件/宿主的等待都会被一起吞掉，测试之间也会互相影响。
+    """
+    await asyncio.sleep(seconds)
+
+
 __all__ = [
     "auto_decide_production",
     "register_wc_voter",
@@ -52,6 +61,8 @@ __all__ = [
     "auto_appoint_governor",
     "auto_choose_commemoration",
     "auto_fill_policy_slots",
+    "confirm_money_settlement",
+    "confirm_trade_settlement",
 ]
 
 
@@ -105,7 +116,7 @@ async def _write_and_verify(
             remaining = deadline - loop.time()
             if remaining <= 0:
                 break
-            await asyncio.sleep(min(0.35, remaining))
+            await _sleep(min(0.35, remaining))
             try:
                 verified = await _t.execute_lua(
                     reader, writer, verify_lua, state_index=state_index,
@@ -256,14 +267,27 @@ async def auto_manage_money(timeout: float = 15.0) -> dict:
         values = dict(item.split("=", 1) for item in line[len("MONEY_VERIFY|"):].split("|") if "=" in item)
         if values.get("supported") != "true":
             return _verify_unsupported("购买建造者后无法读回金币或单位数")
-        if values.get("matched") != "true":
-            return None
         gold = round(_t._to_float(values.get("gold", "-1")), 1)
         builders = _t._to_int(values.get("builders", "0"))
-        return {**pending, "ok": True, "verified": True, "action": "bought_builder",
-                "gold": gold, "builders": builders,
-                "detail": f"已读回验证购买建造者：建造者 {pending['builders']} → {builders}，"
-                          f"金币 {pending['gold']} → {gold}"}
+        before_gold = pending["gold"]
+        before_builders = pending["builders"]
+        if values.get("matched") == "true":
+            return {**pending, "ok": True, "verified": True, "settled": True, "action": "bought_builder",
+                    "gold": gold, "builders": builders,
+                    "detail": f"已读回验证购买建造者：建造者 {before_builders} → {builders}，"
+                              f"金币 {before_gold} → {gold}"}
+        # 金币没下降说明请求被静默拒绝，不是"再等等就会好"——必须报失败并交还。
+        if before_gold >= 0 and gold >= before_gold:
+            return _verify_mismatch(
+                f"购买建造者后金币未下降（{before_gold} → {gold}），请求可能被拒或金币不足以支付"
+            )
+        # 金币已扣、建造者还没出现：Civ6 的购买单位在同一回合通常立即出现，
+        # 但操作队列可能延到结算；这一档标记为"待下回合确认"，不当作成功。
+        return {**pending, "ok": False, "error": "VERIFY_LAGGING", "verified": False,
+                "settled": False, "lagging": True, "gold": gold, "builders": builders,
+                "expected_builders": before_builders + 1,
+                "detail": f"购买已扣金币（{before_gold} → {gold}），建造者数仍为 {builders}"
+                          f"（请求前 {before_builders}）；单位可能下回合才出现，下一回合开始前复核"}
 
     return await _write_and_verify(
         request_lua=_lua("auto_manage_money"), verify_lua=_lua("auto_manage_money_verify"),
@@ -283,7 +307,8 @@ async def auto_found_religion(timeout: float = 15.0) -> dict:
             return {"ok": False, "error": "VERIFY_UNSUPPORTED", "verified": False,
                     "detail": "HasReligiousFoundingUnit 调用失败（API 缺失或改名），"
                               "无法区分“没有创教单位”与“读不出来”；本次未发送创教请求，"
-                              "请人工确认宗教面板是否还能创教"}
+                              "请人工确认宗教面板是否还能创教；若长期出现，可把配置 "
+                              "auto_irreversible 设为 false，跳过伟人/创教/购买/商队这类不可逆自动操作"}
         none = next((item.strip() for item in lines if item.strip().startswith("RELIGION_NONE|")), "")
         if none:
             return {"ok": True, "app": app_id, "founded": False, "via": "tuner",
@@ -373,17 +398,87 @@ async def auto_trade_route(timeout: float = 15.0) -> dict:
         values = dict(item.split("=", 1) for item in line[len("TRADE_VERIFY|"):].split("|") if "=" in item)
         if values.get("supported") != "true":
             return _verify_unsupported("商队请求后无法读回出境路线数")
-        if values.get("matched") != "true":
-            return None
-        return {**pending, "ok": True, "verified": True,
-                "before": _t._to_int(values.get("before")), "after": _t._to_int(values.get("after")),
-                "detail": f"已读回验证 {len(pending['routes'])} 条贸易路线："
-                          f"出境路线数 {values.get('before')} → {values.get('after')}"}
+        before = _t._to_int(values.get("before", "-1"))
+        after = _t._to_int(values.get("after", "-1"))
+        if values.get("matched") == "true":
+            return {**pending, "ok": True, "verified": True, "settled": True,
+                    "before": before, "after": after,
+                    "detail": f"已读回验证 {len(pending['routes'])} 条贸易路线："
+                              f"出境路线数 {before} → {after}"}
+        # 路线请求已下发但路线数没涨：商队要走完路程才体现在 GetNumOutgoingRoutes，
+        # 同回合几乎必然落在这一档。标记为待复核，不当作成功，也不反复空轮询。
+        return {**pending, "ok": False, "error": "VERIFY_LAGGING", "verified": False,
+                "settled": False, "lagging": True, "before": before, "after": after,
+                "expected_routes": len(pending["routes"]),
+                "detail": f"商队路线已请求，出境路线数 {before} → {after} 尚未增加；"
+                          "商队到达目标城后才会体现在路线数上，下一回合开始前复核"}
 
     return await _write_and_verify(
         request_lua=_lua("auto_trade_route"), verify_lua=_lua("auto_trade_route_verify"),
         parse_request=parse_request, parse_verify=parse_verify, timeout=timeout, operation="建立贸易路线",
     )
+
+
+async def _rerun_verify(verify_name: str, prefix: str, timeout: float) -> dict:
+    """只重跑读回脚本，不发写请求；供下一回合复核滞后项。"""
+    lua = _lua(verify_name)
+    try:
+        _app_id, states, reader, writer = await _t._handshake_retry()
+    except _t.TunerError as exc:
+        return {"ok": False, "error": "GAME_TUNER_OFF", "detail": str(exc)}
+    try:
+        out = await _t.execute_lua(
+            reader, writer, lua, state_index=_t._ingame_state_index(states), timeout=timeout,
+        )
+    except _t.TunerError as exc:
+        return {"ok": False, "error": "TUNER_EXEC_FAILED", "detail": str(exc)}
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    line = next((item.strip() for item in out if item.strip().startswith(prefix)), "")
+    if not line:
+        return {"ok": False, "error": "NO_RESPONSE", "detail": f"{verify_name} 复核无回执"}
+    values = dict(item.split("=", 1) for item in line[len(prefix):].split("|") if "=" in item)
+    return {"ok": True, "values": values, "line": line}
+
+
+async def confirm_money_settlement(expected_builders: int, timeout: float = 8.0) -> dict:
+    """下一回合复核已扣款的购买：只重跑 MONEY_VERIFY，不重发购买请求。
+
+    返回 ``ok`` 表示读回确认建造者已到位；``lagging`` 表示金币确已扣、单位仍未见；
+    其它情况是明确失败（读不回来），调用方应交还。
+    """
+    probe = await _rerun_verify("auto_manage_money_verify", "MONEY_VERIFY|", timeout)
+    if not probe.get("ok"):
+        return probe
+    values = probe["values"]
+    if values.get("supported") != "true":
+        return _verify_unsupported("复核购买建造者时无法读回金币或单位数")
+    gold = round(_t._to_float(values.get("gold", "-1")), 1)
+    builders = _t._to_int(values.get("builders", "0"))
+    if builders >= max(1, int(expected_builders)):
+        return {"ok": True, "verified": True, "settled": True, "gold": gold, "builders": builders,
+                "detail": f"下一回合读回确认：建造者 {builders} 个已到位（金币 {gold}）"}
+    return {"ok": False, "error": "VERIFY_LAGGING", "lagging": True, "gold": gold, "builders": builders,
+            "detail": f"金币已扣（{gold}），建造者仍为 {builders} 个，仍未见新单位"}
+
+
+async def confirm_trade_settlement(before: int, expected: int, timeout: float = 8.0) -> dict:
+    """下一回合复核商队路线：只重跑 TRADE_VERIFY，不重发路线请求。"""
+    probe = await _rerun_verify("auto_trade_route_verify", "TRADE_VERIFY|", timeout)
+    if not probe.get("ok"):
+        return probe
+    values = probe["values"]
+    if values.get("supported") != "true":
+        return _verify_unsupported("复核商队路线时无法读回出境路线数")
+    after = _t._to_int(values.get("after", "-1"))
+    if after >= int(before) + max(1, int(expected)):
+        return {"ok": True, "verified": True, "settled": True, "before": before, "after": after,
+                "detail": f"下一回合读回确认：出境路线数 {before} → {after}"}
+    return {"ok": False, "error": "VERIFY_LAGGING", "lagging": True, "before": before, "after": after,
+            "detail": f"出境路线数 {before} → {after}，商队路线仍未计入"}
 
 
 async def auto_manage_spy(timeout: float = 15.0) -> dict:
@@ -576,7 +671,7 @@ async def auto_appoint_governor(timeout: float = 12.0) -> dict:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 break
-            await asyncio.sleep(min(0.4, remaining))
+            await _sleep(min(0.4, remaining))
             verified = await _t.execute_lua(
                 reader, writer, verify_lua, state_index=_t._ingame_state_index(states),
                 timeout=max(0.1, deadline - loop.time()),
@@ -626,7 +721,7 @@ async def auto_choose_commemoration(timeout: float = 12.0) -> dict:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 break
-            await asyncio.sleep(min(0.4, remaining))
+            await _sleep(min(0.4, remaining))
             verified = await _t.execute_lua(
                 reader, writer, verify_lua, state_index=_t._ingame_state_index(states),
                 timeout=max(0.1, deadline - loop.time()),
@@ -634,6 +729,10 @@ async def auto_choose_commemoration(timeout: float = 12.0) -> dict:
             line = next((entry for entry in verified if entry.startswith("COMM|")), "")
             values = {part.split("=")[0]: part.split("=", 1)[1]
                       for part in line[len("COMM|"):].split("|") if "=" in part} if line else {}
+            # pcall 失败时 allowed 是 -1、still 是 false，直接判断会被读成"选择已生效"。
+            # 读回脚本现在显式报 supported，读不出来就报不支持，绝不宣称成功。
+            if values.get("supported") == "false":
+                return _verify_unsupported("选择纪念后无法读回可用次数或可选列表")
             allowed, before = _t._to_int(values.get("allowed", "-1")), _t._to_int(values.get("before", "-1"))
             # before < 0 说明请求前的 Lua 全局状态已丢失；此时 still=false 不能当作成功。
             if before >= 0 and (allowed < before or values.get("still") == "false"):
@@ -682,13 +781,13 @@ async def auto_fill_policy_slots(timeout: float = 12.0) -> dict:
                     "detail": "没有可填的空政策槽（或没有可用政策）", "via": "tuner"}
 
         # 写请求只发一次；后续只读回槽位内容，避免把“请求数”当成已填数。
-        verify_lua = _lua("auto_fill_policy_slots_verify").format(p0=requested)
+        verify_lua = _lua("auto_fill_policy_slots_verify").format(want_count=requested)
         last_detail = "政策槽设置后未读回目标政策"
         for attempt in range(3):
             remaining = deadline - loop.time()
             if remaining <= 0:
                 break
-            await asyncio.sleep(min(0.5, remaining))
+            await _sleep(min(0.5, remaining))
             verified = await _t.execute_lua(
                 reader, writer, verify_lua, state_index=_t._ingame_state_index(states),
                 timeout=max(0.1, deadline - loop.time()),

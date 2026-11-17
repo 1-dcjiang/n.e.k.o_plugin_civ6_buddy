@@ -69,7 +69,8 @@ FireTuner 是游戏调试端口（默认 4318），可读真实城市数据、�
   预定义占位符展开，不把 Lua 逻辑拼接进 Python 业务代码。
 - 万神殿、使节、伟人、商队、宗教、购买建造者、单位升级七类操作均只发一次写请求，
   最多进行三次只读验证；读回失败、不匹配或 API 不支持时明确返回失败或不确定并提示人工核实，
-  不盲目重写。
+  不盲目重写。购买建造者与商队另有分档：金币下降且有新建造者才算成功，金币没降视为请求被拒，
+  金币已扣但单位未现只记滞后并在下一回合只读复核，连续两回合仍未到位则交还（见下方版本记录）。
 - 单位晋升在 GameCore 侧直接调用 `exp:SetPromotion`，不是通过网络同步接口下发；托管按单机
   场景设计，多人联机时不保证其他玩家客户端同步，联机局面请先退出托管。
 - 默认不修改存档或游戏文件；唯一例外是用户明确执行 `fix_tuner` 时，插件备份并修改
@@ -87,6 +88,18 @@ Lua API（`CanProduce`、`CanStartOperation`、`PARAM_*` 键名、`SetHide` 对�
 
 ## 版本
 
+- v0.6.15：A711 增量深审（a4ef58a → 4df6adf）收口。分级口径重写：0.6.13/0.6.14 把「读回不确定」降级为只记日志，
+  M1 指出其中 `WRITE_UNCERTAIN`（请求阶段就没回执/通信失败）也被一起放过，等于把"可能根本没发出去"当成了
+  "等下回合就好了"。现在只有 `VERIFY_LAGGING` 才顺延，且顺延项写入 `_pending_writes`，下一回合只重跑读回脚本
+  复核（不重发写请求），连续两个回合仍不到位才交还；其余错误码一律交还。
+  购买建造者读回三分档：金币下降且建造者 ≥ 请求前 +1 为成功（`==` 放松为 `>=`，避免别城同回合完成建造者误判）；
+  金币没下降＝请求被静默拒绝，报 `VERIFY_MISMATCH`；金币已扣但单位未现＝`VERIFY_LAGGING`。
+  商队读回不再把"同回合路线数没涨"当成功或静默，一律先记滞后、下回合复核。
+  创教 `VERIFY_UNSUPPORTED` 文案补 `auto_irreversible=false` 配置指引；时代纪念读回脚本新增 `supported`
+  汇总（`GetEras` 或任一 pcall 失败不再被读成"选择已生效"，遗留 #6）；`set_research_verify` /
+  `auto_pick_research` / `auto_fill_policy_slots_verify` 三份 Lua 的 `p0..p3` 占位符改为语义名；
+  四个模块的等待统一走模块内 `_sleep`，测试不再替换进程级 `asyncio.sleep`（M5）。
+  278 项测试通过，Ruff 通过。Lua 实机行为仍需按冒烟清单复核（尤其购买三档与商队下回合复核）。
 - v0.6.14：收 0.6.13 的一个真 bug。A697 的 N2 把「购买/商队的读回滞后」降级为只记日志，但分级用的错误码集合
   写成了 `WRITE_UNCERTAIN / VERIFY_MISMATCH / TIMEOUT / VERIFY_TIMEOUT`，而 `_write_and_verify` 在读回不匹配或
   超预算时实际返回的是 `VERIFY_UNCERTAIN`（`VERIFY_MISMATCH` 由 `_verify_mismatch()` 产生、基本没被调用）。

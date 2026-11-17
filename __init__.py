@@ -43,6 +43,15 @@ _OPS_HANDOFF_BUDGET = 15.0  # 交还工具超时 20 秒，预留 5 秒给取消�
 _OPS_HANDOFF_STEP_BUDGET = 3.0
 
 
+async def _sleep(seconds: float) -> None:
+    """唯一的延时入口；测试替换这里，不去改全局 ``asyncio.sleep``。
+
+    替换进程级 ``asyncio.sleep`` 会波及同进程内其它插件和宿主的等待，
+    测试之间也会互相污染；本模块的所有等待都走这个间接层。
+    """
+    await asyncio.sleep(seconds)
+
+
 async def _call_with_deadline(function, budget_deadline: float, /, *args, **kwargs):
     """调用异步函数并受总预算约束；被调用函数仍可接收自己的 deadline 参数。"""
     remaining = budget_deadline - time.monotonic()
@@ -147,6 +156,10 @@ class Civ6BuddyPlugin(NekoPluginBase):
     # __init__ 与配置加载会覆盖成实例属性。
     _auto_irreversible = True
 
+    # 待复核写操作的记账本（构造时建实例字典；用 __new__ 的调用方由
+    # _pending_store() 现场补建，避免类级可变默认在实例之间串味）。
+    _pending_writes = None
+
     def __init__(self, ctx):
         super().__init__(ctx)
         self._saves_dir = ""
@@ -159,6 +172,9 @@ class Civ6BuddyPlugin(NekoPluginBase):
         self._ops_screen_cancel: asyncio.Event | None = None
         self._ops_screen_thread: threading.Thread | None = None
         self._ops_cleanup_lock = asyncio.Lock()
+        # 上一回合已下发、当回合读不回来的写操作（购买建造者 / 商队路线）。
+        # 下一回合开始前先复核这里的记录，再决定要不要发新的写请求。
+        self._pending_writes: dict = {}
 
     def _request_ops_stop(self) -> None:
         """同步发出停止信号：不等待任何游戏调用，正在运行的 tick 会取消当前 await。"""
@@ -279,7 +295,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
-                    await asyncio.sleep(min(0.35, remaining))
+                    await _sleep(min(0.35, remaining))
             return result
         finally:
             lock.release()
@@ -907,6 +923,92 @@ class Civ6BuddyPlugin(NekoPluginBase):
             ),
         }
 
+    def _pending_store(self) -> dict:
+        """待复核写操作的记账本；用 __new__ 构造的调用方也能安全拿到。"""
+        store = getattr(self, "_pending_writes", None)
+        if store is None:
+            store = {}
+            self._pending_writes = store
+        return store
+
+    def _remember_lagging_write(self, label: str, item: dict) -> None:
+        """记下"写请求已下发、金币已扣但读回还看不到结果"的操作，下一回合复核。
+
+        ``age`` 每复核一次仍无结果就 +1；连续两个回合都看不到结果时交还，
+        不再无限期把一次可能失败的写操作当成"迟早会生效"。
+        """
+        store = self._pending_store()
+        if label == "经济":
+            previous = store.get("money", {})
+            store["money"] = {
+                "expected_builders": int(item.get("expected_builders", 1)),
+                "gold": item.get("gold"),
+                "age": int(previous.get("age", 0)) + 1,
+            }
+        else:
+            previous = store.get("trade", {})
+            store["trade"] = {
+                "before": int(item.get("before", 0)),
+                "expected": int(item.get("expected_routes", 1)),
+                "age": int(previous.get("age", 0)) + 1,
+            }
+
+    async def _resolve_pending_writes(self) -> dict:
+        """复核上一回合没读回的写操作：只重跑读回脚本，绝不重发写请求。"""
+        store = self._pending_store()
+        notes: list[str] = []
+        handoff: tuple[str, str] | None = None
+        if "money" in store:
+            info = store["money"]
+            res = await civ6_tuner.confirm_money_settlement(
+                int(info.get("expected_builders", 1)), timeout=8.0,
+            )
+            if res.get("ok"):
+                store.pop("money", None)
+                notes.append(res.get("detail", "购买建造者已确认"))
+            elif res.get("lagging"):
+                info["age"] = int(info.get("age", 0)) + 1
+                if info["age"] >= 2:
+                    handoff = ("WRITE_UNCERTAIN",
+                               f"上回合购买建造者连续 {info['age']} 个回合未见新单位："
+                               f"{res.get('detail', '')}。写请求仅发送一次；结果不确定，可能已生效或消耗资源，请人工核实游戏状态，未自动重试。")
+                    store.pop("money", None)
+                else:
+                    notes.append(res.get("detail", "购买建造者仍待确认"))
+            else:
+                store.pop("money", None)
+                handoff = (res.get("error", "WRITE_UNCERTAIN"),
+                           f"复核上回合购买建造者失败：{res.get('detail', '')}")
+        if handoff is None and "trade" in store:
+            info = store["trade"]
+            res = await civ6_tuner.confirm_trade_settlement(
+                int(info.get("before", 0)), int(info.get("expected", 1)), timeout=8.0,
+            )
+            if res.get("ok"):
+                store.pop("trade", None)
+                notes.append(res.get("detail", "商队路线已确认"))
+            elif res.get("lagging"):
+                info["age"] = int(info.get("age", 0)) + 1
+                if info["age"] >= 2:
+                    handoff = ("WRITE_UNCERTAIN",
+                               f"上回合商队路线连续 {info['age']} 个回合未计入："
+                               f"{res.get('detail', '')}。写请求仅发送一次；结果不确定，可能已生效或消耗资源，请人工核实游戏状态，未自动重试。")
+                    store.pop("trade", None)
+                else:
+                    notes.append(res.get("detail", "商队路线仍待确认"))
+            else:
+                store.pop("trade", None)
+                handoff = (res.get("error", "WRITE_UNCERTAIN"),
+                           f"复核上回合商队路线失败：{res.get('detail', '')}")
+        return {
+            "detail": "；".join(notes) if notes else "无待复核项",
+            "handoff": handoff is not None,
+            "reason": handoff[0] if handoff else "",
+            "output": handoff[1] if handoff else "",
+            "money_pending": "money" in store,
+            "trade_pending": "trade" in store,
+        }
+
     async def _tuner_manage_turn(
         self, turn_before: int, war_flag: bool,
         auto_prod_kind: str, auto_prod_item: str, auto_tech: str, auto_civic: str,
@@ -1037,19 +1139,19 @@ class Civ6BuddyPlugin(NekoPluginBase):
                     if not ev.get("ok"):
                         hard.append((bt, ev.get("detail", "避险扫描失败")))
                         continue
-                    await asyncio.sleep(1.0)
+                    await _sleep(1.0)
                     bd = await civ6_tuner.auto_use_builder(timeout=20.0)
                     logs.append(f"建造者：{bd.get('detail', bd.get('error', '待命'))}")
                     if not bd.get("ok"):
                         hard.append((bt, bd.get("detail", "建造者操作失败")))
                         continue
-                    await asyncio.sleep(1.0)
+                    await _sleep(1.0)
                     moved = await civ6_tuner.move_explorers(timeout=15.0)
                     logs.append(f"侦察探路：{moved.get('detail', moved.get('error', '跳过'))}")
                     if not moved.get("ok"):
                         hard.append((bt, moved.get("detail", "侦察探路失败")))
                         continue
-                    await asyncio.sleep(2.0)
+                    await _sleep(2.0)
                     r = await civ6_tuner.skip_idle_units(force=True, timeout=8.0)
                     logs.append(f"单位跳过：{r.get('detail', '跳过完成')}")
                     if not r.get("ok"):
@@ -1077,14 +1179,30 @@ class Civ6BuddyPlugin(NekoPluginBase):
         # 世界议会投票处理器（防 WORLD_CONGRESS_SESSION 卡回合）、花钱、宗教、伟人、商队、间谍、战争响应
         wc = await civ6_tuner.register_wc_voter(timeout=10.0)
         logs.append(f"世界议会：{wc.get('detail', wc.get('error', ''))}")
+        # 上回合已下发、当回合没读回的购买/商队先复核：只重跑读回脚本，不重发写请求。
+        check = await self._resolve_pending_writes()
+        logs.append(f"上回合写操作复核：{check.get('detail', '')}")
+        if check.get("handoff"):
+            return {"handoff": True, "ok": False, "reason": check.get("reason", "WRITE_UNCERTAIN"),
+                    "output": check.get("output") or check.get("detail", ""), "log": logs}
+        money_pending = check.get("money_pending", False)
+        trade_pending = check.get("trade_pending", False)
         if self._auto_irreversible:
-            mo = await civ6_tuner.auto_manage_money(timeout=12.0)
+            if money_pending:
+                mo = {"ok": True, "settled": False, "lagging": True,
+                      "detail": "上回合购买仍在复核，本回合不重复花钱"}
+            else:
+                mo = await civ6_tuner.auto_manage_money(timeout=12.0)
             logs.append(f"经济自动：{mo.get('detail', mo.get('error', ''))}")
             rg = await civ6_tuner.auto_found_religion(timeout=12.0)
             logs.append(f"宗教：{rg.get('detail', rg.get('error', ''))}")
             gp = await civ6_tuner.auto_recruit_great_person(timeout=12.0)
             logs.append(f"伟人：{gp.get('detail', gp.get('error', ''))}")
-            tr = await civ6_tuner.auto_trade_route(timeout=12.0)
+            if trade_pending:
+                tr = {"ok": True, "settled": False, "lagging": True,
+                      "detail": "上回合商队仍在复核，本回合不重复派队"}
+            else:
+                tr = await civ6_tuner.auto_trade_route(timeout=12.0)
             logs.append(f"商队：{tr.get('detail', tr.get('error', ''))}")
         else:
             # 配置 auto_irreversible=false 时，不花金币、不创教、不招伟人、不派商队；
@@ -1092,30 +1210,29 @@ class Civ6BuddyPlugin(NekoPluginBase):
             skip = {"ok": True, "skipped": True, "detail": "auto_irreversible=false，已跳过不可逆自动操作"}
             mo = rg = gp = tr = skip
             logs.append("经济/宗教/伟人/商队：auto_irreversible=false，已跳过")
-        # 创教与招伟人一旦读不回就必须交还：两者都消耗不可逆资源，且没有可靠的
-        # 读回路径，放过去等于默认成功。
-        # 购买建造者与商队的读回要等下一回合结算（新单位/路线在回合推进后才出现），
-        # 状态滞后属正常现象；这里只把"读回不确定"记进日志、不再交还，否则每次
-        # 花钱成功都会打断一次连续托管。明确失败（API 不可用、请求被拒、无回执）
-        # 仍然交还。
+        # 创教、招伟人与购买、商队的读回语义在这里分开：
+        #   * 只有 VERIFY_LAGGING（"写请求已被接受、金币已扣，但新单位/路线还没出现在
+        #     API 上"）才记日志并挪到下回合复核；
+        #   * WRITE_UNCERTAIN（请求阶段就没有回执/通信失败）、VERIFY_UNCERTAIN、
+        #     VERIFY_MISMATCH、各类 TIMEOUT 都是"不知道写没写成功"，一律交还。
+        # 0.6.14 把 WRITE_UNCERTAIN 也塞进延迟档，等于把"请求可能根本没下发"当成了
+        # "等一下就好"，与"明确失败仍交还"的约定相反——这里收回来。
         soft_writes = (("经济", mo), ("宗教", rg), ("伟人", gp), ("商队", tr))
         lagging_labels = {"经济", "商队"}
-        # VERIFY_UNCERTAIN 是 _write_and_verify 在读回不匹配/超预算时的实际返回码，
-        # 购买建造者要等新单位下回合出现、商队要等商队走到目标城，这两处每次都会命中它。
-        readback_uncertain = {"WRITE_UNCERTAIN", "VERIFY_UNCERTAIN", "VERIFY_MISMATCH",
-                              "TIMEOUT", "VERIFY_TIMEOUT"}
+        readback_deferred = {"VERIFY_LAGGING"}
         uncertain = []
         deferred = []
         for label, item in soft_writes:
             if item.get("ok"):
                 continue
             code = str(item.get("error", "未确认"))
-            if label in lagging_labels and code in readback_uncertain:
+            if label in lagging_labels and code in readback_deferred:
                 deferred.append(f"{label}（{code}）")
+                self._remember_lagging_write(label, item)
                 continue
             uncertain.append(f"{label}（{code}）")
         if deferred:
-            logs.append("读回滞后，只记日志未交还：" + "；".join(deferred))
+            logs.append("读回滞后，下回合复核（未宣称成功）：" + "；".join(deferred))
         if uncertain:
             return {"handoff": True, "ok": False, "reason": "WRITE_UNCERTAIN",
                     "output": "以下写操作未读回确认，未发送结束回合，控制权交还："
@@ -1137,7 +1254,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
             return {"handoff": True, "ok": False, "reason": "ENDTURN_ERR",
                     "output": f"结束回合失败：{e.get('detail')}", "log": logs}
         for _ in range(12):
-            await asyncio.sleep(3.0)
+            await _sleep(3.0)
             if self._ops_stop_event.is_set():
                 raise _OpsStopped
             s = await civ6_tuner.read_situation(timeout=6.0)
@@ -1493,7 +1610,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 pass
             if i < loop_turns - 1:
                 try:
-                    await _call_with_deadline(asyncio.sleep, deadline, 0.5)
+                    await _call_with_deadline(_sleep, deadline, 0.5)
                 except asyncio.TimeoutError:
                     return timeout_result(tuner_ok)
         # 正常完成：托管保持（锁不清，steam_manager 继续让位）；交还由 handoff 负责

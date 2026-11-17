@@ -2,7 +2,7 @@
 local me = Game.GetLocalPlayer()
 local pCulture = Players[me]:GetCulture()
 local targets = __civ6_policy_targets or {{}}
-local want_count = {p0}
+local want_count = {want_count}
 local done, failed = 0, 0
 for s = 0, pCulture:GetNumPolicySlots() - 1 do
   local want = targets[s]

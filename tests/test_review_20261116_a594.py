@@ -142,7 +142,7 @@ def test_manage_turn_soft_write_failure_hands_off_before_end_turn(monkeypatch):
     }
     for name, value in values.items():
         monkeypatch.setattr(_main.civ6_tuner, name, stub(name, value))
-    monkeypatch.setattr(_main.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_main, "_sleep", _no_sleep)
 
     result = asyncio.run(plugin._tuner_manage_turn(
         9, False, "unit", "UNIT_BUILDER", "TECH_POTTERY", "CIVIC_CODE_OF_LAWS",
@@ -176,7 +176,7 @@ def test_manage_turn_skips_irreversible_when_disabled(monkeypatch):
     }
     for name, value in values.items():
         monkeypatch.setattr(_main.civ6_tuner, name, stub(name, value))
-    monkeypatch.setattr(_main.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_main, "_sleep", _no_sleep)
 
     result = asyncio.run(plugin._tuner_manage_turn(
         9, False, "unit", "UNIT_BUILDER", "TECH_POTTERY", "CIVIC_CODE_OF_LAWS",
@@ -202,7 +202,7 @@ def test_commemoration_missing_before_is_not_reported_as_success(monkeypatch):
 
     monkeypatch.setattr(_tuner, "_handshake_retry", handshake)
     monkeypatch.setattr(_tuner, "execute_lua", execute)
-    monkeypatch.setattr(_tuner.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_tuner, "_sleep", _no_sleep)
     result = asyncio.run(_tuner.auto_choose_commemoration(timeout=2.0))
     assert result["ok"] is False
     assert result["error"] == "SILENT_FAILURE"
@@ -300,12 +300,15 @@ _FORMAT_TEMPLATES = {
         "operation": "RESEARCH", "blocking": "ENDTURN_BLOCKING_RESEARCH",
         "ok_prefix": "OK:RESEARCHING",
     },
-    "set_research_verify": {"p0": "TECH_POTTERY", "p1": "GetResearchingTech", "p2": "GetTechs"},
+    "set_research_verify": {
+        "player_method": "GetTechs", "getter": "GetResearchingTech", "wanted": "TECH_POTTERY",
+    },
     "skip_idle_units": {"forced": "false"},
     "auto_pick_research": {
-        "p0": "TechnologyType", "p1": "HasTech", "p2": "GetTechs", "p3": "Technologies",
+        "gi_table": "Technologies", "player_method": "GetTechs", "has_method": "HasTech",
+        "type_field": "TechnologyType",
     },
-    "auto_fill_policy_slots_verify": {"p0": "1"},
+    "auto_fill_policy_slots_verify": {"want_count": "1"},
 }
 
 

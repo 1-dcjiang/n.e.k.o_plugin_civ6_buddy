@@ -18,6 +18,11 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4318
 
 
+async def _sleep(seconds: float) -> None:
+    """唯一的延时入口；测试替换这里，不去改全局 ``asyncio.sleep``。"""
+    await asyncio.sleep(seconds)
+
+
 def _parse_lua_states(raw: list[str]) -> dict[int, str]:
     """LSQ 返回交错 [index, name] 列表 → {index: name}。
 
@@ -262,7 +267,7 @@ async def _handshake_retry(retries: int = 2, delay: float = 0.5, timeout: float 
                     remaining = deadline - loop.time()
                     if remaining <= 0:
                         break
-                    await asyncio.sleep(min(delay, remaining))
+                    await _sleep(min(delay, remaining))
                 else:
-                    await asyncio.sleep(delay)
+                    await _sleep(delay)
     raise last if last else TunerError("握手总预算已耗尽")

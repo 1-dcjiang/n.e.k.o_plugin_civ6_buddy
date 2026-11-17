@@ -321,7 +321,7 @@ def test_cleanup_retries_once_when_tuner_off_then_succeeds(monkeypatch):
         return None
 
     monkeypatch.setattr(_main.civ6_tuner, "unregister_wc_voter", unregister)
-    monkeypatch.setattr(_main.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(_main, "_sleep", no_sleep)
     result = asyncio.run(plugin._cleanup_managed_runtime())
     assert result["ok"] is True
     assert len(attempts) == 2
@@ -337,7 +337,7 @@ def test_cleanup_does_not_hide_persistent_tuner_off(monkeypatch):
         return None
 
     monkeypatch.setattr(_main.civ6_tuner, "unregister_wc_voter", unregister)
-    monkeypatch.setattr(_main.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(_main, "_sleep", no_sleep)
     result = asyncio.run(plugin._cleanup_managed_runtime())
     assert result["ok"] is False
     assert result["error"] == "GAME_TUNER_OFF"

@@ -119,7 +119,7 @@ def _plugin_with_stubs(monkeypatch, overrides=None):
     values.update(overrides or {})
     for name, value in values.items():
         monkeypatch.setattr(_main.civ6_tuner, name, stub(name, value))
-    monkeypatch.setattr(_main.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_main, "_sleep", _no_sleep)
     return plugin, calls
 
 
@@ -131,6 +131,13 @@ def _manage_turn(plugin):
     )
 
 
+_READBACK_LAGGING = {
+    "money": {"ok": False, "error": "VERIFY_LAGGING", "detail": "金币已扣、建造者仍未见",
+              "gold": 50, "builders": 1, "expected_builders": 2},
+    "trade": {"ok": False, "error": "VERIFY_LAGGING", "detail": "路线数尚未增加",
+              "before": 0, "after": 0, "expected_routes": 1},
+}
+
 _READBACK_UNCERTAIN = [
     {"ok": False, "error": "VERIFY_UNCERTAIN", "detail": "读回后状态仍不匹配"},
     {"ok": False, "error": "WRITE_UNCERTAIN", "detail": "无请求回执"},
@@ -139,25 +146,50 @@ _READBACK_UNCERTAIN = [
 ]
 
 
-@pytest.mark.parametrize("payload", _READBACK_UNCERTAIN, ids=lambda p: p["error"])
-def test_money_readback_uncertain_is_logged_not_handed_off(monkeypatch, payload):
-    """购买建造者的读回要等新单位下回合出现；_write_and_verify 返回的
-    VERIFY_UNCERTAIN 是这条链路的实际码，必须落在"只记日志"这一档。"""
-    plugin, calls = _plugin_with_stubs(monkeypatch, {"auto_manage_money": payload})
+def test_money_lagging_is_deferred_to_next_turn(monkeypatch):
+    """只有 VERIFY_LAGGING（金币已扣、单位还没出现）才顺延到下一回合复核。"""
+    plugin, calls = _plugin_with_stubs(monkeypatch, {"auto_manage_money": _READBACK_LAGGING["money"]})
     result = _manage_turn(plugin)
     assert result["handoff"] is False
     assert result["ok"] is True
     assert "end_turn" in calls
     assert any("读回滞后" in line and "经济" in line for line in result["log"])
+    # 顺延必须记账，否则下一回合既不会复核也不会拦重复花钱
+    assert plugin._pending_writes["money"]["expected_builders"] == 2
+    assert plugin._pending_writes["money"]["age"] == 1
 
 
-@pytest.mark.parametrize("payload", _READBACK_UNCERTAIN, ids=lambda p: p["error"])
-def test_trade_route_readback_uncertain_is_logged_not_handed_off(monkeypatch, payload):
-    plugin, calls = _plugin_with_stubs(monkeypatch, {"auto_trade_route": payload})
+def test_trade_lagging_is_deferred_to_next_turn(monkeypatch):
+    plugin, calls = _plugin_with_stubs(monkeypatch, {"auto_trade_route": _READBACK_LAGGING["trade"]})
     result = _manage_turn(plugin)
     assert result["handoff"] is False
     assert "end_turn" in calls
     assert any("读回滞后" in line and "商队" in line for line in result["log"])
+    assert plugin._pending_writes["trade"]["expected"] == 1
+
+
+@pytest.mark.parametrize("payload", _READBACK_UNCERTAIN, ids=lambda p: p["error"])
+def test_money_unreadable_hands_off(monkeypatch, payload):
+    """请求可能根本没下发、读回失败或状态不匹配，都不是"再等等就好"，必须交还。
+
+    0.6.14 把这些码与滞后档揉在一起，等于默认写成功了；这里逐码守回来。
+    """
+    plugin, calls = _plugin_with_stubs(monkeypatch, {"auto_manage_money": payload})
+    result = _manage_turn(plugin)
+    assert result["handoff"] is True
+    assert result["reason"] == "WRITE_UNCERTAIN"
+    assert "经济" in result["output"]
+    assert "end_turn" not in calls
+    assert "money" not in plugin._pending_writes
+
+
+@pytest.mark.parametrize("payload", _READBACK_UNCERTAIN, ids=lambda p: p["error"])
+def test_trade_route_unreadable_hands_off(monkeypatch, payload):
+    plugin, calls = _plugin_with_stubs(monkeypatch, {"auto_trade_route": payload})
+    result = _manage_turn(plugin)
+    assert result["handoff"] is True
+    assert "商队" in result["output"]
+    assert "end_turn" not in calls
 
 
 def test_religion_unreadable_still_hands_off(monkeypatch):

@@ -25,7 +25,7 @@ YUI 会基于 FireTuner 官方数据处理可确认的每回合杂活，无法�
 """
 short_description = "文明6陪玩：按官方数据托管生产、研究、政策与回合；写操作读回验证，识别不确定即交还，不改存档"
 keywords = ["文明6", "Civilization VI", "Civ6", "陪玩", "自动回合", "托管运营", "科技", "市政", "政策", "万神殿", "总督", "侦察兵探路", "弹窗处理", "外交使节", "FireTuner", "存档解析", "Civ6Save", "局面洞察", "胜利路线", "城邦", "领袖", "不瞎点", "读回验证", "键鼠接管", "交还", "situation", "advisor", "buddy", "coach", "takeover", "官方API"]
-version = "0.6.14"
+version = "0.6.15"
 type = "plugin"
 entry = "plugin.plugins.civ6_buddy:Civ6BuddyPlugin"
 

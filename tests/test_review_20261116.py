@@ -105,7 +105,7 @@ def test_write_readback_success_runs_real_business_function(
         return [request_line]
 
     calls, writer = _fake_tuner_io(monkeypatch, respond)
-    monkeypatch.setattr(_tuner.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_tuner, "_sleep", _no_sleep)
     result = asyncio.run(getattr(_tuner, name)(timeout=3.0))
     assert result["ok"] is True, result
     assert result["verified"] is True
@@ -119,20 +119,28 @@ def test_write_readback_success_runs_real_business_function(
     ("name", "request_marker", "verify_marker", "request_line", "_success", "failure_line"),
     _READBACK_CASES,
 )
-def test_write_readback_mismatch_is_uncertain_and_never_rewrites(
+def test_write_readback_mismatch_never_rewrites_and_is_never_success(
     monkeypatch, name, request_marker, verify_marker, request_line, _success, failure_line,
 ):
+    # 购买与商队的读回语义在 0.6.15 分开：金币没降＝请求被拒（MISMATCH），
+    # 商队路线同回合必然还没计入（LAGGING）；两者都只读回一次就下结论，
+    # 不再空轮询三次。其余写操作仍是"三次读回都不匹配＝不确定"。
+    expected, expected_calls = {
+        "auto_manage_money": ("VERIFY_MISMATCH", 2),
+        "auto_trade_route": ("VERIFY_LAGGING", 2),
+    }.get(name, ("VERIFY_UNCERTAIN", 4))
+
     def respond(code):
         return [failure_line] if verify_marker in code else [request_line]
 
     calls, _writer = _fake_tuner_io(monkeypatch, respond)
-    monkeypatch.setattr(_tuner.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_tuner, "_sleep", _no_sleep)
     result = asyncio.run(getattr(_tuner, name)(timeout=3.0))
     assert result["ok"] is False, result
-    assert result["error"] == "VERIFY_UNCERTAIN"
+    assert result["error"] == expected, result
     assert result["verified"] is False
-    assert "人工核实" in result["detail"]
-    assert len(calls) == 4
+    assert "人工核实" in result["detail"] or "仍未见" in result["detail"] or "尚未增加" in result["detail"]
+    assert len(calls) == expected_calls
     assert sum(request_marker in call["code"] for call in calls) == 1
 
 
@@ -253,7 +261,7 @@ def test_lua_template_formatting_preserves_production_parameters(monkeypatch):
         return ["SET|done=1|failed=0|size=1|ids=3"]
 
     calls, _writer = _fake_tuner_io(monkeypatch, respond)
-    monkeypatch.setattr(_tuner.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_tuner, "_sleep", _no_sleep)
     result = asyncio.run(_tuner.set_city_production(
         "district", "DISTRICT_CAMPUS", city_id=3, plot_x=7, plot_y=8, timeout=3.0,
     ))
@@ -303,7 +311,7 @@ def test_cleanup_two_rounds_share_fake_monotonic_budget(monkeypatch):
         clock.now += seconds
 
     monkeypatch.setattr(_main, "time", _FakeModuleTime(clock))
-    monkeypatch.setattr(_main.asyncio, "sleep", sleep)
+    monkeypatch.setattr(_main, "_sleep", sleep)
     monkeypatch.setattr(_main.civ6_tuner, "unregister_wc_voter", unregister)
     result = asyncio.run(plugin._cleanup_managed_runtime())
     assert result["error"] == "GAME_TUNER_OFF"
@@ -330,7 +338,7 @@ def test_two_handshakes_share_protocol_deadline_with_fake_clock(monkeypatch):
         clock.now += seconds
 
     monkeypatch.setattr(_protocol.asyncio, "get_running_loop", lambda: Loop())
-    monkeypatch.setattr(_protocol.asyncio, "sleep", sleep)
+    monkeypatch.setattr(_protocol, "_sleep", sleep)
     monkeypatch.setattr(_protocol, "handshake", handshake)
     with pytest.raises(_protocol.TunerError, match="blocked"):
         asyncio.run(_protocol._handshake_retry(retries=1, delay=0.5, timeout=6.0))
@@ -417,7 +425,7 @@ def _manage_stubs(monkeypatch, blocker, **overrides):
             calls.append(_name)
             return _value
         monkeypatch.setattr(_main.civ6_tuner, name, stub)
-    monkeypatch.setattr(_main.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_main, "_sleep", _no_sleep)
     return calls
 
 
