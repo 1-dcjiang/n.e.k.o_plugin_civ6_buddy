@@ -382,7 +382,10 @@ async def set_city_production(
     selected_city = -1 if city_id is None else city_id
     only_empty = "true" if city_id is None else "false"
     x, y = -1 if plot_x is None else plot_x, -1 if plot_y is None else plot_y
-    request_lua = _lua("set_city_production_request").format(p12=_ITEM_KIND_TO_TABLE[kind], p11=item_name, p10=item_name, p9=only_empty, p8=param, p7=kind, p6=x, p5=y, p4=x, p3=y, p2=selected_city, p1=selected_city, p0=selected_city)
+    request_lua = _lua("set_city_production_request").format(
+        item_table=_ITEM_KIND_TO_TABLE[kind], item_name=item_name, only_empty=only_empty,
+        param=param, kind=kind, x=x, y=y, selected_city=selected_city, city_id=selected_city,
+    )
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:
@@ -416,7 +419,9 @@ async def set_city_production(
                 return {"ok": False, "error": "TIMEOUT", "detail": "生产读回总预算已耗尽，未宣称成功"}
             await asyncio.sleep(min(0.35, remaining))
             cleanup = "true" if attempt == 2 else "false"
-            verify_lua = _lua("set_city_production_verify").format(p2=_ITEM_KIND_TO_TABLE[kind], p1=item_name, p0=cleanup)
+            verify_lua = _lua("set_city_production_verify").format(
+                item_table=_ITEM_KIND_TO_TABLE[kind], item_name=item_name, cleanup=cleanup,
+            )
             verified = await execute_lua(
                 reader, writer, verify_lua, state_index=_ingame_state_index(states),
                 timeout=max(0.1, deadline - loop.time()),
@@ -536,7 +541,11 @@ async def set_research(
             "ENDTURN_BLOCKING_CIVIC", "OK:PROGRESSING", "HasCivic", "GetCulture",
         )
 
-    lua = _lua("set_research").format(p11=gi_table, p10=type_field, p9=item_name, p8=item_name, p7=player_m, p6=has_m, p5=item_name, p4=param, p3=operation, p2=blocking, p1=ok_prefix, p0=item_name)
+    lua = _lua("set_research").format(
+        gi_table=gi_table, type_field=type_field, item_name=item_name,
+        player_method=player_m, has_method=has_m, param=param,
+        operation=operation, blocking=blocking, ok_prefix=ok_prefix,
+    )
     try:
         app_id, states, reader, writer = await _handshake_retry()
     except TunerError as exc:

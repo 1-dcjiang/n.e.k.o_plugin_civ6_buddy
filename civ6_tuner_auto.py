@@ -274,6 +274,16 @@ async def auto_manage_money(timeout: float = 15.0) -> dict:
 async def auto_found_religion(timeout: float = 15.0) -> dict:
     """创立宗教并选择信条；宗教类型与信条列表读回匹配后才报成功。"""
     def parse_request(lines, app_id):
+        # HasReligiousFoundingUnit 调用失败时 Lua 侧报 RELIGION_UNSUPPORTED。
+        # 不能按"没有创教单位"处理：那是读不出来，不是这局不用创教。
+        unsupported = next(
+            (item.strip() for item in lines if item.strip().startswith("RELIGION_UNSUPPORTED|")), ""
+        )
+        if unsupported:
+            return {"ok": False, "error": "VERIFY_UNSUPPORTED", "verified": False,
+                    "detail": "HasReligiousFoundingUnit 调用失败（API 缺失或改名），"
+                              "无法区分“没有创教单位”与“读不出来”；本次未发送创教请求，"
+                              "请人工确认宗教面板是否还能创教"}
         none = next((item.strip() for item in lines if item.strip().startswith("RELIGION_NONE|")), "")
         if none:
             return {"ok": True, "app": app_id, "founded": False, "via": "tuner",
@@ -315,7 +325,9 @@ async def auto_recruit_great_person(timeout: float = 15.0) -> dict:
             return {"ok": True, "app": app_id, "recruited": False, "name": None,
                     "detail": "无可用伟人，本次未招募", "via": "tuner"}
         if name == "UNSUPPORTED":
-            return {"ok": False, "error": "VERIFY_UNSUPPORTED", "detail": "无法读取伟人列表，未发送招募请求"}
+            return {"ok": False, "error": "VERIFY_UNSUPPORTED",
+                    "detail": "无法读取伟人列表，未发送招募请求；若长期出现，可把配置 "
+                              "auto_irreversible 设为 false，跳过伟人/创教/购买/商队这类不可逆自动操作"}
         return {"ok": False, "app": app_id, "recruited": False, "name": name,
                 "via": "tuner", "_verify": True, "detail": "伟人招募请求已发送，等待读回"}
 

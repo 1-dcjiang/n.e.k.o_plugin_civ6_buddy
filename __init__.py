@@ -141,6 +141,12 @@ def _tool_params(_: dict) -> dict:
 class Civ6BuddyPlugin(NekoPluginBase):
     """N.E.K.O. 插件：文明6陪玩（解析存档获知局面 + 陪玩建议）。"""
 
+    # 不可逆自动操作的默认开关。放类属性而不是只放 __init__，
+    # 是为了让不跑构造的调用方（测试用 __new__、以及配置尚未加载的早期调用）
+    # 也能拿到真实默认值，而不是靠 getattr 的兜底把构造缺省盖住。
+    # __init__ 与配置加载会覆盖成实例属性。
+    _auto_irreversible = True
+
     def __init__(self, ctx):
         super().__init__(ctx)
         self._saves_dir = ""
@@ -1071,7 +1077,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
         # 世界议会投票处理器（防 WORLD_CONGRESS_SESSION 卡回合）、花钱、宗教、伟人、商队、间谍、战争响应
         wc = await civ6_tuner.register_wc_voter(timeout=10.0)
         logs.append(f"世界议会：{wc.get('detail', wc.get('error', ''))}")
-        if getattr(self, "_auto_irreversible", True):
+        if self._auto_irreversible:
             mo = await civ6_tuner.auto_manage_money(timeout=12.0)
             logs.append(f"经济自动：{mo.get('detail', mo.get('error', ''))}")
             rg = await civ6_tuner.auto_found_religion(timeout=12.0)
@@ -1086,14 +1092,27 @@ class Civ6BuddyPlugin(NekoPluginBase):
             skip = {"ok": True, "skipped": True, "detail": "auto_irreversible=false，已跳过不可逆自动操作"}
             mo = rg = gp = tr = skip
             logs.append("经济/宗教/伟人/商队：auto_irreversible=false，已跳过")
-        # 这四类是不可逆/消耗资源的写操作：读回不确定时不能只记日志后继续结束回合，
-        # 必须与 plugin.toml 的“识别不确定即交还”保持一致。
+        # 创教与招伟人一旦读不回就必须交还：两者都消耗不可逆资源，且没有可靠的
+        # 读回路径，放过去等于默认成功。
+        # 购买建造者与商队的读回要等下一回合结算（新单位/路线在回合推进后才出现），
+        # 状态滞后属正常现象；这里只把"读回不确定"记进日志、不再交还，否则每次
+        # 花钱成功都会打断一次连续托管。明确失败（API 不可用、请求被拒、无回执）
+        # 仍然交还。
         soft_writes = (("经济", mo), ("宗教", rg), ("伟人", gp), ("商队", tr))
-        uncertain = [
-            f"{label}（{item.get('error', '未确认')}）"
-            for label, item in soft_writes
-            if not item.get("ok")
-        ]
+        lagging_labels = {"经济", "商队"}
+        readback_uncertain = {"WRITE_UNCERTAIN", "VERIFY_MISMATCH", "TIMEOUT", "VERIFY_TIMEOUT"}
+        uncertain = []
+        deferred = []
+        for label, item in soft_writes:
+            if item.get("ok"):
+                continue
+            code = str(item.get("error", "未确认"))
+            if label in lagging_labels and code in readback_uncertain:
+                deferred.append(f"{label}（{code}）")
+                continue
+            uncertain.append(f"{label}（{code}）")
+        if deferred:
+            logs.append("读回滞后，只记日志未交还：" + "；".join(deferred))
         if uncertain:
             return {"handoff": True, "ok": False, "reason": "WRITE_UNCERTAIN",
                     "output": "以下写操作未读回确认，未发送结束回合，控制权交还："

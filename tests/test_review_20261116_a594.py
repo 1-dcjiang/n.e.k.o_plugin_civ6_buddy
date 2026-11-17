@@ -280,16 +280,18 @@ def test_all_lua_files_have_balanced_blocks(path):
 _FORMAT_TEMPLATES = {
     "set_focus": {"yield_type": "YIELD_FOOD"},
     "set_city_production_request": {
-        "p0": "1", "p1": "1", "p2": "1", "p3": "1", "p4": "1", "p5": "1",
-        "p6": "1", "p7": "unit", "p8": "PARAM_UNIT_TYPE", "p9": "true",
-        "p10": "UNIT_SCOUT", "p11": "UNIT_SCOUT", "p12": "Units",
+        "item_table": "Units", "item_name": "UNIT_SCOUT", "only_empty": "true",
+        "param": "PARAM_UNIT_TYPE", "kind": "unit", "x": "1", "y": "1",
+        "selected_city": "1", "city_id": "1",
     },
-    "set_city_production_verify": {"p0": "true", "p1": "UNIT_SCOUT", "p2": "Units"},
+    "set_city_production_verify": {
+        "item_table": "Units", "item_name": "UNIT_SCOUT", "cleanup": "true",
+    },
     "set_research": {
-        "p0": "TECH_POTTERY", "p1": "TECH_POTTERY", "p2": "TECH_POTTERY",
-        "p3": "RESEARCH", "p4": "PARAM_TECH_TYPE", "p5": "TECH_POTTERY",
-        "p6": "HasTech", "p7": "GetTechs", "p8": "TECH_POTTERY",
-        "p9": "TECH_POTTERY", "p10": "TechnologyType", "p11": "Technologies",
+        "gi_table": "Technologies", "type_field": "TechnologyType", "item_name": "TECH_POTTERY",
+        "player_method": "GetTechs", "has_method": "HasTech", "param": "PARAM_TECH_TYPE",
+        "operation": "RESEARCH", "blocking": "ENDTURN_BLOCKING_RESEARCH",
+        "ok_prefix": "OK:RESEARCHING",
     },
     "set_research_verify": {"p0": "TECH_POTTERY", "p1": "GetResearchingTech", "p2": "GetTechs"},
     "skip_idle_units": {"forced": "false"},

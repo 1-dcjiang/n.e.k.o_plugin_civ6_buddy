@@ -8,7 +8,10 @@ if created >= 0 then print("RELIGION_NONE|already_founded") return end
 -- 读回也无法匹配，白白占用 tick 预算。HasReligiousFoundingUnit 是宗教面板
 -- 判断“是否还能创教”的同一接口，缺失时按不可创教处理。
 local has_founder = false
-pcall(function() has_founder = pRel:HasReligiousFoundingUnit() end)
+-- pcall 的返回值必须看：API 缺失/改名时 has_founder 仍是 false，
+-- 与"确实没有创教单位"混成同一句话会让上层误判成"这局不用创教"。
+local has_founder_ok = pcall(function() has_founder = pRel:HasReligiousFoundingUnit() end)
+if not has_founder_ok then print("RELIGION_UNSUPPORTED|has_religious_founding_unit") return end
 if not has_founder then print("RELIGION_NONE|no_founding_unit") return end
 local relType = nil
 for row in GameInfo.Religions() do

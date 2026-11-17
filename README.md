@@ -87,6 +87,15 @@ Lua API（`CanProduce`、`CanStartOperation`、`PARAM_*` 键名、`SetHide` 对�
 
 ## 版本
 
+- v0.6.13：A697 增量深审修复——创立宗教时 `HasReligiousFoundingUnit` 的 `pcall` 返回值现在会被检查，
+  调用失败（API 缺失或改名）报 `RELIGION_UNSUPPORTED` 而不是混成“没有创教单位”，不再把读不出来当成
+  这局不用创教；购买建造者与商队的读回滞后（新单位/路线要等下一回合结算才出现）只记日志、不再交还，
+  创教与招伟人读不回仍交还，API 不可用等明确失败也仍然交还；伟人列表读不到时交还文案带上
+  `auto_irreversible=false` 的配置指引；`set_city_production_request`/`set_city_production_verify`/
+  `set_research` 三份 Lua 模板的倒序占位符 `p0..p12` 改为语义名（`item_table`/`item_name`/`param`/`x`/`y`
+  等），模板与调用两侧同步；`_auto_irreversible` 改由类属性给出默认值，去掉 `getattr` 兜底，
+  不跑构造的调用方也能读到真实默认。
+  246 项测试通过，Ruff 通过。Lua 侧的实机行为仍需按冒烟清单复核（尤其创教前置判断与商队读回）。
 - v0.6.12：A594 增量深审修复——创立宗教先检查 `HasReligiousFoundingUnit`，避免每回合向游戏发无效请求；
   晋升目标每次请求重置，死亡单位按“未达成”处理而不是 `VERIFY_UNSUPPORTED`；政策写请求用 `Hash`、
   读回比对改用槽位 `Policy.Index`；招募伟人先取名字再发请求；`RazeCity/ChooseArtifact/EventPopup/EspionagePopup`
