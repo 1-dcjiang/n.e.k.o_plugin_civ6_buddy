@@ -41,6 +41,10 @@ _OPS_TICK_BUDGET = 870.0  # 工具超时 900 秒，连续回合共享同一总�
 _OPS_CLEANUP_BUDGET = 10.0  # 独立清理：两轮注销共享 10 秒。
 _OPS_HANDOFF_BUDGET = 15.0  # 交还工具超时 20 秒，预留 5 秒给取消收尾与返回。
 _OPS_HANDOFF_STEP_BUDGET = 3.0
+# 购买单位通常同一回合或下一回合出现；商队要走完路程才会体现在 GetNumOutgoingRoutes，
+# 给 6 个账龄（约 5 个后续回合）复核窗口，避免正常长途商队被当成失败交还。
+_MONEY_PENDING_MAX_AGE = 2
+_TRADE_PENDING_MAX_AGE = 6
 
 
 async def _sleep(seconds: float) -> None:
@@ -182,6 +186,8 @@ class Civ6BuddyPlugin(NekoPluginBase):
         self._ops_stop_event.set()
         if self._ops_screen_cancel is not None:
             self._ops_screen_cancel.set()
+        # 交还/停止后旧账不能再拿新局面的建造者数或路线数去比对；下次接管重新记账。
+        self._pending_store().clear()
         _ops_lock_clear()
 
     def _screen_worker_alive(self) -> bool:
@@ -906,7 +912,9 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 "reason": "WAR_TUNER",
             }
         # 只在这里宣告接管。完整回合交给有 900 秒工具预算的 tick，不在 30 秒接管工具内执行。
-        # 只有确认旧 tick 已不在运行后才清除上一次交还的停止信号。
+        # 只有确认旧 tick 已不在运行后才清除上一次交还的停止信号；旧复核账本一并丢弃，
+        # 避免用户手动玩过若干回合/换存档后仍拿旧回合的建造者数或路线数来比对。
+        self._pending_store().clear()
         self._ops_stop_event.clear()
         self._ops_active = True
         _ops_lock_set()
@@ -934,7 +942,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
     def _remember_lagging_write(self, label: str, item: dict) -> None:
         """记下"写请求已下发、金币已扣但读回还看不到结果"的操作，下一回合复核。
 
-        ``age`` 每复核一次仍无结果就 +1；连续两个回合都看不到结果时交还，
+        ``age`` 每复核一次仍无结果就 +1；达到对应上限（购买 2、商队 6）后交还，
         不再无限期把一次可能失败的写操作当成"迟早会生效"。
         """
         store = self._pending_store()
@@ -968,7 +976,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 notes.append(res.get("detail", "购买建造者已确认"))
             elif res.get("lagging"):
                 info["age"] = int(info.get("age", 0)) + 1
-                if info["age"] >= 2:
+                if info["age"] >= _MONEY_PENDING_MAX_AGE:
                     handoff = ("WRITE_UNCERTAIN",
                                f"上回合购买建造者连续 {info['age']} 个回合未见新单位："
                                f"{res.get('detail', '')}。写请求仅发送一次；结果不确定，可能已生效或消耗资源，请人工核实游戏状态，未自动重试。")
@@ -989,7 +997,7 @@ class Civ6BuddyPlugin(NekoPluginBase):
                 notes.append(res.get("detail", "商队路线已确认"))
             elif res.get("lagging"):
                 info["age"] = int(info.get("age", 0)) + 1
-                if info["age"] >= 2:
+                if info["age"] >= _TRADE_PENDING_MAX_AGE:
                     handoff = ("WRITE_UNCERTAIN",
                                f"上回合商队路线连续 {info['age']} 个回合未计入："
                                f"{res.get('detail', '')}。写请求仅发送一次；结果不确定，可能已生效或消耗资源，请人工核实游戏状态，未自动重试。")
@@ -1025,6 +1033,16 @@ class Civ6BuddyPlugin(NekoPluginBase):
         if not cp0.get("ok"):
             return {"handoff": True, "ok": False, "reason": cp0.get("error", "POPUP_UNRESOLVED"),
                     "output": f"回合入口状态未确认：{cp0.get('detail', cp0.get('error', ''))}", "log": logs}
+        # 上回合已下发、当回合没读回的购买/商队先复核：只重跑读回脚本，不重发写请求。
+        # 必须放在任何 blocker 处理（尤其 auto_use_builder）之前：旧建造者可能在本回合
+        # 用完最后一次次数后消失，放到后面复核会把“新单位已到、旧单位已消失”读成未到。
+        check = await self._resolve_pending_writes()
+        logs.append(f"上回合写操作复核：{check.get('detail', '')}")
+        if check.get("handoff"):
+            return {"handoff": True, "ok": False, "reason": check.get("reason", "WRITE_UNCERTAIN"),
+                    "output": check.get("output") or check.get("detail", ""), "log": logs}
+        money_pending = check.get("money_pending", False)
+        trade_pending = check.get("trade_pending", False)
         b = await civ6_tuner.read_blockers(timeout=8.0)
         if not b.get("ok"):
             return {"handoff": True, "ok": False, "reason": "TUNER_OFF",
@@ -1179,14 +1197,6 @@ class Civ6BuddyPlugin(NekoPluginBase):
         # 世界议会投票处理器（防 WORLD_CONGRESS_SESSION 卡回合）、花钱、宗教、伟人、商队、间谍、战争响应
         wc = await civ6_tuner.register_wc_voter(timeout=10.0)
         logs.append(f"世界议会：{wc.get('detail', wc.get('error', ''))}")
-        # 上回合已下发、当回合没读回的购买/商队先复核：只重跑读回脚本，不重发写请求。
-        check = await self._resolve_pending_writes()
-        logs.append(f"上回合写操作复核：{check.get('detail', '')}")
-        if check.get("handoff"):
-            return {"handoff": True, "ok": False, "reason": check.get("reason", "WRITE_UNCERTAIN"),
-                    "output": check.get("output") or check.get("detail", ""), "log": logs}
-        money_pending = check.get("money_pending", False)
-        trade_pending = check.get("trade_pending", False)
         if self._auto_irreversible:
             if money_pending:
                 mo = {"ok": True, "settled": False, "lagging": True,

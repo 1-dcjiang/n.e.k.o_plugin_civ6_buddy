@@ -122,11 +122,11 @@ def test_write_readback_success_runs_real_business_function(
 def test_write_readback_mismatch_never_rewrites_and_is_never_success(
     monkeypatch, name, request_marker, verify_marker, request_line, _success, failure_line,
 ):
-    # 购买与商队的读回语义在 0.6.15 分开：金币没降＝请求被拒（MISMATCH），
-    # 商队路线同回合必然还没计入（LAGGING）；两者都只读回一次就下结论，
-    # 不再空轮询三次。其余写操作仍是"三次读回都不匹配＝不确定"。
+    # 购买与商队的读回语义在 0.6.16 分开：金币没降前两次只算“尚未看到”，
+    # 第三次才报 MISMATCH；商队路线同回合必然还没计入（LAGGING）。其余写操作
+    # 仍是"三次读回都不匹配＝不确定"。
     expected, expected_calls = {
-        "auto_manage_money": ("VERIFY_MISMATCH", 2),
+        "auto_manage_money": ("VERIFY_MISMATCH", 4),
         "auto_trade_route": ("VERIFY_LAGGING", 2),
     }.get(name, ("VERIFY_UNCERTAIN", 4))
 

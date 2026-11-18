@@ -253,7 +253,8 @@ async def auto_manage_money(timeout: float = 15.0) -> dict:
         base = {"app": app_id, "gold": gold, "builders": builders, "via": "tuner"}
         if "UNSUPPORTED" in payload:
             return {**base, "ok": False, "error": "VERIFY_UNSUPPORTED",
-                    "detail": "购买前无法读取金币或建造者数，未发送购买请求"}
+                    "detail": "购买前无法读取金币或建造者数，未发送购买请求；若长期出现，"
+                              "可把配置 auto_irreversible 设为 false，跳过购买/商队这类不可逆自动操作"}
         if "REQUESTED_BUILDER" not in payload:
             action = "建造者不可购买" if "CANNOT_BUY_BUILDER" in payload else "金币不足或无需购买"
             return {**base, "ok": True, "action": "none", "detail": f"经济自动：{action}，本次未花钱"}
@@ -266,7 +267,8 @@ async def auto_manage_money(timeout: float = 15.0) -> dict:
             return None
         values = dict(item.split("=", 1) for item in line[len("MONEY_VERIFY|"):].split("|") if "=" in item)
         if values.get("supported") != "true":
-            return _verify_unsupported("购买建造者后无法读回金币或单位数")
+            return _verify_unsupported("购买建造者后无法读回金币或单位数；若长期出现，"
+                                       "可把配置 auto_irreversible 设为 false，跳过购买/商队这类不可逆自动操作")
         gold = round(_t._to_float(values.get("gold", "-1")), 1)
         builders = _t._to_int(values.get("builders", "0"))
         before_gold = pending["gold"]
@@ -276,10 +278,15 @@ async def auto_manage_money(timeout: float = 15.0) -> dict:
                     "gold": gold, "builders": builders,
                     "detail": f"已读回验证购买建造者：建造者 {before_builders} → {builders}，"
                               f"金币 {before_gold} → {gold}"}
-        # 金币没下降说明请求被静默拒绝，不是"再等等就会好"——必须报失败并交还。
+        # 金币没下降说明请求可能被静默拒绝；但扣款也可能晚一帧才反映到 API，
+        # 前两次读回只算“尚未看到”，第三次仍没下降才定性为拒绝，避免把成功购买误判成交还。
         if before_gold >= 0 and gold >= before_gold:
+            misses = int(pending.get("_gold_unchanged_checks", 0)) + 1
+            pending["_gold_unchanged_checks"] = misses
+            if misses < 3:
+                return None
             return _verify_mismatch(
-                f"购买建造者后金币未下降（{before_gold} → {gold}），请求可能被拒或金币不足以支付"
+                f"购买建造者后金币连续 {misses} 次读回未下降（{before_gold} → {gold}），请求可能被拒或金币不足以支付"
             )
         # 金币已扣、建造者还没出现：Civ6 的购买单位在同一回合通常立即出现，
         # 但操作队列可能延到结算；这一档标记为"待下回合确认"，不当作成功。
@@ -380,7 +387,8 @@ async def auto_trade_route(timeout: float = 15.0) -> dict:
         unsupported = next((item for item in lines if item.strip().startswith("TRADE_UNSUPPORTED")), "")
         if unsupported:
             return {"ok": False, "error": "VERIFY_UNSUPPORTED",
-                    "detail": "无法读取贸易路线数，未发送商队路线请求"}
+                    "detail": "无法读取贸易路线数，未发送商队路线请求；若长期出现，"
+                              "可把配置 auto_irreversible 设为 false，跳过购买/商队这类不可逆自动操作"}
         line = next((item.strip() for item in lines if item.strip().startswith("TRADE=")), "")
         if not line:
             return {"ok": False, "error": "WRITE_UNCERTAIN", "detail": f"商队路线无请求回执。{_VERIFY_MANUAL}"}
@@ -397,7 +405,8 @@ async def auto_trade_route(timeout: float = 15.0) -> dict:
             return None
         values = dict(item.split("=", 1) for item in line[len("TRADE_VERIFY|"):].split("|") if "=" in item)
         if values.get("supported") != "true":
-            return _verify_unsupported("商队请求后无法读回出境路线数")
+            return _verify_unsupported("商队请求后无法读回出境路线数；若长期出现，"
+                                       "可把配置 auto_irreversible 设为 false，跳过购买/商队这类不可逆自动操作")
         before = _t._to_int(values.get("before", "-1"))
         after = _t._to_int(values.get("after", "-1"))
         if values.get("matched") == "true":
@@ -455,7 +464,8 @@ async def confirm_money_settlement(expected_builders: int, timeout: float = 8.0)
         return probe
     values = probe["values"]
     if values.get("supported") != "true":
-        return _verify_unsupported("复核购买建造者时无法读回金币或单位数")
+        return _verify_unsupported("复核购买建造者时无法读回金币或单位数；若长期出现，"
+                                   "可把配置 auto_irreversible 设为 false，跳过购买/商队这类不可逆自动操作")
     gold = round(_t._to_float(values.get("gold", "-1")), 1)
     builders = _t._to_int(values.get("builders", "0"))
     if builders >= max(1, int(expected_builders)):
@@ -472,7 +482,8 @@ async def confirm_trade_settlement(before: int, expected: int, timeout: float = 
         return probe
     values = probe["values"]
     if values.get("supported") != "true":
-        return _verify_unsupported("复核商队路线时无法读回出境路线数")
+        return _verify_unsupported("复核商队路线时无法读回出境路线数；若长期出现，"
+                                   "可把配置 auto_irreversible 设为 false，跳过购买/商队这类不可逆自动操作")
     after = _t._to_int(values.get("after", "-1"))
     if after >= int(before) + max(1, int(expected)):
         return {"ok": True, "verified": True, "settled": True, "before": before, "after": after,

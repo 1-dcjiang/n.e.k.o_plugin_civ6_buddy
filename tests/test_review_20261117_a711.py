@@ -63,15 +63,22 @@ def test_money_verify_success_requires_gold_drop_and_new_builder(monkeypatch):
     assert result["gold"] == 50
 
 
-def test_money_verify_gold_unchanged_is_mismatch(monkeypatch):
-    """金币没下降＝请求被静默拒绝，不能落进"滞后"档只记日志。"""
+def test_money_verify_gold_unchanged_is_mismatch_after_three_reads(monkeypatch):
+    """金币没下降不能首次读回就判失败：扣款可能晚一帧，第三次仍没降才报 MISMATCH。"""
     parse = _capture_parse_verify(_auto.auto_manage_money, monkeypatch)
+    pending = dict(_MONEY_PENDING)
+    assert parse(
+        ["MONEY_VERIFY|supported=true|matched=false|gold=200|builders=1"], pending,
+    ) is None
+    assert parse(
+        ["MONEY_VERIFY|supported=true|matched=false|gold=200|builders=1"], pending,
+    ) is None
     result = parse(
-        ["MONEY_VERIFY|supported=true|matched=false|gold=200|builders=1"], _MONEY_PENDING,
+        ["MONEY_VERIFY|supported=true|matched=false|gold=200|builders=1"], pending,
     )
     assert result["ok"] is False
     assert result["error"] == "VERIFY_MISMATCH"
-    assert "金币未下降" in result["detail"]
+    assert "连续 3 次读回未下降" in result["detail"]
 
 
 def test_money_verify_gold_paid_without_builder_is_lagging(monkeypatch):
